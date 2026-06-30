@@ -1,0 +1,24 @@
+# 生猪期货基差分析平台 - 依赖库
+# 安装方式: pip install -r requirements_basis.txt
+
+# 核心框架
+streamlit>=1.50.0
+
+# 数据处理
+pandas>=2.0.0
+numpy>=1.24.0
+openpyxl>=3.1.0
+
+# 可视化
+plotly>=5.18.0
+
+# 期货数据获取
+akshare>=1.18.0
+
+# 网络爬取与HTML解析
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+lxml>=5.0.0
+
+# 其他 (可选，plotly 依赖)
+kaleido>=0.2.1
