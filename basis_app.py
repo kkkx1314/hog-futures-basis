@@ -496,9 +496,17 @@ def compute_snapshot(ct: str, spot_dict: dict, fut_df: pd.DataFrame, target_date
     }
 
 # ══════════════════════════════════════════════════════════════
-# _doy_to_date
+# _doy_to_date — 修复: 加入 source_year 正确适配闰年/非闰年
 # ══════════════════════════════════════════════════════════════
-def _doy_to_date(doy: int) -> pd.Timestamp:
+def _is_leap(year: int) -> bool:
+    return (year % 4 == 0 and year % 100 != 0) or (year % 400 == 0)
+
+
+def _doy_to_date(doy: int, source_year: int = None) -> pd.Timestamp:
+    """day-of-year → 固定参考日期(2020年)。
+    source_year 用于修正闰年/非闰年转换：非闰年的 doy>59 需+1 补偿2020年的2月29日。"""
+    if source_year is not None and not _is_leap(source_year) and doy > 59:
+        doy += 1
     return pd.Timestamp("2020-01-01") + pd.Timedelta(days=int(doy)-1)
 
 def _make_trace_label(ct: str, trade_year, item_label: str) -> str:
@@ -602,7 +610,8 @@ def fig_spread_season(data: Dict[str, pd.DataFrame], ma: str, mb: str, data_date
         fig.add_trace(go.Scatter(x=df["plot_date"], y=df["spread"], mode="lines", name=label,
             line=dict(color=c, width=w, dash=d),
             hovertemplate=f"<b>{label}</b><br>%{{customdata}}<br>价差：%{{y:+,}}元/吨<extra></extra>",
-            customdata=[_cn_md(_doy_to_date(r["day_of_year"])) for _,r in df.iterrows()]))
+            # ★ 修复：直接使用已修正的 plot_date
+            customdata=[_cn_md(r["plot_date"]) for _,r in df.iterrows()]))
     fig.add_hline(y=0, line_dash="dash", line_color="gray", opacity=0.5)
     title = f"{ma}月 − {mb}月 合约价差季节图"
     if data_date: title += f"<br><sup>📡 期货数据来源：akshare，数据日期：{data_date}</sup>"
@@ -857,8 +866,8 @@ def _tab3_calendar(contracts, spot_dict, ref_regions, sel_items, data_date):
     st.info(f"📌 {tmon}月合约，共 {len(avail)} 个可用：{'、'.join(avail)}")
 
     series: Dict[str, pd.DataFrame] = {}
-    # 每个 item 独立的 doy_collector
-    doy_collectors: Dict[str, Dict[int, List[int]]] = defaultdict(lambda: defaultdict(list))
+    # ★ 修复：用 (month, day) 聚合，避免闰年/非闰年 doy 混乱
+    md_collectors: Dict[str, Dict[Tuple[int, int], List[int]]] = defaultdict(lambda: defaultdict(list))
 
     for sel_item in sel_items:
         is_national = "全国均价" in sel_item
@@ -891,20 +900,23 @@ def _tab3_calendar(contracts, spot_dict, ref_regions, sel_items, data_date):
             if df_basis is None or df_basis.empty: continue
             df_basis["year"] = df_basis["date"].dt.year
             df_basis["doy"] = df_basis["date"].dt.dayofyear
-            df_basis["plot_date"] = df_basis["doy"].apply(_doy_to_date)
+            # ★ 修复：传入 source_year，正确处理闰年/非闰年
+            df_basis["plot_date"] = df_basis.apply(
+                lambda r: _doy_to_date(int(r["doy"]), int(r["year"])), axis=1)
             for yr, grp in df_basis.groupby("year"):
                 grp = grp.sort_values("doy").copy()
                 label = _make_trace_label(c, yr, item_short)
                 series[label] = grp
                 for _, row in grp.iterrows():
-                    doy_collectors[item_short][int(row["doy"])].append(row["basis"])
+                    md_collectors[item_short][(row["date"].month, row["date"].day)].append(row["basis"])
 
     if not series: st.warning("⚠️ 无可用数据"); return
 
-    # 每个 item 一条历史均值线
-    for item_short, dc in doy_collectors.items():
-        avg_rows = [{"doy": d, "basis": int(round(np.mean(v))), "plot_date": _doy_to_date(d)}
-                    for d, v in sorted(dc.items()) if v]
+    # ★ 修复：每个 item 一条历史均值线，用 (month, day) 构造正确的 plot_date
+    for item_short, mdc in md_collectors.items():
+        avg_rows = [{"doy": m*100+d, "basis": int(round(np.mean(v))),
+                      "plot_date": pd.Timestamp(year=2020, month=m, day=d)}
+                    for (m, d), v in sorted(mdc.items()) if v]
         if avg_rows:
             series[f"历史均值-{item_short}"] = pd.DataFrame(avg_rows).sort_values("doy")
 
@@ -998,7 +1010,8 @@ def tab4():
         st.info(info)
 
         spreads, failed = {}, []
-        spread_collector = defaultdict(list)
+        # ★ 修复：用 (month, day) 聚合，正确处理闰年/非闰年
+        spread_collector = defaultdict(list)  # key: (month, day) tuple
 
         for y in valid_years:
             ca, cb = f"LH{y}{ma}", f"LH{y}{mb}"
@@ -1008,19 +1021,27 @@ def tab4():
             cm = ac.index.intersection(bc.index)
             if len(cm) == 0: failed.append(y); continue
             sv = bc[cm] - ac[cm]; doy = cm.dayofyear
+            # ★ 修复：plot_date 直接从实际日期构造，不依赖 doy
             df_sp = pd.DataFrame({"date":cm,"spread":[int(round(v)) for v in sv.values],
-                "day_of_year":doy,"plot_date":[_doy_to_date(d) for d in doy],"trade_year":cm.year}).sort_values("date")
+                "day_of_year":doy,
+                "plot_date":[pd.Timestamp(year=2020, month=d.month, day=d.day) for d in cm],
+                "trade_year":cm.year}).sort_values("date")
             contract_pair_year = f"20{y:02d}"
             for trade_yr, grp in df_sp.groupby("trade_year"):
                 ty_str = str(trade_yr)
                 label = f"{cb[2:]}-{ca[2:]}({ty_str})" if ty_str != contract_pair_year else f"{cb[2:]}-{ca[2:]}"
                 spreads[label] = grp.sort_values("day_of_year")
-                for _, row in grp.iterrows(): spread_collector[int(row["day_of_year"])].append(row["spread"])
+                for _, row in grp.iterrows():
+                    d = row["date"]
+                    spread_collector[(d.month, d.day)].append(row["spread"])
 
         if failed: st.warning(f"⚠️ 计算失败：{'、'.join('20'+str(y) for y in failed)}")
         if not spreads: st.warning("⚠️ 无法计算价差"); return
 
-        avg_rows = [{"day_of_year":d,"spread":int(round(np.mean(v))),"plot_date":_doy_to_date(d)} for d,v in sorted(spread_collector.items()) if v]
+        # ★ 修复：用 (month, day) 构造均值 plot_date
+        avg_rows = [{"day_of_year": m*100+d, "spread": int(round(np.mean(v))),
+                      "plot_date": pd.Timestamp(year=2020, month=m, day=d)}
+                    for (m, d), v in sorted(spread_collector.items()) if v]
         if avg_rows: spreads["历史均值"] = pd.DataFrame(avg_rows).sort_values("day_of_year")
 
         st.plotly_chart(fig_spread_season(spreads, ma, mb, fut_update_date or ""), use_container_width=True)
