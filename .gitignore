@@ -20,4 +20,4 @@ data/futures/*.csv
 Thumbs.db
 
 # Misc
-*.bat
+启动*.bat
