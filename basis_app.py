@@ -49,10 +49,30 @@ DATA_DIR = BASE_DIR / "data"
 FUTURES_DIR = DATA_DIR / "futures"
 DATA_DIR.mkdir(exist_ok=True)
 FUTURES_DIR.mkdir(exist_ok=True)
-# 现货数据路径：优先项目内，否则读桌面绝对路径
-_SPOT_LOCAL = DATA_DIR / "涌益咨询日度数据.xlsx"
-_SPOT_DESKTOP = Path(r"D:\CC\Desktop\2026年6月29日涌益咨询日度数据.xlsx")
-SPOT_PATH = _SPOT_LOCAL if _SPOT_LOCAL.exists() else _SPOT_DESKTOP
+# 现货数据路径：自动扫描桌面取最新文件，否则用项目内缓存
+def _find_latest_spot() -> Path:
+    """在桌面和项目目录中寻找最新的涌益咨询 Excel"""
+    candidates = []
+    # 1. 扫描桌面
+    desktop = Path(r"D:\CC\Desktop")
+    if desktop.exists():
+        for f in desktop.glob("*涌益咨询日度数据*.xlsx"):
+            candidates.append((f.stat().st_mtime, f))
+        for f in desktop.glob("*涌益咨询*.xlsx"):
+            if f not in [c[1] for c in candidates]:
+                candidates.append((f.stat().st_mtime, f))
+    # 2. 项目内备份
+    local = DATA_DIR / "涌益咨询日度数据.xlsx"
+    if local.exists():
+        candidates.append((local.stat().st_mtime, local))
+    # 3. 按修改时间降序，取最新
+    if candidates:
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        return candidates[0][1]
+    # 4. 兜底
+    return Path(r"D:\CC\Desktop\2026年6月29日涌益咨询日度数据.xlsx")
+
+SPOT_PATH = _find_latest_spot()
 
 # ══════════════════════════════════════════════════════════════
 # 中文日期
