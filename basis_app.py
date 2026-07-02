@@ -421,21 +421,26 @@ def get_spot_data_date() -> str:
     m = re.search(r"(\d{4})年(\d{1,2})月(\d{1,2})日", fname)
     if m:
         return f"{m.group(1)}年{int(m.group(2)):02d}月{int(m.group(3)):02d}日"
-    # 2. 从Excel内部日期列获取最新日期
+    # 2. 从Excel内部日期列获取最新日期（只取2020年及以后的）
     try:
         xls = pd.ExcelFile(path)
         if len(xls.sheet_names) > 0:
             df = pd.read_excel(xls, sheet_name=0, header=None)
-            for col in range(2, min(df.shape[1], 200)):
-                for ridx in range(min(df.shape[0], 5)):
-                    v = df.iloc[ridx, col]
+            latest_dt = None
+            # 只扫描表头行(第0-1行)，找日期列
+            for row_idx in range(min(df.shape[0], 2)):
+                for col in range(min(df.shape[1], 200)):
+                    v = df.iloc[row_idx, col]
                     if pd.notna(v):
                         try:
                             dt = pd.to_datetime(v)
-                            if dt.year > 2000:
-                                return _cn(dt)
+                            if dt.year >= 2020:
+                                if latest_dt is None or dt > latest_dt:
+                                    latest_dt = dt
                         except Exception:
                             pass
+            if latest_dt is not None:
+                return _cn(latest_dt)
     except Exception:
         pass
     return "无现货数据"
