@@ -412,35 +412,34 @@ def _get_row_at_md(df, target_month: int, target_day: int):
         return before.iloc[-1]
     return df.iloc[-1]
 
-@st.cache_data(ttl=3600)
 def get_spot_data_date() -> str:
     """从现货Excel文件名或内部数据提取最新日期"""
     path = SPOT_PATH
     # 1. 从文件名提取日期（如"2026年6月29日涌益咨询日度数据.xlsx"）
-    fname = path.stem
-    m = re.search(r"(\d{4})年(\d{1,2})月(\d{1,2})日", fname)
+    fname = path.name  # 用完整文件名避免 stem 丢失编码
+    m = re.search(r"(\d{4})[年\-](\d{1,2})[月\-](\d{1,2})日?", fname)
     if m:
         return f"{m.group(1)}年{int(m.group(2)):02d}月{int(m.group(3)):02d}日"
-    # 2. 从Excel内部日期列获取最新日期（只取2020年及以后的）
+    # 2. 从Excel表头行取所有日期列，返回最大值
     try:
-        xls = pd.ExcelFile(path)
-        if len(xls.sheet_names) > 0:
-            df = pd.read_excel(xls, sheet_name=0, header=None)
-            latest_dt = None
-            # 只扫描表头行(第0-1行)，找日期列
-            for row_idx in range(min(df.shape[0], 2)):
-                for col in range(min(df.shape[1], 200)):
-                    v = df.iloc[row_idx, col]
-                    if pd.notna(v):
-                        try:
-                            dt = pd.to_datetime(v)
-                            if dt.year >= 2020:
-                                if latest_dt is None or dt > latest_dt:
-                                    latest_dt = dt
-                        except Exception:
-                            pass
-            if latest_dt is not None:
-                return _cn(latest_dt)
+        if path.exists():
+            xls = pd.ExcelFile(path)
+            if len(xls.sheet_names) > 0:
+                df = pd.read_excel(xls, sheet_name=0, header=None, nrows=2)
+                latest_dt = None
+                for row_idx in range(min(df.shape[0], 2)):
+                    for col in range(min(df.shape[1], 500)):
+                        v = df.iloc[row_idx, col]
+                        if pd.notna(v):
+                            try:
+                                dt = pd.to_datetime(v)
+                                if dt.year >= 2020:
+                                    if latest_dt is None or dt > latest_dt:
+                                        latest_dt = dt
+                            except Exception:
+                                pass
+                if latest_dt is not None:
+                    return _cn(latest_dt)
     except Exception:
         pass
     return "无现货数据"
