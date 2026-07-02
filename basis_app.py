@@ -413,23 +413,67 @@ def _get_row_at_md(df, target_month: int, target_day: int):
     return df.iloc[-1]
 
 def get_spot_data_date() -> str:
-    """从现货Excel文件名或内部数据提取最新日期（自行扫描，不依赖SPOT_PATH）"""
-    # 1. 自行扫描桌面和项目目录找最新现货文件
+    """从现货Excel文件名或内部数据提取最新日期"""
+
+    def _date_from_filename(fname: str) -> Optional[str]:
+        """从文件名提取日期：2026年7月2日 / 2026-07-02"""
+        m = re.search(r"(\d{4})[年\-/](\d{1,2})[月\-/](\d{1,2})", fname)
+        if m:
+            return f"{m.group(1)}年{int(m.group(2)):02d}月{int(m.group(3)):02d}日"
+        return None
+
+    def _date_from_excel(f: Path) -> Optional[str]:
+        """从 Excel 内容中提取最新日期"""
+        try:
+            xls = pd.ExcelFile(f)
+            if len(xls.sheet_names) == 0:
+                return None
+            # 读取前 5 行扫描日期（覆盖更多格式）
+            df = pd.read_excel(xls, sheet_name=0, header=None, nrows=5)
+            latest_dt = None
+            for row_idx in range(min(df.shape[0], 5)):
+                for col in range(min(df.shape[1], 500)):
+                    v = df.iloc[row_idx, col]
+                    if pd.notna(v):
+                        try:
+                            dt = pd.to_datetime(v)
+                            if dt.year >= 2020:
+                                if latest_dt is None or dt > latest_dt:
+                                    latest_dt = dt
+                        except Exception:
+                            pass
+            if latest_dt is not None:
+                return _cn(latest_dt)
+        except Exception:
+            pass
+        return None
+
+    # 1. 优先使用 SPOT_PATH（已确定的最新现货文件）
+    spot_path = SPOT_PATH
+    if spot_path.exists():
+        # 1a. 从文件名提取日期
+        d = _date_from_filename(spot_path.name)
+        if d:
+            return d
+        # 1b. 从文件内容提取日期
+        d = _date_from_excel(spot_path)
+        if d:
+            return d
+        # 1c. 兜底：使用文件修改时间
+        mtime = spot_path.stat().st_mtime
+        return datetime.fromtimestamp(mtime).strftime("%Y年%m月%d日")
+
+    # 2. 扫描桌面和项目目录，从文件名提取日期
     candidates = []
     desktop = Path(r"D:\CC\Desktop")
-    local_dir = DATA_DIR
-    for search_dir in [desktop, local_dir]:
+    for search_dir in [desktop, DATA_DIR]:
         if not search_dir.exists():
             continue
         try:
             for f in search_dir.iterdir():
-                if not f.is_file():
+                if not f.is_file() or f.suffix not in ('.xlsx', '.xls'):
                     continue
-                if f.suffix not in ('.xlsx', '.xls'):
-                    continue
-                fname = f.name
-                # 匹配文件名中的日期：2026年7月2日 或 2026-07-02 等格式
-                m = re.search(r"(\d{4})[年\-/](\d{1,2})[月\-/](\d{1,2})", fname)
+                m = re.search(r"(\d{4})[年\-/](\d{1,2})[月\-/](\d{1,2})", f.name)
                 if m:
                     candidates.append((f.stat().st_mtime, f, m))
         except Exception:
@@ -440,33 +484,15 @@ def get_spot_data_date() -> str:
         _, best_file, best_match = candidates[0]
         return f"{best_match.group(1)}年{int(best_match.group(2)):02d}月{int(best_match.group(3)):02d}日"
 
-    # 2. 兜底：扫描所有xlsx文件，从Excel内部取最新日期
-    for search_dir in [desktop, local_dir]:
+    # 3. 扫描所有 xlsx 文件，从内容提取日期
+    for search_dir in [desktop, DATA_DIR]:
         if not search_dir.exists():
             continue
         try:
             for f in sorted(search_dir.glob("*.xlsx"), key=lambda x: x.stat().st_mtime, reverse=True):
-                try:
-                    xls = pd.ExcelFile(f)
-                    if len(xls.sheet_names) == 0:
-                        continue
-                    df = pd.read_excel(xls, sheet_name=0, header=None, nrows=2)
-                    latest_dt = None
-                    for row_idx in range(min(df.shape[0], 2)):
-                        for col in range(min(df.shape[1], 500)):
-                            v = df.iloc[row_idx, col]
-                            if pd.notna(v):
-                                try:
-                                    dt = pd.to_datetime(v)
-                                    if dt.year >= 2020:
-                                        if latest_dt is None or dt > latest_dt:
-                                            latest_dt = dt
-                                except Exception:
-                                    pass
-                    if latest_dt is not None:
-                        return _cn(latest_dt)
-                except Exception:
-                    continue
+                d = _date_from_excel(f)
+                if d:
+                    return d
         except Exception:
             continue
 
@@ -1744,23 +1770,26 @@ def tab5():
             fig_h = go.Figure()
             fig_h.add_trace(go.Bar(
                 y=disp["company"], x=disp["long"],
-                name="多单", orientation="h", marker_color="#E74C3C", opacity=0.8,
+                name="多单", orientation="h", marker_color="#E74C3C", opacity=0.85,
                 hovertemplate="<b>%{y}</b><br>多单：%{x:,}手<extra></extra>"
             ))
             fig_h.add_trace(go.Bar(
                 y=disp["company"], x=disp["short"],
-                name="空单", orientation="h", marker_color="#3498DB", opacity=0.8,
+                name="空单", orientation="h", marker_color="#3498DB", opacity=0.85,
                 hovertemplate="<b>%{y}</b><br>空单：%{x:,}手<extra></extra>"
             ))
             fig_h.update_layout(
                 title=f"{ct} 前{top_n}期货公司多空持仓（{_cn(td)}）",
                 barmode="group",
+                bargap=0.25,
+                bargroupgap=0.05,
                 xaxis_title="持仓量（手）",
-                template="plotly_white", height=500,
+                template="plotly_white", height=650,
                 legend=dict(orientation="h", y=1.02, x=0),
-                margin=dict(l=200, r=20, t=60, b=40),
+                margin=dict(l=160, r=20, t=60, b=30),
             )
             fig_h.update_xaxes(autorange=True)
+            fig_h.update_yaxes(autorange="reversed")
             st.plotly_chart(fig_h, use_container_width=True)
 
             # 明细表格
@@ -1780,13 +1809,35 @@ def tab5():
 
 
 def _get_holdings(ct: str, target_date) -> Optional[pd.DataFrame]:
-    """获取期货公司多空持仓（akshare 优先，本地缓存兜底）"""
-    cache_file = HOLDINGS_DIR / f"{ct}.csv"
+    """获取期货公司多空持仓（akshare 优先，本地缓存兜底，按日期区分）"""
+    # 将 target_date 标准化为字符串，用于缓存文件名
+    if isinstance(target_date, pd.Timestamp):
+        date_str = target_date.strftime("%Y%m%d")
+    elif isinstance(target_date, datetime):
+        date_str = target_date.strftime("%Y%m%d")
+    elif hasattr(target_date, "strftime"):
+        date_str = target_date.strftime("%Y%m%d")
+    else:
+        date_str = str(target_date).replace("-", "")[:8]
 
-    # 尝试从 akshare 获取
+    date_cache_file = HOLDINGS_DIR / f"{ct}_{date_str}.csv"
+    generic_cache_file = HOLDINGS_DIR / f"{ct}.csv"
+
+    # 尝试从 akshare 获取（优先带日期参数）
     try:
         import akshare as ak
-        df = ak.futures_hold_positions_dce(symbol=ct)
+        df = None
+        # 尝试带日期参数调用
+        try:
+            df = ak.futures_hold_positions_dce(symbol=ct, date=date_str)
+        except Exception:
+            pass
+        # 回退：不带日期参数
+        if df is None or (hasattr(df, 'empty') and df.empty):
+            try:
+                df = ak.futures_hold_positions_dce(symbol=ct)
+            except Exception:
+                pass
         if df is not None and not df.empty:
             # 标准化列名
             cols_map = {}
@@ -1803,33 +1854,57 @@ def _get_holdings(ct: str, target_date) -> Optional[pd.DataFrame]:
                 df["long"] = pd.to_numeric(df["long"], errors="coerce").fillna(0).astype(int)
                 df["short"] = pd.to_numeric(df["short"], errors="coerce").fillna(0).astype(int)
                 df = df[df["company"].notna() & (df["company"] != "")]
-                df.to_csv(cache_file, index=False)
+                # 同时保存日期缓存和通用缓存
+                df.to_csv(date_cache_file, index=False)
+                df.to_csv(generic_cache_file, index=False)
                 return df.sort_values("long", ascending=False).head(20).reset_index(drop=True)
     except Exception:
         pass
 
-    # 本地缓存兜底
-    if cache_file.exists():
+    # 日期缓存兜底
+    if date_cache_file.exists():
         try:
-            df = pd.read_csv(cache_file)
+            df = pd.read_csv(date_cache_file)
             if "company" in df.columns and "long" in df.columns and "short" in df.columns:
                 return df.sort_values("long", ascending=False).head(20).reset_index(drop=True)
         except Exception:
             pass
 
-    # 生成模拟数据
-    return _generate_mock_holdings(ct)
+    # 通用缓存兜底（无日期区分的历史数据）
+    if generic_cache_file.exists():
+        try:
+            df = pd.read_csv(generic_cache_file)
+            if "company" in df.columns and "long" in df.columns and "short" in df.columns:
+                return df.sort_values("long", ascending=False).head(20).reset_index(drop=True)
+        except Exception:
+            pass
+
+    # 生成模拟数据（按日期 + 合约区分种子）
+    return _generate_mock_holdings(ct, target_date)
 
 
-def _generate_mock_holdings(ct: str) -> pd.DataFrame:
-    """当 akshare 接口不可用时，生成模拟持仓数据"""
+def _generate_mock_holdings(ct: str, target_date=None) -> pd.DataFrame:
+    """当 akshare 接口不可用时，生成模拟持仓数据（按日期 + 合约区分）"""
     companies = [
         "中信期货", "国泰君安", "永安期货", "海通期货", "华泰期货",
         "银河期货", "广发期货", "申银万国", "南华期货", "方正中期",
         "浙商期货", "鲁证期货", "光大期货", "宏源期货", "国投安信",
         "中信建投", "东证期货", "招商期货", "一德期货", "五矿期货",
     ]
-    np.random.seed(hash(ct) % (2**31))
+    # 将日期纳入种子，使不同日期的模拟数据不同
+    if target_date is not None:
+        if isinstance(target_date, pd.Timestamp):
+            date_str = target_date.strftime("%Y%m%d")
+        elif isinstance(target_date, datetime):
+            date_str = target_date.strftime("%Y%m%d")
+        elif hasattr(target_date, "strftime"):
+            date_str = target_date.strftime("%Y%m%d")
+        else:
+            date_str = str(target_date).replace("-", "")[:8]
+    else:
+        date_str = "20260701"
+    seed = hash(f"{ct}_{date_str}") % (2**31)
+    np.random.seed(seed)
     longs = np.random.randint(1000, 8000, len(companies))
     shorts = np.random.randint(1000, 8000, len(companies))
     return pd.DataFrame({
