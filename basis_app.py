@@ -413,35 +413,63 @@ def _get_row_at_md(df, target_month: int, target_day: int):
     return df.iloc[-1]
 
 def get_spot_data_date() -> str:
-    """从现货Excel文件名或内部数据提取最新日期"""
-    path = SPOT_PATH
-    # 1. 从文件名提取日期（如"2026年6月29日涌益咨询日度数据.xlsx"）
-    fname = path.name  # 用完整文件名避免 stem 丢失编码
-    m = re.search(r"(\d{4})[年\-](\d{1,2})[月\-](\d{1,2})日?", fname)
-    if m:
-        return f"{m.group(1)}年{int(m.group(2)):02d}月{int(m.group(3)):02d}日"
-    # 2. 从Excel表头行取所有日期列，返回最大值
-    try:
-        if path.exists():
-            xls = pd.ExcelFile(path)
-            if len(xls.sheet_names) > 0:
-                df = pd.read_excel(xls, sheet_name=0, header=None, nrows=2)
-                latest_dt = None
-                for row_idx in range(min(df.shape[0], 2)):
-                    for col in range(min(df.shape[1], 500)):
-                        v = df.iloc[row_idx, col]
-                        if pd.notna(v):
-                            try:
-                                dt = pd.to_datetime(v)
-                                if dt.year >= 2020:
-                                    if latest_dt is None or dt > latest_dt:
-                                        latest_dt = dt
-                            except Exception:
-                                pass
-                if latest_dt is not None:
-                    return _cn(latest_dt)
-    except Exception:
-        pass
+    """从现货Excel文件名或内部数据提取最新日期（自行扫描，不依赖SPOT_PATH）"""
+    # 1. 自行扫描桌面和项目目录找最新现货文件
+    candidates = []
+    desktop = Path(r"D:\CC\Desktop")
+    local_dir = DATA_DIR
+    for search_dir in [desktop, local_dir]:
+        if not search_dir.exists():
+            continue
+        try:
+            for f in search_dir.iterdir():
+                if not f.is_file():
+                    continue
+                if f.suffix not in ('.xlsx', '.xls'):
+                    continue
+                fname = f.name
+                # 匹配文件名中的日期：2026年7月2日 或 2026-07-02 等格式
+                m = re.search(r"(\d{4})[年\-/](\d{1,2})[月\-/](\d{1,2})", fname)
+                if m:
+                    candidates.append((f.stat().st_mtime, f, m))
+        except Exception:
+            continue
+
+    if candidates:
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        _, best_file, best_match = candidates[0]
+        return f"{best_match.group(1)}年{int(best_match.group(2)):02d}月{int(best_match.group(3)):02d}日"
+
+    # 2. 兜底：扫描所有xlsx文件，从Excel内部取最新日期
+    for search_dir in [desktop, local_dir]:
+        if not search_dir.exists():
+            continue
+        try:
+            for f in sorted(search_dir.glob("*.xlsx"), key=lambda x: x.stat().st_mtime, reverse=True):
+                try:
+                    xls = pd.ExcelFile(f)
+                    if len(xls.sheet_names) == 0:
+                        continue
+                    df = pd.read_excel(xls, sheet_name=0, header=None, nrows=2)
+                    latest_dt = None
+                    for row_idx in range(min(df.shape[0], 2)):
+                        for col in range(min(df.shape[1], 500)):
+                            v = df.iloc[row_idx, col]
+                            if pd.notna(v):
+                                try:
+                                    dt = pd.to_datetime(v)
+                                    if dt.year >= 2020:
+                                        if latest_dt is None or dt > latest_dt:
+                                            latest_dt = dt
+                                except Exception:
+                                    pass
+                    if latest_dt is not None:
+                        return _cn(latest_dt)
+                except Exception:
+                    continue
+        except Exception:
+            continue
+
     return "无现货数据"
 
 def load_futures(ct: str, force: bool = False) -> Tuple[Optional[pd.DataFrame], str]:
