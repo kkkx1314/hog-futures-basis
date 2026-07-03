@@ -429,25 +429,27 @@ def get_spot_data_date() -> str:
         return None
 
     def _date_from_excel(f: Path) -> Optional[str]:
-        """从 Excel 内容中提取最新日期"""
+        """从 Excel 内容中提取最新日期（扫描全部 sheet）"""
         try:
             xls = pd.ExcelFile(f)
-            if len(xls.sheet_names) == 0:
-                return None
-            # 读取前 5 行扫描日期（覆盖更多格式）
-            df = pd.read_excel(xls, sheet_name=0, header=None, nrows=5)
             latest_dt = None
-            for row_idx in range(min(df.shape[0], 5)):
-                for col in range(min(df.shape[1], 500)):
-                    v = df.iloc[row_idx, col]
-                    if pd.notna(v):
-                        try:
-                            dt = pd.to_datetime(v)
-                            if dt.year >= 2020:
-                                if latest_dt is None or dt > latest_dt:
-                                    latest_dt = dt
-                        except Exception:
-                            pass
+            for sheet_name in xls.sheet_names[:3]:  # 最多扫3个sheet
+                try:
+                    # 扫描更多行以确保能找到数据日期
+                    df = pd.read_excel(xls, sheet_name=sheet_name, header=None, nrows=50)
+                    for row_idx in range(min(df.shape[0], 50)):
+                        for col in range(min(df.shape[1], 500)):
+                            v = df.iloc[row_idx, col]
+                            if pd.notna(v):
+                                try:
+                                    dt = pd.to_datetime(v)
+                                    if pd.Timestamp("2020-01-01") <= dt <= pd.Timestamp("2030-12-31"):
+                                        if latest_dt is None or dt > latest_dt:
+                                            latest_dt = dt
+                                except Exception:
+                                    pass
+                except Exception:
+                    pass
             if latest_dt is not None:
                 return _cn(latest_dt)
         except Exception:
@@ -461,13 +463,10 @@ def get_spot_data_date() -> str:
         d = _date_from_filename(spot_path.name)
         if d:
             return d
-        # 1b. 从文件内容提取日期
+        # 1b. 从文件内容提取日期（★ 不依赖文件修改时间）
         d = _date_from_excel(spot_path)
         if d:
             return d
-        # 1c. 兜底：使用文件修改时间
-        mtime = spot_path.stat().st_mtime
-        return datetime.fromtimestamp(mtime).strftime("%Y年%m月%d日")
 
     # 2. 扫描桌面和项目目录，从文件名提取日期
     candidates = []
@@ -1856,14 +1855,14 @@ def tab5():
             # ── 构建柱状图 ──
             fig_h = go.Figure()
 
-            # 多单 — 文字在柱内（白色）
+            # 多单 — 文字在柱内（白色），字号加大
             fig_h.add_trace(go.Bar(
                 y=disp["company_label"], x=disp["long"],
                 name="多单", orientation="h",
                 marker_color="#E74C3C", opacity=0.85,
                 text=[f"{v:,}" for v in disp["long"]],
                 textposition="inside", insidetextanchor="middle",
-                textfont=dict(color="white", size=10),
+                textfont=dict(color="white", size=13),
                 customdata=disp[["short", "long_change", "short_change", "change_label"]].values,
                 hovertemplate=(
                     "<b>%{y}</b><br>"
@@ -1873,14 +1872,14 @@ def tab5():
                 ),
             ))
 
-            # 空单 — 文字在柱外
+            # 空单 — 文字在柱外，字号加大
             fig_h.add_trace(go.Bar(
                 y=disp["company_label"], x=disp["short"],
                 name="空单", orientation="h",
                 marker_color="#3498DB", opacity=0.85,
                 text=[f"{v:,}" for v in disp["short"]],
                 textposition="outside",
-                textfont=dict(color="#3498DB", size=10),
+                textfont=dict(color="#3498DB", size=13),
                 customdata=disp[["long", "long_change", "short_change", "change_label"]].values,
                 hovertemplate=(
                     "<b>%{y}</b><br>"
@@ -1930,6 +1929,77 @@ def tab5():
                 "🟢 **正指**（国泰君安、中粮期货、东证期货）—— 方向与行情正相关 ｜ "
                 "🔴 **反指**（东方财富、徽商期货、平安期货）—— 方向与行情负相关"
             )
+
+            # ── 正指/反指 动向结论 ──
+            def _analyze_direction(name: str, lc: int, sc: int, is_zhengzhi: bool) -> str:
+                """根据多空变化判断方向意图"""
+                tag = "正指" if is_zhengzhi else "反指"
+                parts = []
+                if lc > 0: parts.append(f"加多+{lc:,}")
+                elif lc < 0: parts.append(f"减多{lc:,}")
+                if sc > 0: parts.append(f"加空+{sc:,}")
+                elif sc < 0: parts.append(f"减空{sc:,}")
+                action = "、".join(parts) if parts else "持仓不变"
+
+                # 判断方向
+                if lc > 0 and sc < 0:
+                    intent = "看多" if is_zhengzhi else "看空"
+                    detail = "加多减空" if is_zhengzhi else "加多减空（反向信号）"
+                elif lc < 0 and sc > 0:
+                    intent = "看空" if is_zhengzhi else "看多"
+                    detail = "减多加空" if is_zhengzhi else "减多加空（反向信号）"
+                elif lc > 0 and sc > 0:
+                    intent = "多空分歧"
+                    detail = "双向加仓，方向不明确"
+                elif lc < 0 and sc < 0:
+                    intent = "观望离场"
+                    detail = "双向减仓，资金流出"
+                else:
+                    intent = "中性"
+                    detail = "变化不大"
+
+                if is_zhengzhi:
+                    return f"**{name}** 🟢正指：{action} → {intent}（{detail}）"
+                else:
+                    return f"**{name}** 🔴反指：{action} → {intent}（{detail}）"
+
+            zhengzhi_found = []
+            fanzhi_found = []
+            for _, row in disp.iterrows():
+                co = row["company"]
+                lc = int(row["long_change"])
+                sc = int(row["short_change"])
+                if co in ZHENGZHI_COMPANIES:
+                    zhengzhi_found.append(_analyze_direction(co, lc, sc, True))
+                elif co in FANZHI_COMPANIES:
+                    fanzhi_found.append(_analyze_direction(co, lc, sc, False))
+
+            if zhengzhi_found or fanzhi_found:
+                st.markdown("##### 🔍 关键席位动向")
+                if zhengzhi_found:
+                    st.markdown("**🟢 正指席位**（方向与行情一致）：")
+                    for line in zhengzhi_found:
+                        st.markdown(f"- {line}")
+                if fanzhi_found:
+                    st.markdown("**🔴 反指席位**（方向与行情相反）：")
+                    for line in fanzhi_found:
+                        st.markdown(f"- {line}")
+                # 综合判断
+                st.markdown("---")
+                zz_bull = sum(1 for z in zhengzhi_found if "看多" in z)
+                zz_bear = sum(1 for z in zhengzhi_found if "看空" in z)
+                fz_bull = sum(1 for z in fanzhi_found if "看多" in z)
+                fz_bear = sum(1 for z in fanzhi_found if "看空" in z)
+                # 正指看多+反指看空 = 偏多；正指看空+反指看多 = 偏空
+                bull_score = zz_bull + fz_bear
+                bear_score = zz_bear + fz_bull
+                if bull_score > bear_score:
+                    overall = "🐂 **综合偏多** — 正指做多且反指未看多，方向一致性较强"
+                elif bear_score > bull_score:
+                    overall = "🐻 **综合偏空** — 正指做空且反指未看空，方向一致性较强"
+                else:
+                    overall = "⚖️ **方向分歧** — 正指和反指信号不一致，市场缺乏明确方向"
+                st.markdown(overall)
 
             # ── 明细表格（含日变化列） ──
             with st.expander("📋 持仓明细表"):
