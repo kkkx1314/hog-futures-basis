@@ -151,6 +151,12 @@ REGION_PALETTE = [
 ]
 
 # ══════════════════════════════════════════════════════════════
+# 正指 / 反指 期货公司
+# ══════════════════════════════════════════════════════════════
+ZHENGZHI_COMPANIES = {"国泰君安", "中粮期货", "东证期货"}
+FANZHI_COMPANIES = {"东方财富", "徽商期货", "平安期货"}
+
+# ══════════════════════════════════════════════════════════════
 # 辅助：合约代码提取 & 颜色
 # ══════════════════════════════════════════════════════════════
 def _extract_contract_code(label: str) -> str:
@@ -1759,6 +1765,21 @@ def tab5():
 
         # ── 下方：前20期货公司多空持仓 ──
         st.markdown("#### 🏢 前20期货公司多空持仓")
+
+        # 获取前一个交易日
+        prev_td = None
+        fds_sorted = sorted(fds)
+        td_idx = fds_sorted.index(td) if td in fds_sorted else -1
+        if td_idx > 0:
+            prev_td = fds_sorted[td_idx - 1]
+        elif td not in fds_sorted:
+            # td 不在 fds 中（已回退到 nearby），取其前一个
+            for i, d in enumerate(fds_sorted):
+                if d >= td:
+                    if i > 0:
+                        prev_td = fds_sorted[i - 1]
+                    break
+
         holdings_df = _get_holdings(ct, td)
         if holdings_df is not None and not holdings_df.empty:
             # 分组柱状图
@@ -1767,40 +1788,132 @@ def tab5():
             # 计算净持仓
             disp["净持仓"] = disp["long"] - disp["short"]
 
+            # ── 获取昨日数据，计算日变化 ──
+            prev_holdings = None
+            if prev_td is not None:
+                prev_holdings = _get_holdings(ct, prev_td)
+            disp["long_change"] = 0
+            disp["short_change"] = 0
+            if prev_holdings is not None and not prev_holdings.empty:
+                prev_map = {r["company"]: r for _, r in prev_holdings.iterrows()}
+                for i, row in disp.iterrows():
+                    co = row["company"]
+                    if co in prev_map:
+                        disp.at[i, "long_change"] = int(row["long"]) - int(prev_map[co]["long"])
+                        disp.at[i, "short_change"] = int(row["short"]) - int(prev_map[co]["short"])
+
+            # ── 添加正指/反指标签 ──
+            def _tag_company(name: str) -> str:
+                if name in ZHENGZHI_COMPANIES:
+                    return f"{name} 🟢正"
+                if name in FANZHI_COMPANIES:
+                    return f"{name} 🔴反"
+                return name
+
+            disp["company_label"] = disp["company"].apply(_tag_company)
+
+            # ── 日变化文字（用于右侧标注） ──
+            def _change_text(lc: int, sc: int) -> str:
+                parts = []
+                if lc != 0:
+                    parts.append(f"多{'＋' if lc > 0 else ''}{lc}")
+                if sc != 0:
+                    parts.append(f"空{'＋' if sc > 0 else ''}{sc}")
+                return "  ".join(parts) if parts else ""
+
+            disp["change_label"] = disp.apply(
+                lambda r: _change_text(int(r["long_change"]), int(r["short_change"])), axis=1)
+
+            # ── 构建柱状图 ──
             fig_h = go.Figure()
+
+            # 多单 — 文字在柱内（白色）
             fig_h.add_trace(go.Bar(
-                y=disp["company"], x=disp["long"],
-                name="多单", orientation="h", marker_color="#E74C3C", opacity=0.85,
-                hovertemplate="<b>%{y}</b><br>多单：%{x:,}手<extra></extra>"
+                y=disp["company_label"], x=disp["long"],
+                name="多单（多头持仓）", orientation="h",
+                marker_color="#E74C3C", opacity=0.85,
+                text=[f"{v:,}" for v in disp["long"]],
+                textposition="inside", insidetextanchor="middle",
+                textfont=dict(color="white", size=10),
+                customdata=disp[["short", "long_change", "short_change", "change_label"]].values,
+                hovertemplate=(
+                    "<b>%{y}</b><br>"
+                    "多单：%{x:,}手"
+                    "<extra></extra>"
+                ),
             ))
+
+            # 空单 — 文字在柱外
             fig_h.add_trace(go.Bar(
-                y=disp["company"], x=disp["short"],
-                name="空单", orientation="h", marker_color="#3498DB", opacity=0.85,
-                hovertemplate="<b>%{y}</b><br>空单：%{x:,}手<extra></extra>"
+                y=disp["company_label"], x=disp["short"],
+                name="空单（空头持仓）", orientation="h",
+                marker_color="#3498DB", opacity=0.85,
+                text=[f"{v:,}" for v in disp["short"]],
+                textposition="outside",
+                textfont=dict(color="#3498DB", size=10),
+                customdata=disp[["long", "long_change", "short_change", "change_label"]].values,
+                hovertemplate=(
+                    "<b>%{y}</b><br>"
+                    "空单：%{x:,}手"
+                    "<extra></extra>"
+                ),
             ))
+
+            # ── 日变化标注（在图表右侧添加文字标注） ──
+            annotations = []
+            max_x = max(disp["long"].max(), disp["short"].max())
+            for i, (_, row) in enumerate(disp.iterrows()):
+                cl = row["change_label"]
+                if cl:
+                    annotations.append(dict(
+                        x=max_x * 1.12,
+                        y=row["company_label"],
+                        text=f"<span style='font-size:10px;color:#555'>{cl}</span>",
+                        showarrow=False,
+                        xanchor="left",
+                        yanchor="middle",
+                    ))
+
             fig_h.update_layout(
-                title=f"{ct} 前{top_n}期货公司多空持仓（{_cn(td)}）",
+                title=(
+                    f"{ct} 前{top_n}期货公司多空持仓（{_cn(td)}）"
+                    + (f"<br><sup>📐 日变化对比：{_cn(prev_td)} → {_cn(td)}</sup>" if prev_td is not None else "")
+                ),
                 barmode="group",
-                bargap=0.25,
-                bargroupgap=0.05,
+                bargap=0.22,
+                bargroupgap=0.08,
                 xaxis_title="持仓量（手）",
-                template="plotly_white", height=650,
+                template="plotly_white", height=max(500, top_n * 32),
                 legend=dict(orientation="h", y=1.02, x=0),
-                margin=dict(l=160, r=20, t=60, b=30),
+                margin=dict(l=170, r=160, t=70, b=30),
+                annotations=annotations,
             )
             fig_h.update_xaxes(autorange=True)
             fig_h.update_yaxes(autorange="reversed")
             st.plotly_chart(fig_h, use_container_width=True)
 
-            # 明细表格
+            # ── 图例说明 ──
+            st.caption(
+                "🟢 **正指**（国泰君安、中粮期货、东证期货）—— 方向与行情正相关 ｜ "
+                "🔴 **反指**（东方财富、徽商期货、平安期货）—— 方向与行情负相关"
+            )
+
+            # ── 明细表格（含日变化列） ──
             with st.expander("📋 持仓明细表"):
                 tbl = disp.copy()
                 tbl["多单"] = tbl["long"].apply(lambda x: f"{x:,}")
                 tbl["空单"] = tbl["short"].apply(lambda x: f"{x:,}")
                 tbl["净持仓"] = tbl["净持仓"].apply(lambda x: f"{x:+,}")
-                st.dataframe(tbl[["company", "多单", "空单", "净持仓"]].rename(
-                    columns={"company": "期货公司"}
-                ), use_container_width=True, hide_index=True)
+                tbl["多单变化"] = tbl["long_change"].apply(
+                    lambda x: f"＋{x:,}" if x > 0 else (f"{x:,}" if x < 0 else "—"))
+                tbl["空单变化"] = tbl["short_change"].apply(
+                    lambda x: f"＋{x:,}" if x > 0 else (f"{x:,}" if x < 0 else "—"))
+                col_order = ["company", "多单", "空单", "净持仓"]
+                if prev_holdings is not None and not prev_holdings.empty:
+                    col_order += ["多单变化", "空单变化"]
+                st.dataframe(
+                    tbl[col_order].rename(columns={"company": "期货公司"}),
+                    use_container_width=True, hide_index=True)
         else:
             st.warning("⚠️ 持仓数据暂不可用（接口受限，请稍后重试）")
             # 模拟数据展示
@@ -1888,8 +2001,8 @@ def _generate_mock_holdings(ct: str, target_date=None) -> pd.DataFrame:
     companies = [
         "中信期货", "国泰君安", "永安期货", "海通期货", "华泰期货",
         "银河期货", "广发期货", "申银万国", "南华期货", "方正中期",
-        "浙商期货", "鲁证期货", "光大期货", "宏源期货", "国投安信",
-        "中信建投", "东证期货", "招商期货", "一德期货", "五矿期货",
+        "浙商期货", "中粮期货", "东方财富", "徽商期货", "国投安信",
+        "中信建投", "东证期货", "招商期货", "平安期货", "五矿期货",
     ]
     # 将日期纳入种子，使不同日期的模拟数据不同
     if target_date is not None:
