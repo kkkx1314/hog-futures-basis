@@ -1788,19 +1788,32 @@ def tab5():
             # 计算净持仓
             disp["净持仓"] = disp["long"] - disp["short"]
 
-            # ── 获取昨日数据，计算日变化 ──
-            prev_holdings = None
-            if prev_td is not None:
-                prev_holdings = _get_holdings(ct, prev_td)
-            disp["long_change"] = 0
-            disp["short_change"] = 0
-            if prev_holdings is not None and not prev_holdings.empty:
-                prev_map = {r["company"]: r for _, r in prev_holdings.iterrows()}
-                for i, row in disp.iterrows():
-                    co = row["company"]
-                    if co in prev_map:
-                        disp.at[i, "long_change"] = int(row["long"]) - int(prev_map[co]["long"])
-                        disp.at[i, "short_change"] = int(row["short"]) - int(prev_map[co]["short"])
+            # ── 日变化：优先用 API 返回的增减列，否则从前日数据推算 ──
+            api_long_chg = "long_change_api" in disp.columns
+            api_short_chg = "short_change_api" in disp.columns
+            if api_long_chg:
+                disp["long_change"] = disp["long_change_api"].fillna(0).astype(int)
+            else:
+                disp["long_change"] = 0
+            if api_short_chg:
+                disp["short_change"] = disp["short_change_api"].fillna(0).astype(int)
+            else:
+                disp["short_change"] = 0
+
+            if not api_long_chg or not api_short_chg:
+                # 回退：从前一日数据计算（仅对 API 未提供的列）
+                prev_holdings = None
+                if prev_td is not None:
+                    prev_holdings = _get_holdings(ct, prev_td)
+                if prev_holdings is not None and not prev_holdings.empty:
+                    prev_map = {r["company"]: r for _, r in prev_holdings.iterrows()}
+                    for i, row in disp.iterrows():
+                        co = row["company"]
+                        if co in prev_map:
+                            if not api_long_chg:
+                                disp.at[i, "long_change"] = int(row["long"]) - int(prev_map[co]["long"])
+                            if not api_short_chg:
+                                disp.at[i, "short_change"] = int(row["short"]) - int(prev_map[co]["short"])
 
             # ── 添加正指/反指标签 ──
             def _tag_company(name: str) -> str:
@@ -1812,13 +1825,17 @@ def tab5():
 
             disp["company_label"] = disp["company"].apply(_tag_company)
 
-            # ── 日变化文字（用于右侧标注） ──
+            # ── 日变化文字（加多/减多/加空/减空） ──
             def _change_text(lc: int, sc: int) -> str:
                 parts = []
-                if lc != 0:
-                    parts.append(f"多{'＋' if lc > 0 else ''}{lc}")
-                if sc != 0:
-                    parts.append(f"空{'＋' if sc > 0 else ''}{sc}")
+                if lc > 0:
+                    parts.append(f"加多+{lc}")
+                elif lc < 0:
+                    parts.append(f"减多{lc}")
+                if sc > 0:
+                    parts.append(f"加空+{sc}")
+                elif sc < 0:
+                    parts.append(f"减空{sc}")
                 return "  ".join(parts) if parts else ""
 
             disp["change_label"] = disp.apply(
@@ -1830,7 +1847,7 @@ def tab5():
             # 多单 — 文字在柱内（白色）
             fig_h.add_trace(go.Bar(
                 y=disp["company_label"], x=disp["long"],
-                name="多单（多头持仓）", orientation="h",
+                name="多单", orientation="h",
                 marker_color="#E74C3C", opacity=0.85,
                 text=[f"{v:,}" for v in disp["long"]],
                 textposition="inside", insidetextanchor="middle",
@@ -1838,7 +1855,8 @@ def tab5():
                 customdata=disp[["short", "long_change", "short_change", "change_label"]].values,
                 hovertemplate=(
                     "<b>%{y}</b><br>"
-                    "多单：%{x:,}手"
+                    "多单：%{x:,}手<br>"
+                    "%{customdata[3]}"
                     "<extra></extra>"
                 ),
             ))
@@ -1846,7 +1864,7 @@ def tab5():
             # 空单 — 文字在柱外
             fig_h.add_trace(go.Bar(
                 y=disp["company_label"], x=disp["short"],
-                name="空单（空头持仓）", orientation="h",
+                name="空单", orientation="h",
                 marker_color="#3498DB", opacity=0.85,
                 text=[f"{v:,}" for v in disp["short"]],
                 textposition="outside",
@@ -1854,19 +1872,21 @@ def tab5():
                 customdata=disp[["long", "long_change", "short_change", "change_label"]].values,
                 hovertemplate=(
                     "<b>%{y}</b><br>"
-                    "空单：%{x:,}手"
+                    "空单：%{x:,}手<br>"
+                    "%{customdata[3]}"
                     "<extra></extra>"
                 ),
             ))
 
-            # ── 日变化标注（在图表右侧添加文字标注） ──
+            # ── 日变化标注（图表右侧，远离柱体） ──
             annotations = []
             max_x = max(disp["long"].max(), disp["short"].max())
             for i, (_, row) in enumerate(disp.iterrows()):
                 cl = row["change_label"]
                 if cl:
+                    # 颜色：加多为红色，减多为绿色（加空为蓝色，减空为浅蓝）
                     annotations.append(dict(
-                        x=max_x * 1.12,
+                        x=max_x * 1.22,
                         y=row["company_label"],
                         text=f"<span style='font-size:10px;color:#555'>{cl}</span>",
                         showarrow=False,
@@ -1877,7 +1897,8 @@ def tab5():
             fig_h.update_layout(
                 title=(
                     f"{ct} 前{top_n}期货公司多空持仓（{_cn(td)}）"
-                    + (f"<br><sup>📐 日变化对比：{_cn(prev_td)} → {_cn(td)}</sup>" if prev_td is not None else "")
+                    + (f"<br><sup>📐 日变化对比：{_cn(prev_td)} → {_cn(td)}" if prev_td is not None else "")
+                    + ("（API直接数据）</sup>" if (api_long_chg or api_short_chg) else "</sup>")
                 ),
                 barmode="group",
                 bargap=0.22,
@@ -1885,7 +1906,7 @@ def tab5():
                 xaxis_title="持仓量（手）",
                 template="plotly_white", height=max(500, top_n * 32),
                 legend=dict(orientation="h", y=1.02, x=0),
-                margin=dict(l=170, r=160, t=70, b=30),
+                margin=dict(l=170, r=200, t=70, b=30),
                 annotations=annotations,
             )
             fig_h.update_xaxes(autorange=True)
@@ -1905,11 +1926,12 @@ def tab5():
                 tbl["空单"] = tbl["short"].apply(lambda x: f"{x:,}")
                 tbl["净持仓"] = tbl["净持仓"].apply(lambda x: f"{x:+,}")
                 tbl["多单变化"] = tbl["long_change"].apply(
-                    lambda x: f"＋{x:,}" if x > 0 else (f"{x:,}" if x < 0 else "—"))
+                    lambda x: f"加多+{x:,}" if x > 0 else (f"减多{x:,}" if x < 0 else "—"))
                 tbl["空单变化"] = tbl["short_change"].apply(
-                    lambda x: f"＋{x:,}" if x > 0 else (f"{x:,}" if x < 0 else "—"))
+                    lambda x: f"加空+{x:,}" if x > 0 else (f"减空{x:,}" if x < 0 else "—"))
                 col_order = ["company", "多单", "空单", "净持仓"]
-                if prev_holdings is not None and not prev_holdings.empty:
+                has_changes = (disp["long_change"] != 0).any() or (disp["short_change"] != 0).any()
+                if has_changes:
                     col_order += ["多单变化", "空单变化"]
                 st.dataframe(
                     tbl[col_order].rename(columns={"company": "期货公司"}),
@@ -1952,20 +1974,34 @@ def _get_holdings(ct: str, target_date) -> Optional[pd.DataFrame]:
             except Exception:
                 pass
         if df is not None and not df.empty:
-            # 标准化列名
+            # 标准化列名（★ 排除"增减"/"变化"列，避免覆盖实际持仓值）
             cols_map = {}
             for c in df.columns:
                 cl = str(c).strip()
+                # ── 先识别增减列（优先级更高，避免被后续覆盖） ──
+                if "增减" in cl or "变化" in cl:
+                    if "买" in cl or "多" in cl:
+                        cols_map[c] = "long_change_api"
+                    elif "卖" in cl or "空" in cl:
+                        cols_map[c] = "short_change_api"
+                    continue  # ★ 跳过，不要进入下面的持仓判断
+                # ── 公司名称 ──
                 if "会员" in cl or "公司" in cl or "名称" in cl:
                     cols_map[c] = "company"
-                elif "多头" in cl or "多单" in cl or "持买单" in cl:
+                # ── 多单（不含增减） ──
+                elif "持买单" in cl or "多头" in cl or "多单" in cl:
                     cols_map[c] = "long"
-                elif "空头" in cl or "空单" in cl or "持卖单" in cl:
+                # ── 空单（不含增减） ──
+                elif "持卖单" in cl or "空头" in cl or "空单" in cl:
                     cols_map[c] = "short"
             df.rename(columns=cols_map, inplace=True)
             if "company" in df.columns and "long" in df.columns and "short" in df.columns:
                 df["long"] = pd.to_numeric(df["long"], errors="coerce").fillna(0).astype(int)
                 df["short"] = pd.to_numeric(df["short"], errors="coerce").fillna(0).astype(int)
+                # 保留 API 返回的增减列
+                for chg_col in ["long_change_api", "short_change_api"]:
+                    if chg_col in df.columns:
+                        df[chg_col] = pd.to_numeric(df[chg_col], errors="coerce").fillna(0).astype(int)
                 df = df[df["company"].notna() & (df["company"] != "")]
                 # 同时保存日期缓存和通用缓存
                 df.to_csv(date_cache_file, index=False)
