@@ -1974,7 +1974,7 @@ def tab5():
                 zz_bull = zz_bear = fz_bull = fz_bear = 0
 
                 if zhengzhi_found:
-                    conclusion_items.append("🟢 **正指席位**（国泰君安、中粮期货、东证期货 — 方向与行情一致）")
+                    conclusion_items.append("🟢 正指席位（国泰君安、中粮期货、东证期货 — 方向与行情一致）")
                     for co, lc, sc, _ in zhengzhi_found:
                         line = _analyze_direction(co, lc, sc, True)
                         conclusion_items.append(f"• {line}")
@@ -1982,7 +1982,7 @@ def tab5():
                         elif "看空" in line: zz_bear += 1
 
                 if fanzhi_found:
-                    conclusion_items.append("🔴 **反指席位**（东方财富、徽商期货、平安期货 — 方向与行情相反）")
+                    conclusion_items.append("🔴 反指席位（东方财富、徽商期货、平安期货 — 方向与行情相反）")
                     for co, lc, sc, _ in fanzhi_found:
                         line = _analyze_direction(co, lc, sc, False)
                         conclusion_items.append(f"• {line}")
