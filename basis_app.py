@@ -1764,7 +1764,19 @@ def tab5():
         st.plotly_chart(fig_vol, use_container_width=True)
 
         # ── 下方：前20期货公司多空持仓 ──
-        st.markdown("#### 🏢 前20期货公司多空持仓")
+        col_title, col_legend = st.columns([3, 1])
+        with col_title:
+            st.markdown("#### 🏢 前20期货公司多空持仓")
+        with col_legend:
+            st.markdown(
+                '<div style="display:flex;align-items:center;gap:16px;padding-top:4px;font-size:0.9rem;">'
+                '<span style="display:inline-block;width:14px;height:14px;background:#E74C3C;'
+                'border-radius:2px;vertical-align:middle;margin-right:4px;"></span> 多单'
+                '<span style="display:inline-block;width:14px;height:14px;background:#3498DB;'
+                'border-radius:2px;vertical-align:middle;margin-right:4px;margin-left:12px;"></span> 空单'
+                '</div>',
+                unsafe_allow_html=True,
+            )
 
         # 获取前一个交易日
         prev_td = None
@@ -1905,14 +1917,7 @@ def tab5():
                 bargroupgap=0.12,
                 xaxis_title="持仓量（手）",
                 template="plotly_white", height=max(500, top_n * 32),
-                legend=dict(
-                    orientation="v",
-                    yanchor="top", y=0.99,
-                    xanchor="right", x=0.99,
-                    bgcolor="rgba(255,255,255,0.85)",
-                    bordercolor="#ddd",
-                    borderwidth=1,
-                ),
+                showlegend=False,
                 margin=dict(l=170, r=200, t=80, b=30),
                 annotations=annotations,
             )
