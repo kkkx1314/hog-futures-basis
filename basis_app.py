@@ -1800,20 +1800,20 @@ def tab5():
             # 计算净持仓
             disp["净持仓"] = disp["long"] - disp["short"]
 
-            # ── 日变化：优先用 API 返回的增减列，否则从前日数据推算 ──
-            api_long_chg = "long_change_api" in disp.columns
-            api_short_chg = "short_change_api" in disp.columns
+            # ── 日变化：优先用 API 返回的增减列（long_chg / short_chg） ──
+            api_long_chg = "long_chg" in disp.columns
+            api_short_chg = "short_chg" in disp.columns
             if api_long_chg:
-                disp["long_change"] = disp["long_change_api"].fillna(0).astype(int)
+                disp["long_change"] = disp["long_chg"].fillna(0).astype(int)
             else:
                 disp["long_change"] = 0
             if api_short_chg:
-                disp["short_change"] = disp["short_change_api"].fillna(0).astype(int)
+                disp["short_change"] = disp["short_chg"].fillna(0).astype(int)
             else:
                 disp["short_change"] = 0
 
             if not api_long_chg or not api_short_chg:
-                # 回退：从前一日数据计算（仅对 API 未提供的列）
+                # 回退：从前一日数据推算（仅对 API 未提供的列）
                 prev_holdings = None
                 if prev_td is not None:
                     prev_holdings = _get_holdings(ct, prev_td)
@@ -1956,8 +1956,12 @@ def tab5():
 
 
 def _get_holdings(ct: str, target_date) -> Optional[pd.DataFrame]:
-    """获取期货公司多空持仓（akshare 优先，本地缓存兜底，按日期区分）"""
-    # 将 target_date 标准化为字符串，用于缓存文件名
+    """获取期货公司多空持仓（新浪财经 → akshare futures_hold_pos_sina，按日期区分）
+
+    新浪财经接口分三张表返回：成交量排名、多单持仓排名、空单持仓排名。
+    三张表按公司名合并后返回统一的 company/long/short/volume + 各变化量。
+    """
+    # 将 target_date 标准化为 YYYYMMDD 字符串
     if isinstance(target_date, pd.Timestamp):
         date_str = target_date.strftime("%Y%m%d")
     elif isinstance(target_date, datetime):
@@ -1970,59 +1974,69 @@ def _get_holdings(ct: str, target_date) -> Optional[pd.DataFrame]:
     date_cache_file = HOLDINGS_DIR / f"{ct}_{date_str}.csv"
     generic_cache_file = HOLDINGS_DIR / f"{ct}.csv"
 
-    # 尝试从 akshare 获取（优先带日期参数）
+    # ── 尝试从新浪财经获取 ──
     try:
         import akshare as ak
-        df = None
-        # 尝试带日期参数调用
-        try:
-            df = ak.futures_hold_positions_dce(symbol=ct, date=date_str)
-        except Exception:
-            pass
-        # 回退：不带日期参数
-        if df is None or (hasattr(df, 'empty') and df.empty):
-            try:
-                df = ak.futures_hold_positions_dce(symbol=ct)
-            except Exception:
-                pass
-        if df is not None and not df.empty:
-            # 标准化列名（★ 排除"增减"/"变化"列，避免覆盖实际持仓值）
-            cols_map = {}
+
+        # 分三次调用，分别取 成交量 / 多单持仓 / 空单持仓
+        df_vol = ak.futures_hold_pos_sina(symbol="成交量", contract=ct, date=date_str)
+        df_long = ak.futures_hold_pos_sina(symbol="多单持仓", contract=ct, date=date_str)
+        df_short = ak.futures_hold_pos_sina(symbol="空单持仓", contract=ct, date=date_str)
+
+        # 标准化列名
+        # 新浪返回列: 名次, 会员简称, {成交量|多单持仓|空单持仓}, 比上交易增减
+        def _norm_sina(df: pd.DataFrame, val_col: str, chg_col: str) -> pd.DataFrame:
+            """将新浪表标准化为 company / {val_col} / {chg_col}"""
+            out = pd.DataFrame()
+            # 找"会员简称"列
             for c in df.columns:
-                cl = str(c).strip()
-                # ── 先识别增减列（优先级更高，避免被后续覆盖） ──
-                if "增减" in cl or "变化" in cl:
-                    if "买" in cl or "多" in cl:
-                        cols_map[c] = "long_change_api"
-                    elif "卖" in cl or "空" in cl:
-                        cols_map[c] = "short_change_api"
-                    continue  # ★ 跳过，不要进入下面的持仓判断
-                # ── 公司名称 ──
-                if "会员" in cl or "公司" in cl or "名称" in cl:
-                    cols_map[c] = "company"
-                # ── 多单（不含增减） ──
-                elif "持买单" in cl or "多头" in cl or "多单" in cl:
-                    cols_map[c] = "long"
-                # ── 空单（不含增减） ──
-                elif "持卖单" in cl or "空头" in cl or "空单" in cl:
-                    cols_map[c] = "short"
-            df.rename(columns=cols_map, inplace=True)
-            if "company" in df.columns and "long" in df.columns and "short" in df.columns:
-                df["long"] = pd.to_numeric(df["long"], errors="coerce").fillna(0).astype(int)
-                df["short"] = pd.to_numeric(df["short"], errors="coerce").fillna(0).astype(int)
-                # 保留 API 返回的增减列
-                for chg_col in ["long_change_api", "short_change_api"]:
-                    if chg_col in df.columns:
-                        df[chg_col] = pd.to_numeric(df[chg_col], errors="coerce").fillna(0).astype(int)
-                df = df[df["company"].notna() & (df["company"] != "")]
-                # 同时保存日期缓存和通用缓存
-                df.to_csv(date_cache_file, index=False)
-                df.to_csv(generic_cache_file, index=False)
-                return df.sort_values("long", ascending=False).head(20).reset_index(drop=True)
+                if "会员" in str(c) or "简称" in str(c):
+                    out["company"] = df[c].astype(str).str.strip()
+                    break
+            # 找数值列（非名次、非会员、非增减）
+            for c in df.columns:
+                cs = str(c)
+                if "名次" in cs or "会员" in cs or "简称" in cs or "增减" in cs or "比上" in cs:
+                    continue
+                out[val_col] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype(int)
+                break
+            # 找增减列
+            for c in df.columns:
+                cs = str(c)
+                if "增减" in cs or "比上" in cs:
+                    out[chg_col] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype(int)
+                    break
+            if chg_col not in out.columns:
+                out[chg_col] = 0
+            return out[out["company"].notna() & (out["company"] != "")]
+
+        vol_df = _norm_sina(df_vol, "volume", "volume_chg")
+        long_df = _norm_sina(df_long, "long", "long_chg")
+        short_df = _norm_sina(df_short, "short", "short_chg")
+
+        # 三表按 company 做 outer join，缺失填 0
+        merged = long_df.merge(short_df, on="company", how="outer")
+        merged = merged.merge(vol_df, on="company", how="outer")
+        merged = merged.fillna(0)
+        for col in ["long", "long_chg", "short", "short_chg", "volume", "volume_chg"]:
+            if col in merged.columns:
+                merged[col] = merged[col].astype(int)
+
+        if merged.empty:
+            raise ValueError("合并后无数据")
+
+        # 按多单持仓降序排列（主力多单排名）
+        merged = merged.sort_values("long", ascending=False).reset_index(drop=True)
+
+        # 缓存
+        merged.to_csv(date_cache_file, index=False)
+        merged.to_csv(generic_cache_file, index=False)
+        return merged.head(20)
+
     except Exception:
         pass
 
-    # 日期缓存兜底
+    # ── 日期缓存兜底 ──
     if date_cache_file.exists():
         try:
             df = pd.read_csv(date_cache_file)
@@ -2031,7 +2045,7 @@ def _get_holdings(ct: str, target_date) -> Optional[pd.DataFrame]:
         except Exception:
             pass
 
-    # 通用缓存兜底（无日期区分的历史数据）
+    # ── 通用缓存兜底 ──
     if generic_cache_file.exists():
         try:
             df = pd.read_csv(generic_cache_file)
@@ -2040,7 +2054,7 @@ def _get_holdings(ct: str, target_date) -> Optional[pd.DataFrame]:
         except Exception:
             pass
 
-    # 生成模拟数据（按日期 + 合约区分种子）
+    # ── 生成模拟数据 ──
     return _generate_mock_holdings(ct, target_date)
 
 
