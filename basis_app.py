@@ -1901,12 +1901,19 @@ def tab5():
                     + ("（API直接数据）</sup>" if (api_long_chg or api_short_chg) else "</sup>")
                 ),
                 barmode="group",
-                bargap=0.22,
-                bargroupgap=0.08,
+                bargap=0.30,
+                bargroupgap=0.12,
                 xaxis_title="持仓量（手）",
                 template="plotly_white", height=max(500, top_n * 32),
-                legend=dict(orientation="h", y=1.02, x=0),
-                margin=dict(l=170, r=200, t=70, b=30),
+                legend=dict(
+                    orientation="v",
+                    yanchor="top", y=0.99,
+                    xanchor="right", x=0.99,
+                    bgcolor="rgba(255,255,255,0.85)",
+                    bordercolor="#ddd",
+                    borderwidth=1,
+                ),
+                margin=dict(l=170, r=200, t=80, b=30),
                 annotations=annotations,
             )
             fig_h.update_xaxes(autorange=True)
