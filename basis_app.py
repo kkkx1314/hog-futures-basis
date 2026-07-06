@@ -1722,9 +1722,19 @@ def tab5():
 
         fds = sorted(fut_df["date"].unique())
         td = pd.to_datetime(sel_date)
+        td_fallback = False
         if td not in fds:
             nearby = [d for d in fds if d <= td]
-            if nearby: td = nearby[-1]
+            if nearby:
+                td = nearby[-1]
+                td_fallback = True
+
+        # ── 所选日期非交易日提示 ──
+        if td_fallback:
+            st.info(
+                f"📅 **{_cn(pd.to_datetime(sel_date))}** 为非交易日，"
+                f"已自动切换至最近交易日 **{_cn(td)}**"
+            )
 
         # ── 上方：成交量/持仓量 双轴图 ──
         st.markdown("#### 📈 成交量与持仓量走势")
@@ -1789,9 +1799,34 @@ def tab5():
                         prev_td = fds_sorted[i - 1]
                     break
 
-        holdings_df = _get_holdings(ct, td)
+        holdings_df, holdings_actual_date, holdings_source = _get_holdings(ct, td, return_meta=True)
         if holdings_df is not None and not holdings_df.empty:
-            # 分组柱状图
+            # ── 检查数据日期是否匹配 ──
+            holdings_date_mismatch = False
+            holdings_actual_dt = None
+            try:
+                holdings_actual_dt = pd.to_datetime(holdings_actual_date, format="%Y%m%d")
+                if holdings_actual_dt.date() != td.date():
+                    holdings_date_mismatch = True
+            except Exception:
+                pass
+
+            # ── 日期不匹配 / 数据源提示 ──
+            if holdings_date_mismatch:
+                sel_date_str = _cn(td)
+                actual_date_str = _cn(holdings_actual_dt) if holdings_actual_dt is not None else holdings_actual_date
+                st.warning(
+                    f"⚠️ **{sel_date_str}** 暂无前20期货公司多空持仓数据，"
+                    f"当前显示的是最近可用数据 **{actual_date_str}**。"
+                    f"（数据来源：{holdings_source}）"
+                )
+            elif holdings_source == "mock":
+                st.warning(
+                    f"⚠️ 前20期货公司多空持仓数据暂不可用（akshare接口受限），"
+                    f"当前显示的是模拟数据（{_cn(holdings_actual_dt) if holdings_actual_dt else holdings_actual_date}），仅供参考。"
+                )
+
+            # ── 分组柱状图 ──
             top_n = min(20, len(holdings_df))
             disp = holdings_df.head(top_n).copy()
             # 计算净持仓
@@ -1903,10 +1938,24 @@ def tab5():
                         yanchor="middle",
                     ))
 
+            # ── 构建标题，标注数据来源和日期 ──
+            title_date = holdings_actual_dt if holdings_actual_dt is not None else td
+            title_badge = ""
+            if holdings_date_mismatch:
+                title_badge = (
+                    f"<br><sup>⚠️ 所选日期（{_cn(td)}）无持仓数据，"
+                    f"当前显示最近可用数据（{_cn(title_date)}）</sup>"
+                )
+            elif holdings_source == "generic_cache":
+                title_badge = f"<br><sup>📦 数据来源：本地缓存（{_cn(title_date)}）</sup>"
+            elif holdings_source == "mock":
+                title_badge = f"<br><sup>⚠️ 数据来源：模拟数据（{_cn(title_date)}），实际接口暂不可用</sup>"
+
             fig_h.update_layout(
                 title=(
-                    f"{ct} 前{top_n}期货公司多空持仓（{_cn(td)}）"
-                    + (f"<br><sup>📐 日变化对比：{_cn(prev_td)} → {_cn(td)}" if prev_td is not None else "")
+                    f"{ct} 前{top_n}期货公司多空持仓（{_cn(title_date)}）"
+                    + title_badge
+                    + (f"<br><sup>📐 日变化对比：{_cn(prev_td)} → {_cn(title_date)}" if prev_td is not None else "")
                     + ("（API直接数据）</sup>" if (api_long_chg or api_short_chg) else "</sup>")
                 ),
                 barmode="group",
@@ -2028,11 +2077,15 @@ def tab5():
                 st.info("实际使用中将从 akshare 获取大商所前20期货公司多空持仓数据。当前接口不可用时的占位展示。")
 
 
-def _get_holdings(ct: str, target_date) -> Optional[pd.DataFrame]:
+def _get_holdings(ct: str, target_date, return_meta: bool = False):
     """获取期货公司多空持仓（新浪财经 → akshare futures_hold_pos_sina，按日期区分）
 
     新浪财经接口分三张表返回：成交量排名、多单持仓排名、空单持仓排名。
     三张表按公司名合并后返回统一的 company/long/short/volume + 各变化量。
+
+    当 return_meta=True 时返回 (DataFrame, actual_date_str, source_label)，
+    actual_date_str 为 YYYYMMDD 格式，表示数据实际所属日期。
+    source_label 表示数据来源：'akshare' / 'date_cache' / 'generic_cache' / 'mock'
     """
     # 将 target_date 标准化为 YYYYMMDD 字符串
     if isinstance(target_date, pd.Timestamp):
@@ -2046,6 +2099,8 @@ def _get_holdings(ct: str, target_date) -> Optional[pd.DataFrame]:
 
     date_cache_file = HOLDINGS_DIR / f"{ct}_{date_str}.csv"
     generic_cache_file = HOLDINGS_DIR / f"{ct}.csv"
+    # 通用缓存的日期元数据文件（记录实际数据日期）
+    generic_meta_file = HOLDINGS_DIR / f"{ct}_meta.txt"
 
     # ── 尝试从新浪财经获取 ──
     try:
@@ -2104,6 +2159,10 @@ def _get_holdings(ct: str, target_date) -> Optional[pd.DataFrame]:
         # 缓存
         merged.to_csv(date_cache_file, index=False)
         merged.to_csv(generic_cache_file, index=False)
+        # 记录通用缓存的实际数据日期
+        generic_meta_file.write_text(date_str)
+        if return_meta:
+            return merged.head(20), date_str, "akshare"
         return merged.head(20)
 
     except Exception:
@@ -2114,7 +2173,10 @@ def _get_holdings(ct: str, target_date) -> Optional[pd.DataFrame]:
         try:
             df = pd.read_csv(date_cache_file)
             if "company" in df.columns and "long" in df.columns and "short" in df.columns:
-                return df.sort_values("long", ascending=False).head(20).reset_index(drop=True)
+                result = df.sort_values("long", ascending=False).head(20).reset_index(drop=True)
+                if return_meta:
+                    return result, date_str, "date_cache"
+                return result
         except Exception:
             pass
 
@@ -2123,12 +2185,25 @@ def _get_holdings(ct: str, target_date) -> Optional[pd.DataFrame]:
         try:
             df = pd.read_csv(generic_cache_file)
             if "company" in df.columns and "long" in df.columns and "short" in df.columns:
-                return df.sort_values("long", ascending=False).head(20).reset_index(drop=True)
+                # 尝试读取通用缓存的实际日期
+                generic_date = date_str  # 默认用请求日期
+                if generic_meta_file.exists():
+                    try:
+                        generic_date = generic_meta_file.read_text().strip()[:8]
+                    except Exception:
+                        pass
+                result = df.sort_values("long", ascending=False).head(20).reset_index(drop=True)
+                if return_meta:
+                    return result, generic_date, "generic_cache"
+                return result
         except Exception:
             pass
 
     # ── 生成模拟数据 ──
-    return _generate_mock_holdings(ct, target_date)
+    result = _generate_mock_holdings(ct, target_date)
+    if return_meta:
+        return result, date_str, "mock"
+    return result
 
 
 def _generate_mock_holdings(ct: str, target_date=None) -> pd.DataFrame:
