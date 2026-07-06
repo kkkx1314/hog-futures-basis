@@ -748,7 +748,7 @@ def fig_distribution(recs: list, ct: str, target_date, data_date: str = "") -> g
     fig = go.Figure()
     fig.add_trace(go.Bar(x=df["region"], y=df["basis"], marker_color=clrs,
         text=[f"{v:+,}" for v in df["basis"]], textposition="outside", textfont=dict(size=11),
-        hovertemplate="<b>%{x}</b><br>基差：%{y:+,}元/吨<br>现货：%{customdata[0]:.0f}元/公斤<br>期货：%{customdata[1]:.0f}元/吨<br>升贴水：%{customdata[2]:+d}元/吨<extra></extra>",
+        hovertemplate="<b>%{x}</b><br>基差：%{y:+,}元/吨<br>现货：%{customdata[0]:.2f}元/公斤<br>期货：%{customdata[1]:.0f}元/吨<br>升贴水：%{customdata[2]:+d}元/吨<extra></extra>",
         customdata=df[["spot_price","futures_close","premium"]].values))
     fig.add_hline(y=0, line_dash="solid", line_color="gray", opacity=0.5)
     fig.update_layout(title=title, xaxis_title="区域", yaxis_title="基差（元/吨）",
@@ -1350,7 +1350,7 @@ def tab1():
             with st.expander("📋 数据明细表"):
                 tbl = pd.DataFrame(recs).sort_values("basis", ascending=False)
                 tbl["基差（元/吨）"] = tbl["basis"].apply(lambda x: f"{x:+,}")
-                tbl["现货（元/公斤）"] = tbl["spot_price"].apply(lambda x: f"{int(round(x))}" if x > 0 else "—")
+                tbl["现货（元/公斤）"] = tbl["spot_price"].apply(lambda x: f"{x:.2f}" if x > 0 else "—")
                 tbl["期货（元/吨）"] = tbl["futures_close"].apply(lambda x: f"{int(round(x))}")
                 display_cols = ["region","基差（元/吨）","现货（元/公斤）","期货（元/吨）"]
                 st.dataframe(tbl[display_cols].rename(columns={"region":"区域/指标"}), use_container_width=True, hide_index=True)
