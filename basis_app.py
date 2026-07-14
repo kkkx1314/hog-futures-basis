@@ -3113,6 +3113,23 @@ def tab7():
 # ══════════════════════════════════════════════════════════════
 # 主入口
 # ══════════════════════════════════════════════════════════════
+@st.cache_data(ttl=3600, show_spinner=False)
+def _warmup_all_holdings_cache():
+    """启动时预热：拉取所有活跃合约从上市至今的全部持仓数据。"""
+    active = get_active_contracts()
+    if not active:
+        return 0
+    total = 0
+    for ct in active:
+        fut_df, _ = load_futures(ct)
+        if fut_df is None or fut_df.empty:
+            continue
+        sd = fut_df["date"].min()
+        ed = fut_df["date"].max()
+        total += _prefetch_holdings_range([ct], sd, ed, silent=True)
+    return total
+
+
 def main():
     # ── 全局 CSS ──
     st.markdown("""<style>
@@ -3144,6 +3161,9 @@ def main():
     </div>
     <hr style="border: none; border-top: 1px solid #e9ecef; margin: 0.5rem 0 1.5rem 0;">
     """, unsafe_allow_html=True)
+
+    # ── 预热所有合约的持仓缓存 ──
+    _warmup_all_holdings_cache()
 
     # ── 七个 Tab ──
     t1, t2, t3, t4, t5, t6, t7 = st.tabs([
