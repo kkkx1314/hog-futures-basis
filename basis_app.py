@@ -2349,17 +2349,19 @@ def tab6():
                 all_dates.append(pd.to_datetime(df["date"].min()).date())
                 all_dates.append(pd.to_datetime(df["date"].max()).date())
         if all_dates:
-            min_date, max_date = min(all_dates), max(all_dates)
+            data_min, data_max = min(all_dates), max(all_dates)
         else:
-            min_date = datetime.now().date() - timedelta(days=365)
-            max_date = datetime.now().date()
+            data_min = datetime.now().date() - timedelta(days=365)
+            data_max = datetime.now().date()
+        # 默认近 12 个月（避免首次加载拉取过多年份）
+        default_start = max(data_min, data_max - timedelta(days=365))
 
-        date_range = st.date_input("📅 日期范围", value=(min_date, max_date),
-                                   max_value=datetime.now().date(), key="t6_date_range")
+        date_range = st.date_input("📅 日期范围", value=(default_start, data_max),
+                                   min_value=data_min, max_value=data_max, key="t6_date_range")
         if isinstance(date_range, tuple) and len(date_range) == 2:
             sd, ed = date_range
         else:
-            sd, ed = min_date, max_date
+            sd, ed = default_start, data_max
 
     with col_chart:
         if len(available_cts) < 1:
@@ -3113,23 +3115,6 @@ def tab7():
 # ══════════════════════════════════════════════════════════════
 # 主入口
 # ══════════════════════════════════════════════════════════════
-@st.cache_data(ttl=3600, show_spinner=False)
-def _warmup_all_holdings_cache():
-    """启动时预热：拉取所有活跃合约从上市至今的全部持仓数据。"""
-    active = get_active_contracts()
-    if not active:
-        return 0
-    total = 0
-    for ct in active:
-        fut_df, _ = load_futures(ct)
-        if fut_df is None or fut_df.empty:
-            continue
-        sd = fut_df["date"].min()
-        ed = fut_df["date"].max()
-        total += _prefetch_holdings_range([ct], sd, ed, silent=True)
-    return total
-
-
 def main():
     # ── 全局 CSS ──
     st.markdown("""<style>
@@ -3161,9 +3146,6 @@ def main():
     </div>
     <hr style="border: none; border-top: 1px solid #e9ecef; margin: 0.5rem 0 1.5rem 0;">
     """, unsafe_allow_html=True)
-
-    # ── 预热所有合约的持仓缓存 ──
-    _warmup_all_holdings_cache()
 
     # ── 七个 Tab ──
     t1, t2, t3, t4, t5, t6, t7 = st.tabs([
