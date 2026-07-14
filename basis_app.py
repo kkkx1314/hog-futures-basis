@@ -1817,29 +1817,27 @@ def tab5():
                 actual_date_str = _cn(holdings_actual_dt) if holdings_actual_dt is not None else holdings_actual_date
                 days_behind = (td.date() - holdings_actual_dt.date()).days if holdings_actual_dt else 999
 
-                if holdings_source == "akshare":
+                if holdings_source in ("akshare", "akshare_fallback"):
                     # ★ API 正常，但所选日期数据尚未发布（大商所 T+1，正常现象）
                     st.info(
                         f"📡 **{sel_date_str}** 的持仓排名数据尚未发布"
                         f"（大商所通常 T+1 更新），"
                         f"当前显示的是最新可用数据 **{actual_date_str}**"
-                        f"（{days_behind}天前）。"
+                        f"（{days_behind}天前，来自新浪财经）。"
                     )
                 else:
-                    # ★ API 失败，使用的是本地缓存
-                    # 尝试获取 API 错误详情
+                    # ★ API 完全失败，使用的是本地缓存
                     error_key = f"{ct}_{td.strftime('%Y%m%d')}"
                     api_errors = st.session_state.get("_holdings_api_errors", {})
                     error_detail = api_errors.get(error_key, "")
                     error_hint = ""
                     if error_detail:
-                        # 常见错误给出中文提示
                         if "timeout" in error_detail.lower() or "timed out" in error_detail.lower():
                             error_hint = "（接口请求超时，可能是网络波动或新浪服务器繁忙）"
                         elif "connection" in error_detail.lower() or "refused" in error_detail.lower():
                             error_hint = "（接口连接失败，请检查网络或稍后重试）"
-                        elif "empty" in error_detail.lower() or "no data" in error_detail.lower():
-                            error_hint = "（该日期数据尚未发布，大商所通常 T+1 更新持仓排名）"
+                        elif "数据尚未发布" in error_detail:
+                            error_hint = "（所选日期及近 5 个交易日数据均未发布，大商所通常 T+1 更新）"
                         else:
                             error_hint = f"（接口异常：{error_detail[:80]}）"
                     st.warning(
@@ -1849,7 +1847,7 @@ def tab5():
                     )
             elif holdings_source == "mock":
                 st.warning(
-                    f"⚠️ 前20期货公司多空持仓数据暂不可用（akshare / 新浪接口均无法连接），"
+                    f"⚠️ 前20期货公司多空持仓数据暂不可用（新浪接口均无法连接），"
                     f"当前显示的是模拟数据（{_cn(holdings_actual_dt) if holdings_actual_dt else holdings_actual_date}），仅供参考。"
                 )
 
@@ -1968,13 +1966,16 @@ def tab5():
             # ── 构建标题，标注数据来源和日期 ──
             title_date = holdings_actual_dt if holdings_actual_dt is not None else td
             title_badge = ""
-            if holdings_date_mismatch:
+            if holdings_source == "akshare_fallback":
+                title_badge = (
+                    f"<br><sup>📡 所选日期（{_cn(td)}）数据未发布，"
+                    f"当前显示最新可用数据（{_cn(title_date)}，新浪财经）</sup>"
+                )
+            elif holdings_source in ("generic_cache", "date_cache"):
                 title_badge = (
                     f"<br><sup>⚠️ 所选日期（{_cn(td)}）无持仓数据，"
                     f"当前显示最近可用数据（{_cn(title_date)}）</sup>"
                 )
-            elif holdings_source == "generic_cache":
-                title_badge = f"<br><sup>📦 数据来源：本地缓存（{_cn(title_date)}）</sup>"
             elif holdings_source == "mock":
                 title_badge = f"<br><sup>⚠️ 数据来源：模拟数据（{_cn(title_date)}），实际接口暂不可用</sup>"
 
@@ -2112,7 +2113,7 @@ def _get_holdings(ct: str, target_date, return_meta: bool = False):
 
     当 return_meta=True 时返回 (DataFrame, actual_date_str, source_label)，
     actual_date_str 为 YYYYMMDD 格式，表示数据实际所属日期。
-    source_label 表示数据来源：'akshare' / 'date_cache' / 'generic_cache' / 'mock'
+    source_label 表示数据来源：'akshare' / 'akshare_fallback' / 'date_cache' / 'generic_cache' / 'mock'
     """
     # 将 target_date 标准化为 YYYYMMDD 字符串
     if isinstance(target_date, pd.Timestamp):
@@ -2129,11 +2130,19 @@ def _get_holdings(ct: str, target_date, return_meta: bool = False):
     # 通用缓存的日期元数据文件（记录实际数据日期）
     generic_meta_file = HOLDINGS_DIR / f"{ct}_meta.txt"
 
-    # ── 尝试从新浪财经获取（带重试 + 日期回退） ──
+    # ── 尝试从新浪财经获取（带重试 + 交易日回退） ──
     last_error = None
+    _EMPTY_SENTINEL = "__EMPTY__"  # 哨兵：API 成功但数据未发布（0 rows）
 
     def _try_fetch_for_date(try_date_str: str):
-        """尝试对指定日期拉取持仓数据，成功返回 (merged_df, None)，失败返回 (None, error_msg)"""
+        """尝试对指定日期拉取持仓数据。
+
+        返回:
+          (merged_df, "ok")  — 成功获取到数据
+          (None, _EMPTY_SENTINEL) — API 调用成功但返回 0 行（数据尚未发布）
+        异常:
+          抛出原始异常 — 网络错误 / API 故障
+        """
         import akshare as ak
 
         # 分三次调用，分别取 成交量 / 多单持仓 / 空单持仓
@@ -2146,19 +2155,16 @@ def _get_holdings(ct: str, target_date, return_meta: bool = False):
         def _norm_sina(df: pd.DataFrame, val_col: str, chg_col: str) -> pd.DataFrame:
             """将新浪表标准化为 company / {val_col} / {chg_col}"""
             out = pd.DataFrame()
-            # 找"会员简称"列
             for c in df.columns:
                 if "会员" in str(c) or "简称" in str(c):
                     out["company"] = df[c].astype(str).str.strip()
                     break
-            # 找数值列（非名次、非会员、非增减）
             for c in df.columns:
                 cs = str(c)
                 if "名次" in cs or "会员" in cs or "简称" in cs or "增减" in cs or "比上" in cs:
                     continue
                 out[val_col] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype(int)
                 break
-            # 找增减列
             for c in df.columns:
                 cs = str(c)
                 if "增减" in cs or "比上" in cs:
@@ -2180,19 +2186,25 @@ def _get_holdings(ct: str, target_date, return_meta: bool = False):
             if col in merged.columns:
                 merged[col] = merged[col].astype(int)
 
+        # ★ 区分：API 成功但数据未发布（0 rows） vs 真正的 API 异常
         if merged.empty:
-            raise ValueError("合并后无数据")
+            return None, _EMPTY_SENTINEL
 
         # 按多单持仓降序排列（主力多单排名）
         merged = merged.sort_values("long", ascending=False).reset_index(drop=True)
-        return merged, None
+        return merged, "ok"
 
-    # ★ 优先尝试请求日期，失败则回退到最近 5 个自然日
+    # ★ 构建回退日期列表：只包含交易日（周一至周五），跳过周末
     try_dates = [date_str]
     try:
         base_dt = datetime.strptime(date_str, "%Y%m%d")
-        for offset in range(1, 6):  # 回退最多 5 天
+        offset = 1
+        while len(try_dates) < 6:  # 最多 6 个候选日期
             fallback_dt = base_dt - timedelta(days=offset)
+            offset += 1
+            # 跳过周末（周六=5, 周日=6）
+            if fallback_dt.weekday() >= 5:
+                continue
             fallback_str = fallback_dt.strftime("%Y%m%d")
             if fallback_str not in try_dates:
                 try_dates.append(fallback_str)
@@ -2202,19 +2214,23 @@ def _get_holdings(ct: str, target_date, return_meta: bool = False):
     for try_date in try_dates:
         for attempt in range(3):  # 每个日期最多重试 3 次
             try:
-                merged, _ = _try_fetch_for_date(try_date)
+                merged, status = _try_fetch_for_date(try_date)
+                if status == _EMPTY_SENTINEL:
+                    # ★ API 正常但数据未发布 → 不重试，直接尝试上一个日期
+                    last_error = f"{try_date}: 数据尚未发布（0 rows）"
+                    break  # 跳出重试循环，进入下一个日期
                 # 成功：写入缓存
                 merged.to_csv(HOLDINGS_DIR / f"{ct}_{try_date}.csv", index=False)
                 merged.to_csv(generic_cache_file, index=False)
                 generic_meta_file.write_text(try_date)
+                source = "akshare" if try_date == date_str else "akshare_fallback"
                 if return_meta:
-                    return merged.head(20), try_date, "akshare"
+                    return merged.head(20), try_date, source
                 return merged.head(20)
             except Exception as e:
-                last_error = str(e)
+                last_error = f"{try_date}: {type(e).__name__}: {str(e)[:120]}"
                 if attempt < 2:
                     time.sleep(1)  # 重试前等待 1 秒
-        # 该日期 3 次都失败，尝试下一个日期
 
     # ★ 所有 API 尝试都失败了，记录最后的错误（供调试）
     if last_error:
