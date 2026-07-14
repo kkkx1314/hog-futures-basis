@@ -130,8 +130,8 @@ YEAR_COLORS = {
 }
 FALLBACK_COLOR = "#95A5A6"
 AVG_LINE_COLOR = "#95A5A6"
-AVG_LINE_WIDTH = 1
-AVG_LINE_DASH = "dot"
+AVG_LINE_WIDTH = 0.5
+AVG_LINE_DASH = "2,4"   # 密集小圆点（2px点 + 4px间距）
 
 # Tab 2 汇总指标固定颜色
 SUMMARY_COLORS = {
@@ -2479,6 +2479,10 @@ def tab6():
 
         # ── 图3：前20净持仓季节性对比 ──
         st.markdown("#### 🏢 前20净持仓季节性对比")
+
+        # ★ 预热缓存（首次较慢，之后秒出）
+        _prefetch_holdings_range(available_cts, sd, ed, silent=True)
+
         net_data, net_collector = _build_seasonal_net_positions(available_cts, sd, ed)
         if net_data:
             fig_net = go.Figure()
@@ -2605,13 +2609,48 @@ def _fetch_exact_holdings(ct: str, date_str: str) -> Optional[pd.DataFrame]:
         return None
 
 
-def _build_seasonal_net_positions(contracts: List[str], sd, ed) -> Tuple[Dict[str, pd.DataFrame], defaultdict]:
-    """构建季节性净持仓数据 — 每个交易日拉取真实 DCE 持仓排名数据
+def _prefetch_holdings_range(contracts: List[str], sd, ed, silent: bool = False) -> int:
+    """预热缓存：拉取日期范围内所有缺失的持仓数据。
 
-    对日期范围内每个交易日，调用 Sina API 获取当日真实持仓明细，
-    计算净持仓 = Σ多单 − Σ空单（全部上榜公司）。
-    首次加载较慢（API 调用），之后从缓存秒出。
+    遍历每个合约的交易日，检查本地缓存；无缓存则调 API 拉取并保存。
+    返回本次新拉取的天数。
     """
+    total_fetched = 0
+
+    for c in contracts:
+        fut_df, _ = load_futures(c)
+        if fut_df is None or fut_df.empty:
+            continue
+        trading_dates = sorted(
+            d for d in fut_df["date"].unique()
+            if pd.to_datetime(sd) <= d <= pd.to_datetime(ed)
+        )
+        missing = [
+            d for d in trading_dates
+            if not (HOLDINGS_DIR / f"{c}_{d.strftime('%Y%m%d')}.csv").exists()
+        ]
+        if not missing:
+            continue
+
+        if not silent:
+            st.toast(f"📡 {c}：同步 {len(missing)} 天持仓数据…", icon="🔄")
+
+        for i, dt in enumerate(missing):
+            date_str = dt.strftime("%Y%m%d")
+            if i > 0:
+                time.sleep(0.12)  # API 限流保护
+            _fetch_exact_holdings(c, date_str)
+            total_fetched += 1
+
+    return total_fetched
+
+
+def _build_seasonal_net_positions(contracts: List[str], sd, ed) -> Tuple[Dict[str, pd.DataFrame], defaultdict]:
+    """构建季节性净持仓数据 — 从本地缓存读取每日真实净持仓。
+
+    净持仓 = Σ多单 − Σ空单（全部上榜公司）。
+    无缓存日期 → None（图中留空）。
+    需先调用 _prefetch_holdings_range 预热缓存。"""
     net_data: Dict[str, pd.DataFrame] = {}
     net_collector = defaultdict(list)
 
@@ -2628,47 +2667,28 @@ def _build_seasonal_net_positions(contracts: List[str], sd, ed) -> Tuple[Dict[st
         fut_df["plot_date"] = [pd.Timestamp(year=2020, month=d.month, day=d.day)
                                 for d in fut_df["date"]]
         fut_df["trade_year"] = fut_df["date"].dt.year
-
-        # ── 统计需要拉取的日期数 ──
         trading_dates = sorted(fut_df["date"].unique())
-        cached_count = sum(
-            1 for d in trading_dates
-            if (HOLDINGS_DIR / f"{c}_{d.strftime('%Y%m%d')}.csv").exists()
-        )
-        need_fetch = len(trading_dates) - cached_count
 
-        if need_fetch > 0:
-            st.info(f"📡 {c}：正在拉取 {need_fetch} 个交易日的真实持仓数据（共 {len(trading_dates)} 天）…")
-            progress_bar = st.progress(0)
-            fetched = 0
-
-        # ── 逐日获取真实净持仓 ──
+        # ── 只从缓存读取（需先调用 _prefetch_holdings_range 预热） ──
         net_positions = []
 
-        for i, dt in enumerate(trading_dates):
+        for dt in trading_dates:
             date_str = dt.strftime("%Y%m%d")
             cache_file = HOLDINGS_DIR / f"{c}_{date_str}.csv"
 
-            # 无缓存时需要调 API，加短暂休眠避免限流
-            if not cache_file.exists() and i > 0:
-                time.sleep(0.15)
-
-            holdings = _fetch_exact_holdings(c, date_str)
-
-            if holdings is not None and not holdings.empty:
-                net = int(holdings["long"].sum() - holdings["short"].sum())
+            if cache_file.exists():
+                try:
+                    df = pd.read_csv(cache_file)
+                    if "company" in df.columns and "long" in df.columns and "short" in df.columns:
+                        net = int(df["long"].sum() - df["short"].sum())
+                    else:
+                        net = None
+                except Exception:
+                    net = None
             else:
-                # 数据未发布 → None，图中该点留空不连线
-                net = None
+                net = None  # 未缓存 → 留空
 
             net_positions.append(net)
-
-            if need_fetch > 0 and i % max(1, len(trading_dates) // 20) == 0:
-                progress_bar.progress(min((i + 1) / len(trading_dates), 1.0))
-
-        if need_fetch > 0:
-            progress_bar.progress(1.0)
-            progress_bar.empty()
 
         fut_df["net_position"] = net_positions
 
