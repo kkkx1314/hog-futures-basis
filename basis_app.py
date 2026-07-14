@@ -2571,35 +2571,29 @@ def _fetch_exact_holdings(ct: str, date_str: str) -> Optional[pd.DataFrame]:
 
 
 def _prefetch_holdings_range(contracts: List[str], sd, ed, silent: bool = False) -> int:
-    """预热缓存：拉取日期范围内所有缺失的持仓数据。
+    """增量同步：仅拉取最近 3 个交易日缺失的持仓数据。
 
-    遍历每个合约的交易日，检查本地缓存；无缓存则调 API 拉取并保存。
-    返回本次新拉取的天数。
+    历史数据请用 download_holdings_history.py 离线批量下载。
     """
     total_fetched = 0
+    today = datetime.now().date()
 
     for c in contracts:
         fut_df, _ = load_futures(c)
         if fut_df is None or fut_df.empty:
             continue
-        trading_dates = sorted(
-            d for d in fut_df["date"].unique()
-            if pd.to_datetime(sd) <= d <= pd.to_datetime(ed)
-        )
-        missing = [
-            d for d in trading_dates
-            if not (HOLDINGS_DIR / f"{c}_{d.strftime('%Y%m%d')}.csv").exists()
-        ]
-        if not missing:
-            continue
+        all_dates = sorted(d for d in fut_df["date"].unique()
+                           if pd.to_datetime(sd) <= d <= pd.to_datetime(ed))
 
-        if not silent:
-            st.toast(f"📡 {c}：同步 {len(missing)} 天持仓数据…", icon="🔄")
+        # ★ 只拉最近 3 个交易日缺失的数据
+        recent = [d for d in all_dates if (today - d.date()).days <= 4]
+        missing = [d for d in recent
+                   if not (HOLDINGS_DIR / f"{c}_{d.strftime('%Y%m%d')}.csv").exists()]
 
         for i, dt in enumerate(missing):
             date_str = dt.strftime("%Y%m%d")
             if i > 0:
-                time.sleep(0.12)  # API 限流保护
+                time.sleep(0.12)
             _fetch_exact_holdings(c, date_str)
             total_fetched += 1
 
@@ -2607,11 +2601,12 @@ def _prefetch_holdings_range(contracts: List[str], sd, ed, silent: bool = False)
 
 
 def _build_seasonal_net_positions(contracts: List[str], sd, ed) -> Tuple[Dict[str, pd.DataFrame], defaultdict]:
-    """构建季节性净持仓数据 — 从本地缓存读取每日真实净持仓。
+    """构建季节性净持仓数据 — 从本地 CSV 缓存读取每日真实净持仓。
 
     净持仓 = Σ多单 − Σ空单（全部上榜公司）。
-    无缓存日期 → None（图中留空）。
-    需先调用 _prefetch_holdings_range 预热缓存。"""
+    历史数据由 download_holdings_history.py 离线下载，
+    最新几日由 _prefetch_holdings_range 增量拉取。
+    无缓存日期 → None（图中留空）。"""
     net_data: Dict[str, pd.DataFrame] = {}
     net_collector = defaultdict(list)
 
