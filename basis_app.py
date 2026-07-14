@@ -1845,11 +1845,8 @@ def tab5():
                         f"当前显示的是最近可用数据 **{actual_date_str}**。"
                         f"（数据来源：{holdings_source}）{error_hint}"
                     )
-            elif holdings_source == "mock":
-                st.warning(
-                    f"⚠️ 前20期货公司多空持仓数据暂不可用（新浪接口均无法连接），"
-                    f"当前显示的是模拟数据（{_cn(holdings_actual_dt) if holdings_actual_dt else holdings_actual_date}），仅供参考。"
-                )
+            elif holdings_source == "unavailable":
+                st.warning("⚠️ 前20期货公司多空持仓数据暂不可用，API 和本地缓存均无数据。")
 
             # ── 分组柱状图 ──
             top_n = min(20, len(holdings_df))
@@ -1976,8 +1973,8 @@ def tab5():
                     f"<br><sup>⚠️ 所选日期（{_cn(td)}）无持仓数据，"
                     f"当前显示最近可用数据（{_cn(title_date)}）</sup>"
                 )
-            elif holdings_source == "mock":
-                title_badge = f"<br><sup>⚠️ 数据来源：模拟数据（{_cn(title_date)}），实际接口暂不可用</sup>"
+            elif holdings_source == "unavailable":
+                title_badge = f"<br><sup>⚠️ 数据不可用，API 和缓存均无数据</sup>"
 
             fig_h.update_layout(
                 title=(
@@ -2099,10 +2096,7 @@ def tab5():
                     tbl[col_order].rename(columns={"company": "期货公司"}),
                     use_container_width=True, hide_index=True)
         else:
-            st.warning("⚠️ 持仓数据暂不可用（接口受限，请稍后重试）")
-            # 模拟数据展示
-            with st.expander("📋 模拟数据示例（仅供参考）"):
-                st.info("实际使用中将从 akshare 获取大商所前20期货公司多空持仓数据。当前接口不可用时的占位展示。")
+            st.warning("⚠️ 持仓数据暂不可用，API 和本地缓存均无数据，请检查网络后重试。")
 
 
 def _get_holdings(ct: str, target_date, return_meta: bool = False):
@@ -2113,7 +2107,7 @@ def _get_holdings(ct: str, target_date, return_meta: bool = False):
 
     当 return_meta=True 时返回 (DataFrame, actual_date_str, source_label)，
     actual_date_str 为 YYYYMMDD 格式，表示数据实际所属日期。
-    source_label 表示数据来源：'akshare' / 'akshare_fallback' / 'date_cache' / 'generic_cache' / 'mock'
+    source_label 表示数据来源：'akshare' / 'akshare_fallback' / 'date_cache' / 'generic_cache' / 'unavailable'
     """
     # 将 target_date 标准化为 YYYYMMDD 字符串
     if isinstance(target_date, pd.Timestamp):
@@ -2267,43 +2261,10 @@ def _get_holdings(ct: str, target_date, return_meta: bool = False):
         except Exception:
             pass
 
-    # ── 生成模拟数据 ──
-    result = _generate_mock_holdings(ct, target_date)
+    # ── 所有数据源均失败 ──
     if return_meta:
-        return result, date_str, "mock"
-    return result
-
-
-def _generate_mock_holdings(ct: str, target_date=None) -> pd.DataFrame:
-    """当 akshare 接口不可用时，生成模拟持仓数据（按日期 + 合约区分）"""
-    companies = [
-        "中信期货", "国泰君安", "永安期货", "海通期货", "华泰期货",
-        "银河期货", "广发期货", "申银万国", "南华期货", "方正中期",
-        "浙商期货", "中粮期货", "东方财富", "徽商期货", "国投安信",
-        "中信建投", "东证期货", "招商期货", "平安期货", "五矿期货",
-    ]
-    # 将日期纳入种子，使不同日期的模拟数据不同
-    if target_date is not None:
-        if isinstance(target_date, pd.Timestamp):
-            date_str = target_date.strftime("%Y%m%d")
-        elif isinstance(target_date, datetime):
-            date_str = target_date.strftime("%Y%m%d")
-        elif hasattr(target_date, "strftime"):
-            date_str = target_date.strftime("%Y%m%d")
-        else:
-            date_str = str(target_date).replace("-", "")[:8]
-    else:
-        date_str = "20260701"
-    seed = hash(f"{ct}_{date_str}") % (2**31)
-    np.random.seed(seed)
-    longs = np.random.randint(1000, 8000, len(companies))
-    shorts = np.random.randint(1000, 8000, len(companies))
-    return pd.DataFrame({
-        "company": companies,
-        "long": sorted(longs, reverse=True),
-        "short": sorted(shorts, reverse=True),
-    })
-
+        return None, date_str, "unavailable"
+    return None
 
 # ══════════════════════════════════════════════════════════════
 # Tab 6：季节性持仓对比
