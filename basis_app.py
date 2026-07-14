@@ -129,9 +129,9 @@ YEAR_COLORS = {
     "2024": "#2C3E50", "2025": "#27AE60", "2026": "#E74C3C", "2027": "#E67E22",
 }
 FALLBACK_COLOR = "#95A5A6"
-AVG_LINE_COLOR = "#95A5A6"
+AVG_LINE_COLOR = "#6B7280"
 AVG_LINE_WIDTH = 0.5
-AVG_LINE_DASH = "2,4"   # 密集小圆点（2px点 + 4px间距）
+AVG_LINE_DASH = "dot"
 
 # Tab 2 汇总指标固定颜色
 SUMMARY_COLORS = {
@@ -2353,15 +2353,13 @@ def tab6():
         else:
             data_min = datetime.now().date() - timedelta(days=365)
             data_max = datetime.now().date()
-        # 默认近 12 个月（避免首次加载拉取过多年份）
-        default_start = max(data_min, data_max - timedelta(days=365))
 
-        date_range = st.date_input("📅 日期范围", value=(default_start, data_max),
+        date_range = st.date_input("📅 日期范围", value=(data_min, data_max),
                                    min_value=data_min, max_value=data_max, key="t6_date_range")
         if isinstance(date_range, tuple) and len(date_range) == 2:
             sd, ed = date_range
         else:
-            sd, ed = default_start, data_max
+            sd, ed = data_min, data_max
 
     with col_chart:
         if len(available_cts) < 1:
