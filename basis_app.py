@@ -2510,7 +2510,7 @@ def tab6():
             fig_net.update_yaxes(autorange=True)
             st.plotly_chart(fig_net, use_container_width=True)
         else:
-            st.warning("⚠️ 前20净持仓数据暂不可用，已标注为模拟数据")
+            st.warning("⚠️ 前20净持仓数据暂不可用，请先同步数据后再查看")
 
         # ── 自动结论 ──
         result = _gen_tab6_conclusion(vol_data, oi_data, net_data if net_data else {}, sel_month, active_cts)
