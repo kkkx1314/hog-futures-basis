@@ -1815,26 +1815,38 @@ def tab5():
             if holdings_date_mismatch:
                 sel_date_str = _cn(td)
                 actual_date_str = _cn(holdings_actual_dt) if holdings_actual_dt is not None else holdings_actual_date
-                # 尝试获取 API 错误详情
-                error_key = f"{ct}_{td.strftime('%Y%m%d')}"
-                api_errors = st.session_state.get("_holdings_api_errors", {})
-                error_detail = api_errors.get(error_key, "")
-                error_hint = ""
-                if error_detail:
-                    # 常见错误给出中文提示
-                    if "timeout" in error_detail.lower() or "timed out" in error_detail.lower():
-                        error_hint = "（接口请求超时，可能是网络波动或新浪服务器繁忙）"
-                    elif "connection" in error_detail.lower() or "refused" in error_detail.lower():
-                        error_hint = "（接口连接失败，请检查网络或稍后重试）"
-                    elif "empty" in error_detail.lower() or "no data" in error_detail.lower():
-                        error_hint = "（该日期数据尚未发布，大商所通常 T+1 更新持仓排名）"
-                    else:
-                        error_hint = f"（接口异常：{error_detail[:80]}）"
-                st.warning(
-                    f"⚠️ **{sel_date_str}** 暂无前20期货公司多空持仓数据，"
-                    f"当前显示的是最近可用数据 **{actual_date_str}**。"
-                    f"（数据来源：{holdings_source}）{error_hint}"
-                )
+                days_behind = (td.date() - holdings_actual_dt.date()).days if holdings_actual_dt else 999
+
+                if holdings_source == "akshare":
+                    # ★ API 正常，但所选日期数据尚未发布（大商所 T+1，正常现象）
+                    st.info(
+                        f"📡 **{sel_date_str}** 的持仓排名数据尚未发布"
+                        f"（大商所通常 T+1 更新），"
+                        f"当前显示的是最新可用数据 **{actual_date_str}**"
+                        f"（{days_behind}天前）。"
+                    )
+                else:
+                    # ★ API 失败，使用的是本地缓存
+                    # 尝试获取 API 错误详情
+                    error_key = f"{ct}_{td.strftime('%Y%m%d')}"
+                    api_errors = st.session_state.get("_holdings_api_errors", {})
+                    error_detail = api_errors.get(error_key, "")
+                    error_hint = ""
+                    if error_detail:
+                        # 常见错误给出中文提示
+                        if "timeout" in error_detail.lower() or "timed out" in error_detail.lower():
+                            error_hint = "（接口请求超时，可能是网络波动或新浪服务器繁忙）"
+                        elif "connection" in error_detail.lower() or "refused" in error_detail.lower():
+                            error_hint = "（接口连接失败，请检查网络或稍后重试）"
+                        elif "empty" in error_detail.lower() or "no data" in error_detail.lower():
+                            error_hint = "（该日期数据尚未发布，大商所通常 T+1 更新持仓排名）"
+                        else:
+                            error_hint = f"（接口异常：{error_detail[:80]}）"
+                    st.warning(
+                        f"⚠️ **{sel_date_str}** 暂无前20期货公司多空持仓数据，"
+                        f"当前显示的是最近可用数据 **{actual_date_str}**。"
+                        f"（数据来源：{holdings_source}）{error_hint}"
+                    )
             elif holdings_source == "mock":
                 st.warning(
                     f"⚠️ 前20期货公司多空持仓数据暂不可用（akshare / 新浪接口均无法连接），"
