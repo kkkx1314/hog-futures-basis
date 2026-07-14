@@ -2531,68 +2531,92 @@ def tab6():
                 st.dataframe(pd.DataFrame(st_cols), use_container_width=True, hide_index=True)
 
 
-def _build_seasonal_net_positions(contracts: List[str], sd, ed) -> Tuple[Dict[str, pd.DataFrame], defaultdict]:
-    """构建季节性净持仓数据（从真实缓存数据获取每日净持仓，不做模拟）
+def _fetch_exact_holdings(ct: str, date_str: str) -> Optional[pd.DataFrame]:
+    """拉取指定合约在指定日期的真实持仓数据（无回退，无重试）
 
-    对于每个交易日，尝试从日期精确缓存获取真实持仓数据；
-    若无当日缓存，则向前查找最近可用数据。
+    成功返回合并后的 DataFrame，失败返回 None。
+    结果缓存到日期精确文件。
+    """
+    cache_file = HOLDINGS_DIR / f"{ct}_{date_str}.csv"
+    generic_cache_file = HOLDINGS_DIR / f"{ct}.csv"
+    generic_meta_file = HOLDINGS_DIR / f"{ct}_meta.txt"
+
+    # ── 先查缓存 ──
+    if cache_file.exists():
+        try:
+            df = pd.read_csv(cache_file)
+            if "company" in df.columns and "long" in df.columns and "short" in df.columns:
+                return df
+        except Exception:
+            pass
+
+    # ── 从新浪 API 拉取 ──
+    try:
+        import akshare as ak
+
+        df_vol = ak.futures_hold_pos_sina(symbol="成交量", contract=ct, date=date_str)
+        df_long = ak.futures_hold_pos_sina(symbol="多单持仓", contract=ct, date=date_str)
+        df_short = ak.futures_hold_pos_sina(symbol="空单持仓", contract=ct, date=date_str)
+
+        def _norm_sina(df, val_col, chg_col):
+            out = pd.DataFrame()
+            for c in df.columns:
+                if "会员" in str(c) or "简称" in str(c):
+                    out["company"] = df[c].astype(str).str.strip()
+                    break
+            for c in df.columns:
+                cs = str(c)
+                if "名次" in cs or "会员" in cs or "简称" in cs or "增减" in cs or "比上" in cs:
+                    continue
+                out[val_col] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype(int)
+                break
+            for c in df.columns:
+                cs = str(c)
+                if "增减" in cs or "比上" in cs:
+                    out[chg_col] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype(int)
+                    break
+            if chg_col not in out.columns:
+                out[chg_col] = 0
+            return out[out["company"].notna() & (out["company"] != "")]
+
+        vol_df = _norm_sina(df_vol, "volume", "volume_chg")
+        long_df = _norm_sina(df_long, "long", "long_chg")
+        short_df = _norm_sina(df_short, "short", "short_chg")
+
+        merged = long_df.merge(short_df, on="company", how="outer")
+        merged = merged.merge(vol_df, on="company", how="outer")
+        merged = merged.fillna(0)
+        for col in ["long", "long_chg", "short", "short_chg", "volume", "volume_chg"]:
+            if col in merged.columns:
+                merged[col] = merged[col].astype(int)
+
+        if merged.empty or merged["long"].sum() == 0:
+            return None  # 数据未发布
+
+        merged = merged.sort_values("long", ascending=False).reset_index(drop=True)
+
+        # 缓存
+        merged.to_csv(cache_file, index=False)
+        merged.to_csv(generic_cache_file, index=False)
+        generic_meta_file.write_text(date_str)
+        return merged
+
+    except Exception:
+        return None
+
+
+def _build_seasonal_net_positions(contracts: List[str], sd, ed) -> Tuple[Dict[str, pd.DataFrame], defaultdict]:
+    """构建季节性净持仓数据 — 每个交易日拉取真实 DCE 持仓排名数据
+
+    对日期范围内每个交易日，调用 Sina API 获取当日真实持仓明细，
+    计算净持仓 = Σ多单 − Σ空单（全部上榜公司）。
+    首次加载较慢（API 调用），之后从缓存秒出。
     """
     net_data: Dict[str, pd.DataFrame] = {}
     net_collector = defaultdict(list)
 
     for c in contracts:
-        # ── 收集该合约所有可用的持仓快照 ──
-        # 格式: {date_str: net_position}
-        snapshots: Dict[str, int] = {}
-
-        # 1. 扫描所有日期精确缓存
-        for cache_file in sorted(HOLDINGS_DIR.glob(f"{c}_*.csv")):
-            if cache_file.name == f"{c}.csv":
-                continue  # 跳过通用缓存，后面单独处理
-            try:
-                # 从文件名提取日期: LH2609_20260710.csv → 20260710
-                date_part = cache_file.stem.replace(f"{c}_", "")
-                if len(date_part) != 8 or not date_part.isdigit():
-                    continue
-                df = pd.read_csv(cache_file)
-                if "company" in df.columns and "long" in df.columns and "short" in df.columns:
-                    # ★ 使用全部合并公司（DCE 三张排名表合并，通常 28-40 家）
-                    net = int(df["long"].sum() - df["short"].sum())
-                    snapshots[date_part] = net
-            except Exception:
-                pass
-
-        # 2. 通用缓存兜底
-        generic_file = HOLDINGS_DIR / f"{c}.csv"
-        if generic_file.exists():
-            try:
-                df = pd.read_csv(generic_file)
-                if "company" in df.columns and "long" in df.columns and "short" in df.columns:
-                    # ★ 使用全部合并公司（DCE 三张排名表合并，通常 28-40 家）
-                    generic_net = int(df["long"].sum() - df["short"].sum())
-                    # 读取通用缓存的日期
-                    meta_file = HOLDINGS_DIR / f"{c}_meta.txt"
-                    if meta_file.exists():
-                        try:
-                            generic_date = meta_file.read_text().strip()[:8]
-                            if generic_date not in snapshots:
-                                snapshots[generic_date] = generic_net
-                        except Exception:
-                            pass
-            except Exception:
-                pass
-
-        # 3. 如果完全没有缓存，使用模拟数据兜底
-        if not snapshots:
-            mock_df = _generate_mock_holdings(c)
-            if mock_df is not None and not mock_df.empty:
-                mock_net = int(mock_df["long"].sum() - mock_df["short"].sum())
-                snapshots["mock"] = mock_net
-
-        if not snapshots:
-            continue
-
-        # ── 加载期货行情数据 ──
+        # ── 加载期货行情数据获取交易日列表 ──
         fut_df, _ = load_futures(c)
         if fut_df is None or fut_df.empty:
             continue
@@ -2601,29 +2625,52 @@ def _build_seasonal_net_positions(contracts: List[str], sd, ed) -> Tuple[Dict[st
         if fut_df.empty:
             continue
 
-        # ── 为每个交易日分配真实净持仓（向前填充） ──
-        sorted_snapshot_dates = sorted(snapshots.keys())
         fut_df["plot_date"] = [pd.Timestamp(year=2020, month=d.month, day=d.day)
                                 for d in fut_df["date"]]
         fut_df["trade_year"] = fut_df["date"].dt.year
 
+        # ── 统计需要拉取的日期数 ──
+        trading_dates = sorted(fut_df["date"].unique())
+        cached_count = sum(
+            1 for d in trading_dates
+            if (HOLDINGS_DIR / f"{c}_{d.strftime('%Y%m%d')}.csv").exists()
+        )
+        need_fetch = len(trading_dates) - cached_count
+
+        if need_fetch > 0:
+            st.info(f"📡 {c}：正在拉取 {need_fetch} 个交易日的真实持仓数据（共 {len(trading_dates)} 天）…")
+            progress_bar = st.progress(0)
+            fetched = 0
+
+        # ── 逐日获取真实净持仓 ──
         net_positions = []
-        for _, row in fut_df.iterrows():
-            date_key = row["date"].strftime("%Y%m%d")
-            # 精确匹配
-            if date_key in snapshots:
-                net_positions.append(snapshots[date_key])
+        last_valid_net = None
+
+        for i, dt in enumerate(trading_dates):
+            date_str = dt.strftime("%Y%m%d")
+            cache_file = HOLDINGS_DIR / f"{c}_{date_str}.csv"
+
+            # 无缓存时需要调 API，加短暂休眠避免限流
+            if not cache_file.exists() and i > 0:
+                time.sleep(0.15)
+
+            holdings = _fetch_exact_holdings(c, date_str)
+
+            if holdings is not None and not holdings.empty:
+                net = int(holdings["long"].sum() - holdings["short"].sum())
+                last_valid_net = net
             else:
-                # 向前查找最近可用数据
-                best_date = None
-                for sd_key in sorted_snapshot_dates:
-                    if sd_key <= date_key:
-                        best_date = sd_key
-                if best_date:
-                    net_positions.append(snapshots[best_date])
-                else:
-                    # 没有任何历史数据，用最早的快照
-                    net_positions.append(snapshots[sorted_snapshot_dates[0]])
+                # 数据未发布（如最新 1-2 天）→ 沿用上一交易日数据
+                net = last_valid_net
+
+            net_positions.append(net)
+
+            if need_fetch > 0 and i % max(1, len(trading_dates) // 20) == 0:
+                progress_bar.progress(min((i + 1) / len(trading_dates), 1.0))
+
+        if need_fetch > 0:
+            progress_bar.progress(1.0)
+            progress_bar.empty()
 
         fut_df["net_position"] = net_positions
 
