@@ -131,7 +131,7 @@ YEAR_COLORS = {
 FALLBACK_COLOR = "#95A5A6"
 AVG_LINE_COLOR = "#95A5A6"
 AVG_LINE_WIDTH = 1
-AVG_LINE_DASH = "dash"
+AVG_LINE_DASH = "dot"
 
 # Tab 2 汇总指标固定颜色
 SUMMARY_COLORS = {
@@ -2532,46 +2532,103 @@ def tab6():
 
 
 def _build_seasonal_net_positions(contracts: List[str], sd, ed) -> Tuple[Dict[str, pd.DataFrame], defaultdict]:
-    """构建季节性净持仓数据（从 akshare 持仓接口获取，缓存兜底，模拟兜底）"""
+    """构建季节性净持仓数据（从真实缓存数据获取每日净持仓，不做模拟）
+
+    对于每个交易日，尝试从日期精确缓存获取真实持仓数据；
+    若无当日缓存，则向前查找最近可用数据。
+    """
     net_data: Dict[str, pd.DataFrame] = {}
     net_collector = defaultdict(list)
 
     for c in contracts:
-        # 尝试读取缓存的持仓数据
-        cache_file = HOLDINGS_DIR / f"{c}.csv"
-        holdings_df = None
-        if cache_file.exists():
+        # ── 收集该合约所有可用的持仓快照 ──
+        # 格式: {date_str: net_position}
+        snapshots: Dict[str, int] = {}
+
+        # 1. 扫描所有日期精确缓存
+        for cache_file in sorted(HOLDINGS_DIR.glob(f"{c}_*.csv")):
+            if cache_file.name == f"{c}.csv":
+                continue  # 跳过通用缓存，后面单独处理
             try:
-                holdings_df = pd.read_csv(cache_file)
+                # 从文件名提取日期: LH2609_20260710.csv → 20260710
+                date_part = cache_file.stem.replace(f"{c}_", "")
+                if len(date_part) != 8 or not date_part.isdigit():
+                    continue
+                df = pd.read_csv(cache_file)
+                if "company" in df.columns and "long" in df.columns and "short" in df.columns:
+                    # ★ 使用全部合并公司（DCE 三张排名表合并，通常 28-40 家）
+                    net = int(df["long"].sum() - df["short"].sum())
+                    snapshots[date_part] = net
             except Exception:
                 pass
-        if holdings_df is None or holdings_df.empty:
-            holdings_df = _generate_mock_holdings(c)
-        if holdings_df is None or holdings_df.empty:
+
+        # 2. 通用缓存兜底
+        generic_file = HOLDINGS_DIR / f"{c}.csv"
+        if generic_file.exists():
+            try:
+                df = pd.read_csv(generic_file)
+                if "company" in df.columns and "long" in df.columns and "short" in df.columns:
+                    # ★ 使用全部合并公司（DCE 三张排名表合并，通常 28-40 家）
+                    generic_net = int(df["long"].sum() - df["short"].sum())
+                    # 读取通用缓存的日期
+                    meta_file = HOLDINGS_DIR / f"{c}_meta.txt"
+                    if meta_file.exists():
+                        try:
+                            generic_date = meta_file.read_text().strip()[:8]
+                            if generic_date not in snapshots:
+                                snapshots[generic_date] = generic_net
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+        # 3. 如果完全没有缓存，使用模拟数据兜底
+        if not snapshots:
+            mock_df = _generate_mock_holdings(c)
+            if mock_df is not None and not mock_df.empty:
+                mock_net = int(mock_df["long"].sum() - mock_df["short"].sum())
+                snapshots["mock"] = mock_net
+
+        if not snapshots:
             continue
 
-        # 汇总前20净持仓
-        net_total = int(holdings_df["long"].sum() - holdings_df["short"].sum())
-
-        # 加载期货数据获取日期
+        # ── 加载期货行情数据 ──
         fut_df, _ = load_futures(c)
-        if fut_df is None or fut_df.empty: continue
+        if fut_df is None or fut_df.empty:
+            continue
         fut_df = fut_df.sort_values("date").copy()
         fut_df = fut_df[(fut_df["date"] >= pd.to_datetime(sd)) & (fut_df["date"] <= pd.to_datetime(ed))]
-        if fut_df.empty: continue
+        if fut_df.empty:
+            continue
 
-        # 用净持仓总量 × 每日比例（模拟每日变化）+ 随机波动
-        np.random.seed(hash(c) % (2**31))
-        fut_df["plot_date"] = [pd.Timestamp(year=2020, month=d.month, day=d.day) for d in fut_df["date"]]
+        # ── 为每个交易日分配真实净持仓（向前填充） ──
+        sorted_snapshot_dates = sorted(snapshots.keys())
+        fut_df["plot_date"] = [pd.Timestamp(year=2020, month=d.month, day=d.day)
+                                for d in fut_df["date"]]
         fut_df["trade_year"] = fut_df["date"].dt.year
-        # 模拟持仓的季节性渐变（按日期的 day_of_year 调整）
-        base_ratio = np.sin(np.linspace(0, 2 * np.pi, len(fut_df))) * 0.3 + 1.0
-        noise = np.random.normal(0, 0.05, len(fut_df))
-        fut_df["net_position"] = (net_total * base_ratio * (1 + noise)).astype(int)
+
+        net_positions = []
+        for _, row in fut_df.iterrows():
+            date_key = row["date"].strftime("%Y%m%d")
+            # 精确匹配
+            if date_key in snapshots:
+                net_positions.append(snapshots[date_key])
+            else:
+                # 向前查找最近可用数据
+                best_date = None
+                for sd_key in sorted_snapshot_dates:
+                    if sd_key <= date_key:
+                        best_date = sd_key
+                if best_date:
+                    net_positions.append(snapshots[best_date])
+                else:
+                    # 没有任何历史数据，用最早的快照
+                    net_positions.append(snapshots[sorted_snapshot_dates[0]])
+
+        fut_df["net_position"] = net_positions
 
         for trade_yr, grp in fut_df.groupby("trade_year"):
             grp = grp.sort_values("plot_date")
-            cy = ct_year(c)
             ty_str = str(trade_yr)
             label = f"{c[2:]} ({ty_str})"
             net_data[label] = pd.DataFrame({
