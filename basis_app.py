@@ -1815,14 +1815,29 @@ def tab5():
             if holdings_date_mismatch:
                 sel_date_str = _cn(td)
                 actual_date_str = _cn(holdings_actual_dt) if holdings_actual_dt is not None else holdings_actual_date
+                # 尝试获取 API 错误详情
+                error_key = f"{ct}_{td.strftime('%Y%m%d')}"
+                api_errors = st.session_state.get("_holdings_api_errors", {})
+                error_detail = api_errors.get(error_key, "")
+                error_hint = ""
+                if error_detail:
+                    # 常见错误给出中文提示
+                    if "timeout" in error_detail.lower() or "timed out" in error_detail.lower():
+                        error_hint = "（接口请求超时，可能是网络波动或新浪服务器繁忙）"
+                    elif "connection" in error_detail.lower() or "refused" in error_detail.lower():
+                        error_hint = "（接口连接失败，请检查网络或稍后重试）"
+                    elif "empty" in error_detail.lower() or "no data" in error_detail.lower():
+                        error_hint = "（该日期数据尚未发布，大商所通常 T+1 更新持仓排名）"
+                    else:
+                        error_hint = f"（接口异常：{error_detail[:80]}）"
                 st.warning(
                     f"⚠️ **{sel_date_str}** 暂无前20期货公司多空持仓数据，"
                     f"当前显示的是最近可用数据 **{actual_date_str}**。"
-                    f"（数据来源：{holdings_source}）"
+                    f"（数据来源：{holdings_source}）{error_hint}"
                 )
             elif holdings_source == "mock":
                 st.warning(
-                    f"⚠️ 前20期货公司多空持仓数据暂不可用（akshare接口受限），"
+                    f"⚠️ 前20期货公司多空持仓数据暂不可用（akshare / 新浪接口均无法连接），"
                     f"当前显示的是模拟数据（{_cn(holdings_actual_dt) if holdings_actual_dt else holdings_actual_date}），仅供参考。"
                 )
 
@@ -2102,14 +2117,17 @@ def _get_holdings(ct: str, target_date, return_meta: bool = False):
     # 通用缓存的日期元数据文件（记录实际数据日期）
     generic_meta_file = HOLDINGS_DIR / f"{ct}_meta.txt"
 
-    # ── 尝试从新浪财经获取 ──
-    try:
+    # ── 尝试从新浪财经获取（带重试 + 日期回退） ──
+    last_error = None
+
+    def _try_fetch_for_date(try_date_str: str):
+        """尝试对指定日期拉取持仓数据，成功返回 (merged_df, None)，失败返回 (None, error_msg)"""
         import akshare as ak
 
         # 分三次调用，分别取 成交量 / 多单持仓 / 空单持仓
-        df_vol = ak.futures_hold_pos_sina(symbol="成交量", contract=ct, date=date_str)
-        df_long = ak.futures_hold_pos_sina(symbol="多单持仓", contract=ct, date=date_str)
-        df_short = ak.futures_hold_pos_sina(symbol="空单持仓", contract=ct, date=date_str)
+        df_vol = ak.futures_hold_pos_sina(symbol="成交量", contract=ct, date=try_date_str)
+        df_long = ak.futures_hold_pos_sina(symbol="多单持仓", contract=ct, date=try_date_str)
+        df_short = ak.futures_hold_pos_sina(symbol="空单持仓", contract=ct, date=try_date_str)
 
         # 标准化列名
         # 新浪返回列: 名次, 会员简称, {成交量|多单持仓|空单持仓}, 比上交易增减
@@ -2155,18 +2173,40 @@ def _get_holdings(ct: str, target_date, return_meta: bool = False):
 
         # 按多单持仓降序排列（主力多单排名）
         merged = merged.sort_values("long", ascending=False).reset_index(drop=True)
+        return merged, None
 
-        # 缓存
-        merged.to_csv(date_cache_file, index=False)
-        merged.to_csv(generic_cache_file, index=False)
-        # 记录通用缓存的实际数据日期
-        generic_meta_file.write_text(date_str)
-        if return_meta:
-            return merged.head(20), date_str, "akshare"
-        return merged.head(20)
-
+    # ★ 优先尝试请求日期，失败则回退到最近 5 个自然日
+    try_dates = [date_str]
+    try:
+        base_dt = datetime.strptime(date_str, "%Y%m%d")
+        for offset in range(1, 6):  # 回退最多 5 天
+            fallback_dt = base_dt - timedelta(days=offset)
+            fallback_str = fallback_dt.strftime("%Y%m%d")
+            if fallback_str not in try_dates:
+                try_dates.append(fallback_str)
     except Exception:
         pass
+
+    for try_date in try_dates:
+        for attempt in range(3):  # 每个日期最多重试 3 次
+            try:
+                merged, _ = _try_fetch_for_date(try_date)
+                # 成功：写入缓存
+                merged.to_csv(HOLDINGS_DIR / f"{ct}_{try_date}.csv", index=False)
+                merged.to_csv(generic_cache_file, index=False)
+                generic_meta_file.write_text(try_date)
+                if return_meta:
+                    return merged.head(20), try_date, "akshare"
+                return merged.head(20)
+            except Exception as e:
+                last_error = str(e)
+                if attempt < 2:
+                    time.sleep(1)  # 重试前等待 1 秒
+        # 该日期 3 次都失败，尝试下一个日期
+
+    # ★ 所有 API 尝试都失败了，记录最后的错误（供调试）
+    if last_error:
+        st.session_state.setdefault("_holdings_api_errors", {})[f"{ct}_{date_str}"] = last_error
 
     # ── 日期缓存兜底 ──
     if date_cache_file.exists():
