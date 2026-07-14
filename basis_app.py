@@ -2644,7 +2644,6 @@ def _build_seasonal_net_positions(contracts: List[str], sd, ed) -> Tuple[Dict[st
 
         # ── 逐日获取真实净持仓 ──
         net_positions = []
-        last_valid_net = None
 
         for i, dt in enumerate(trading_dates):
             date_str = dt.strftime("%Y%m%d")
@@ -2658,10 +2657,9 @@ def _build_seasonal_net_positions(contracts: List[str], sd, ed) -> Tuple[Dict[st
 
             if holdings is not None and not holdings.empty:
                 net = int(holdings["long"].sum() - holdings["short"].sum())
-                last_valid_net = net
             else:
-                # 数据未发布（如最新 1-2 天）→ 沿用上一交易日数据
-                net = last_valid_net
+                # 数据未发布 → None，图中该点留空不连线
+                net = None
 
             net_positions.append(net)
 
@@ -2684,7 +2682,9 @@ def _build_seasonal_net_positions(contracts: List[str], sd, ed) -> Tuple[Dict[st
             }).sort_values("plot_date")
             for _, row in grp.iterrows():
                 md = (row["date"].month, row["date"].day)
-                net_collector[md].append(int(row["net_position"]))
+                v = row["net_position"]
+                if v is not None and not pd.isna(v):
+                    net_collector[md].append(int(v))
 
     # 历史均值
     if net_collector:
