@@ -129,8 +129,7 @@ def main():
                 total_new += 1
             else:
                 total_miss += 1
-            if i < len(missing) - 1:
-                time.sleep(0.1)
+            # no sleep - API handles rapid requests fine
 
         print(f"done ({ct_ok}/{len(missing)} ok)")
 
