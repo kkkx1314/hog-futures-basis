@@ -1,56 +1,64 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""
-Batch download all historical top-20 position data for LH futures.
-Run once, then the app loads instantly from local CSV cache.
+"""Robust batch download with timeout. Run from sentiment_platform directory."""
 
-Usage: python download_holdings_history.py
-"""
-
-import time
+import signal
 import pandas as pd
 from pathlib import Path
+import akshare as ak
 
 BASE_DIR = Path(__file__).parent
-DATA_DIR = BASE_DIR / "data"
-FUTURES_DIR = DATA_DIR / "futures"
-HOLDINGS_DIR = DATA_DIR / "holdings"
+FUTURES_DIR = BASE_DIR / "data" / "futures"
+HOLDINGS_DIR = BASE_DIR / "data" / "holdings"
 HOLDINGS_DIR.mkdir(exist_ok=True)
 
-ALL_MONTHS = ["01", "03", "05", "07", "09", "11"]
-ALL_CONTRACTS = []
-for y in range(21, 28):
-    for m in ALL_MONTHS:
-        c = f"LH{y}{m}"
-        if "LH2109" <= c <= "LH2705":
-            ALL_CONTRACTS.append(c)
+TIMEOUT = 15  # seconds per API call
 
 
-def get_trading_dates(ct: str):
-    """Read futures CSV and return all trading dates for the contract."""
-    f = FUTURES_DIR / f"{ct}.csv"
-    if not f.exists():
-        return []
-    try:
-        df = pd.read_csv(f)
-        df["date"] = pd.to_datetime(df["date"])
-        return sorted(df["date"].dt.strftime("%Y%m%d").unique())
-    except Exception:
-        return []
+class TimeoutError(Exception):
+    pass
+
+
+def with_timeout(seconds):
+    def decorator(func):
+        def wrapper(*args, **kwargs):
+            result = [None]
+            exception = [None]
+
+            def target():
+                try:
+                    result[0] = func(*args, **kwargs)
+                except Exception as e:
+                    exception[0] = e
+
+            import threading
+            t = threading.Thread(target=target)
+            t.daemon = True
+            t.start()
+            t.join(seconds)
+            if t.is_alive():
+                raise TimeoutError(f"Timed out after {seconds}s")
+            if exception[0]:
+                raise exception[0]
+            return result[0]
+        return wrapper
+    return decorator
+
+
+@with_timeout(TIMEOUT)
+def call_api(symbol, contract, date_str):
+    return ak.futures_hold_pos_sina(symbol=symbol, contract=contract, date=date_str)
 
 
 def fetch_one(ct: str, date_str: str) -> bool:
-    """Fetch and cache one day of position data. Returns True on success."""
     cache_file = HOLDINGS_DIR / f"{ct}_{date_str}.csv"
     if cache_file.exists():
         return True
 
-    import akshare as ak
-
     try:
-        df_vol = ak.futures_hold_pos_sina(symbol="成交量", contract=ct, date=date_str)
-        df_long = ak.futures_hold_pos_sina(symbol="多单持仓", contract=ct, date=date_str)
-        df_short = ak.futures_hold_pos_sina(symbol="空单持仓", contract=ct, date=date_str)
+        df_vol = call_api("成交量", ct, date_str)
+        df_long = call_api("多单持仓", ct, date_str)
+        df_short = call_api("空单持仓", ct, date_str)
 
         def _norm(df, val_col, chg_col):
             out = pd.DataFrame()
@@ -89,54 +97,39 @@ def fetch_one(ct: str, date_str: str) -> bool:
 
         merged = merged.sort_values("long", ascending=False).reset_index(drop=True)
         merged.to_csv(cache_file, index=False)
-
         generic = HOLDINGS_DIR / f"{ct}.csv"
-        meta = HOLDINGS_DIR / f"{ct}_meta.txt"
         merged.to_csv(generic, index=False)
-        meta.write_text(date_str)
+        (HOLDINGS_DIR / f"{ct}_meta.txt").write_text(date_str)
         return True
-
     except Exception:
         return False
 
 
 def main():
-    print("=" * 60)
-    print("  LH Futures Top-20 Position Data - Batch Download")
-    print("=" * 60)
-
-    contracts = [c for c in ALL_CONTRACTS if (FUTURES_DIR / f"{c}.csv").exists()]
-    print(f"\nFound {len(contracts)} contracts with futures data")
-
-    total_new = 0
-    total_miss = 0
+    # Read all contracts with futures data
+    contracts = sorted([f.stem for f in FUTURES_DIR.glob("LH*.csv")])
+    print(f"Found {len(contracts)} contracts")
 
     for ct in contracts:
-        dates = get_trading_dates(ct)
-        if not dates:
-            continue
-
+        df = pd.read_csv(FUTURES_DIR / f"{ct}.csv")
+        df["date"] = pd.to_datetime(df["date"])
+        dates = sorted(df["date"].dt.strftime("%Y%m%d").unique())
         missing = [d for d in dates if not (HOLDINGS_DIR / f"{ct}_{d}.csv").exists()]
+
         if not missing:
-            print(f"  {ct}: all {len(dates)} days cached")
+            print(f"  {ct}: {len(dates)} cached, skip")
             continue
 
-        print(f"  {ct}: downloading {len(missing)} days ...", end=" ", flush=True)
-        ct_ok = 0
-        for i, d in enumerate(missing):
+        print(f"  {ct}: {len(dates)} total, {len(missing)} to fetch ...", end=" ", flush=True)
+        ok = 0
+        for d in missing:
             if fetch_one(ct, d):
-                ct_ok += 1
-                total_new += 1
-            else:
-                total_miss += 1
-            # no sleep - API handles rapid requests fine
+                ok += 1
+        print(f"{ok}/{len(missing)} ok ({len(dates)-len(missing)+ok}/{len(dates)} total)")
 
-        print(f"done ({ct_ok}/{len(missing)} ok)")
-
-    print(f"\n{'=' * 60}")
-    print(f"Done! New: {total_new}, Failed: {total_miss}")
-    print(f"Data dir: {HOLDINGS_DIR}")
-    print(f"{'=' * 60}")
+    # Final stats
+    total_files = len(list(HOLDINGS_DIR.glob("LH*_*.csv")))
+    print(f"\nDone! Total cached files: {total_files}")
 
 
 if __name__ == "__main__":

@@ -2571,12 +2571,11 @@ def _fetch_exact_holdings(ct: str, date_str: str) -> Optional[pd.DataFrame]:
 
 
 def _prefetch_holdings_range(contracts: List[str], sd, ed, silent: bool = False) -> int:
-    """增量同步：仅拉取最近 3 个交易日缺失的持仓数据。
+    """全量同步：拉取日期范围内所有缺失的持仓数据。
 
-    历史数据请用 download_holdings_history.py 离线批量下载。
+    首次打开 Tab 6 会较慢，之后全部命中本地 CSV 缓存，秒出。
     """
     total_fetched = 0
-    today = datetime.now().date()
 
     for c in contracts:
         fut_df, _ = load_futures(c)
@@ -2584,18 +2583,26 @@ def _prefetch_holdings_range(contracts: List[str], sd, ed, silent: bool = False)
             continue
         all_dates = sorted(d for d in fut_df["date"].unique()
                            if pd.to_datetime(sd) <= d <= pd.to_datetime(ed))
-
-        # ★ 只拉最近 3 个交易日缺失的数据
-        recent = [d for d in all_dates if (today - d.date()).days <= 4]
-        missing = [d for d in recent
+        missing = [d for d in all_dates
                    if not (HOLDINGS_DIR / f"{c}_{d.strftime('%Y%m%d')}.csv").exists()]
+        if not missing:
+            continue
+
+        if not silent:
+            msg = st.empty()
+            progress_bar = st.progress(0)
 
         for i, dt in enumerate(missing):
             date_str = dt.strftime("%Y%m%d")
-            if i > 0:
-                time.sleep(0.12)
             _fetch_exact_holdings(c, date_str)
             total_fetched += 1
+            if not silent and (i % 5 == 0 or i == len(missing) - 1):
+                progress_bar.progress((i + 1) / len(missing))
+                msg.caption(f"📡 {c}：同步历史持仓 {i+1}/{len(missing)}（首次较慢，缓存后秒出）")
+
+        if not silent:
+            progress_bar.empty()
+            msg.empty()
 
     return total_fetched
 
@@ -2604,8 +2611,7 @@ def _build_seasonal_net_positions(contracts: List[str], sd, ed) -> Tuple[Dict[st
     """构建季节性净持仓数据 — 从本地 CSV 缓存读取每日真实净持仓。
 
     净持仓 = Σ多单 − Σ空单（全部上榜公司）。
-    历史数据由 download_holdings_history.py 离线下载，
-    最新几日由 _prefetch_holdings_range 增量拉取。
+    数据由 _prefetch_holdings_range 在首次打开时全量拉取并缓存。
     无缓存日期 → None（图中留空）。"""
     net_data: Dict[str, pd.DataFrame] = {}
     net_collector = defaultdict(list)
