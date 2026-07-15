@@ -336,7 +336,13 @@ def _cache_fresh(ct: str) -> bool:
     if not p.exists(): return False
     try:
         df = pd.read_csv(p)
-        return "date" in df.columns and not df.empty and pd.to_datetime(df["date"].max()).date() >= datetime.now().date()
+        if "date" not in df.columns or df.empty:
+            return False
+        max_date = pd.to_datetime(df["date"].max()).date()
+        # 已到期合约（30天前就停更了）→ 视为"够新"，不再尝试下载
+        if max_date < (datetime.now().date() - timedelta(days=30)):
+            return True
+        return max_date >= datetime.now().date()
     except Exception: return False
 
 def get_cached_contracts() -> List[str]:
@@ -501,6 +507,7 @@ def get_spot_data_date() -> str:
 
     return "无现货数据"
 
+@st.cache_data(ttl=1800, show_spinner=False)
 def load_futures(ct: str, force: bool = False) -> Tuple[Optional[pd.DataFrame], str]:
     cp = _csv_path(ct)
     if not force and _cache_fresh(ct):
@@ -2288,27 +2295,29 @@ def tab6():
                                  index=active_months.index("09") if "09" in active_months else 0,
                                  format_func=lambda m: f"{m}月合约", key="t6_month")
 
-        # 找出该月份所有可用合约
+        # 找出该月份所有可用合约（轻量：只检查 CSV 文件是否存在）
         same_month_cts = [c for c in ALL_CONTRACTS if ct_month(c) == sel_month]
-        # 排除当前年份未来的合约（暂时过滤）
-        available_cts = []
-        for c in same_month_cts:
-            df, _ = load_futures(c)
-            if df is not None and not df.empty and len(df) >= 20:
-                available_cts.append(c)
+        available_cts = [c for c in same_month_cts if _csv_path(c).exists()]
         if not available_cts:
             available_cts = same_month_cts
 
         st.caption(f"已发现 {len(available_cts)} 个 {sel_month} 月合约：{'、'.join(available_cts[:8])}"
                    f"{'…' if len(available_cts) > 8 else ''}")
 
-        # 日期范围
+        # 日期范围（轻量：只读 CSV 首尾行）
         all_dates = []
         for c in available_cts:
-            df, _ = load_futures(c)
-            if df is not None and not df.empty:
-                all_dates.append(pd.to_datetime(df["date"].min()).date())
-                all_dates.append(pd.to_datetime(df["date"].max()).date())
+            cp = _csv_path(c)
+            if not cp.exists(): continue
+            try:
+                # 只读第一行和最后一行，不加载整个文件
+                df = pd.read_csv(cp, usecols=["date"])
+                if df.empty: continue
+                dates = pd.to_datetime(df["date"])
+                all_dates.append(dates.min().date())
+                all_dates.append(dates.max().date())
+            except Exception:
+                continue
         if all_dates:
             data_min, data_max = min(all_dates), max(all_dates)
         else:
