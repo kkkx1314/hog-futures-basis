@@ -417,22 +417,34 @@ def get_latest_trade_date() -> Optional[pd.Timestamp]:
     return _get_global_latest_date()
 
 
-# ── 纯读取：只从本地 CSV 加载，绝不发起网络请求 ──
+# ── 读取：优先本地 CSV，缺失时惰性同步 ──
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=3600)
 def load_futures(ct: str) -> Tuple[Optional[pd.DataFrame], str]:
-    """纯本地读取期货数据。绝不联网——同步由 sync_futures 独立完成。"""
+    """读取期货数据。本地有 CSV → 直接返回；本地无 → 惰性同步这一个合约。"""
     cp = _csv_path(ct)
-    if not cp.exists():
-        return None, "❌ 本地无数据"
-    try:
-        df = pd.read_csv(cp)
-        if "date" not in df.columns or df.empty:
-            return None, "❌ 数据为空"
-        df["date"] = pd.to_datetime(df["date"])
-        return df.sort_values("date").reset_index(drop=True), "📁 本地缓存"
-    except Exception:
-        return None, "❌ 读取失败"
+
+    # 本地有数据 → 直接读，不联网
+    if cp.exists():
+        try:
+            df = pd.read_csv(cp)
+            if "date" not in df.columns or df.empty:
+                return None, "❌ 数据为空"
+            df["date"] = pd.to_datetime(df["date"])
+            return df.sort_values("date").reset_index(drop=True), "📁 本地缓存"
+        except Exception:
+            return None, "❌ 读取失败"
+
+    # 本地无数据 → 惰性同步这一个合约（仅首次触发，缓存后不再走此分支）
+    ok, msg = sync_futures(ct, force_full=True)
+    if ok and cp.exists():
+        try:
+            df = pd.read_csv(cp)
+            df["date"] = pd.to_datetime(df["date"])
+            return df.sort_values("date").reset_index(drop=True), f"🌐 首次同步"
+        except Exception:
+            return None, "❌ 同步后读取失败"
+    return None, f"❌ 同步失败：{msg}"
 
 
 # ── 同步：全量 / 增量下载，写入本地 CSV ──
@@ -3252,12 +3264,6 @@ def main():
     <hr style="border: none; border-top: 1px solid #e9ecef; margin: 0.5rem 0 1.5rem 0;">
     """, unsafe_allow_html=True)
 
-    # ── 启动时同步活跃合约（增量为主，跳过已到期）──
-    if "_startup_sync_done" not in st.session_state:
-        with st.spinner("🔄 正在同步最新数据…"):
-            sync_active_contracts(silent=True)
-        st.session_state["_startup_sync_done"] = True
-
     # ── 七个 Tab ──
     t1, t2, t3, t4, t5, t6, t7 = st.tabs([
         "📊 当日基差分布", "📈 单合约基差走势", "🔄 合约基差比较",
@@ -3295,12 +3301,12 @@ def main():
     with c1:
         if st.button("🔄 刷新数据", use_container_width=True, key="main_refresh"):
             st.cache_data.clear()
-            st.session_state.pop("_startup_sync_done", None)
+            with st.spinner("🔄 正在同步最新数据…"):
+                sync_active_contracts()
             st.rerun()
     with c2:
         if st.button("🗑️ 清除缓存", use_container_width=True, key="main_clear"):
             st.cache_data.clear()
-            st.session_state.pop("_startup_sync_done", None)
             if FUTURES_DIR.exists(): shutil.rmtree(FUTURES_DIR); FUTURES_DIR.mkdir()
             st.rerun()
 
