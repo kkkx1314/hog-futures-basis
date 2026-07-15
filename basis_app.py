@@ -32,6 +32,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from collections import defaultdict
 from typing import Dict, List, Tuple, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import warnings
 
 warnings.filterwarnings("ignore")
@@ -2736,10 +2737,9 @@ def _migrate_existing_to_aggregated(ct: str) -> int:
 
 
 def _update_net_latest(ct: str, max_attempts: int = 3) -> int:
-    """增量更新净持仓数据。
-    - 聚合文件不存在 → 全量采样（每 5 个交易日取 1 个点，兼顾速度与覆盖）
-    - 聚合文件已存在 → 只拉取最新缺失的 N 个交易日
-    返回新拉取的日期数。"""
+    """更新净持仓数据。
+    - 聚合文件不存在 → 全量下载所有历史交易日
+    - 聚合文件已存在 → 只拉取最新缺失的 N 个交易日"""
     cp = _csv_path(ct)
     if not cp.exists():
         return 0
@@ -2755,46 +2755,70 @@ def _update_net_latest(ct: str, max_attempts: int = 3) -> int:
     is_first_sync = (agg_df is None or agg_df.empty)
     all_trading_dates = sorted(fut_df["date"].unique(), reverse=True)
     cached_dates = set(agg_df["date"].dt.strftime("%Y%m%d")) if not is_first_sync else set()
-    latest_trade_date = all_trading_dates[0] if all_trading_dates else None
 
     # 增量模式：已是最新则跳过
-    if not is_first_sync and latest_trade_date and agg_df["date"].max() >= latest_trade_date:
+    if not is_first_sync:
+        latest_trade_date = all_trading_dates[0] if all_trading_dates else None
+        if latest_trade_date and agg_df["date"].max() >= latest_trade_date:
+            return 0
+
+    # ── 收集待下载日期 ──
+    pending_dates = []
+    for dt in all_trading_dates:
+        if not is_first_sync and len(pending_dates) >= max_attempts:
+            break
+        date_str = dt.strftime("%Y%m%d")
+        if date_str not in cached_dates:
+            pending_dates.append(date_str)
+
+    if not pending_dates:
         return 0
 
     fetched = 0
-    for position, dt in enumerate(all_trading_dates):  # position 0 = 最新
-        # 增量模式：超出限制则停止
-        if not is_first_sync and fetched >= max_attempts:
-            break
-        # 首次全量：安全上限 300 点
-        if is_first_sync and fetched >= 300:
-            break
+    agg_path = _net_agg_path(ct)
 
-        date_str = dt.strftime("%Y%m%d")
-        if date_str in cached_dates:
-            continue
+    if is_first_sync:
+        # 首次全量：并行下载（5 线程），大幅缩短等待时间
+        def _fetch_one(ds: str):
+            h = _fetch_exact_holdings(ct, ds, use_fallback=False)
+            if h is not None and not h.empty:
+                return ds, int(h["long"].sum() - h["short"].sum())
+            return ds, None
 
-        # 首次全量采样：最新 30 天全取，其余每隔 5 个交易日取 1 点
-        if is_first_sync and position >= 30 and position % 5 != 0:
-            cached_dates.add(date_str)
-            continue
-
-        holdings = _fetch_exact_holdings(ct, date_str, use_fallback=False)
-        if holdings is not None and not holdings.empty:
-            net = int(holdings["long"].sum() - holdings["short"].sum())
-            new_row = pd.DataFrame([{"date": pd.to_datetime(date_str), "net_position": net}])
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            future_map = {executor.submit(_fetch_one, ds): ds for ds in pending_dates}
+            for future in as_completed(future_map):
+                ds, net = future.result()
+                if net is not None:
+                    new_row = pd.DataFrame([{"date": pd.to_datetime(ds), "net_position": net}])
+                    if agg_df is not None and not agg_df.empty:
+                        agg_df = agg_df[agg_df["date"] != pd.to_datetime(ds)]
+                        agg_df = pd.concat([agg_df, new_row], ignore_index=True)
+                    else:
+                        agg_df = new_row
+                    fetched += 1
+                cached_dates.add(ds)
+            # 排序并写入
             if agg_df is not None and not agg_df.empty:
-                agg_df = agg_df[agg_df["date"] != pd.to_datetime(date_str)]
-                agg_df = pd.concat([agg_df, new_row], ignore_index=True)
-            else:
-                agg_df = new_row
+                agg_df = agg_df.sort_values("date").reset_index(drop=True)
+                agg_df.to_csv(agg_path, index=False)
+    else:
+        # 增量模式：串行即可（最多 3 天）
+        for ds in pending_dates:
+            holdings = _fetch_exact_holdings(ct, ds, use_fallback=False)
+            if holdings is not None and not holdings.empty:
+                net = int(holdings["long"].sum() - holdings["short"].sum())
+                new_row = pd.DataFrame([{"date": pd.to_datetime(ds), "net_position": net}])
+                if agg_df is not None and not agg_df.empty:
+                    agg_df = agg_df[agg_df["date"] != pd.to_datetime(ds)]
+                    agg_df = pd.concat([agg_df, new_row], ignore_index=True)
+                else:
+                    agg_df = new_row
+                fetched += 1
+            cached_dates.add(ds)
+        if agg_df is not None and not agg_df.empty and fetched > 0:
             agg_df = agg_df.sort_values("date").reset_index(drop=True)
-            agg_df.to_csv(_net_agg_path(ct), index=False)
-            cached_dates.add(date_str)
-            fetched += 1
-        else:
-            cached_dates.add(date_str)
-            continue
+            agg_df.to_csv(agg_path, index=False)
 
     return fetched
 
