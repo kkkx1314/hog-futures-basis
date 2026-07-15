@@ -508,33 +508,33 @@ def sync_active_contracts(silent: bool = True) -> Dict[str, str]:
 
 
 def _download_futures(ct: str, sd: str, ed: str) -> Optional[pd.DataFrame]:
-    """底层网络下载（akshare → eastmoney 兜底）"""
-    for i in range(3):
-        try:
-            import akshare as ak
-            df = ak.futures_zh_daily_sina(symbol=ct)
-            if df is not None and not df.empty:
-                df["date"] = pd.to_datetime(df["date"]); df = df.sort_values("date")
-                return df[(df["date"]>=sd)&(df["date"]<=ed)].reset_index(drop=True)
-        except Exception:
-            if i < 2: time.sleep(1)
-    for i in range(3):
-        try:
-            r = requests.get("https://push2his.eastmoney.com/api/qt/stock/kline/get",
-                params={"secid":f"114.{ct}","fields1":"f1,f2,f3,f4,f5,f6","fields2":"f51,f52,f53,f54,f55,f56,f57","klt":"101","fqt":"1","end":"20500101","lmt":"3000"},
-                timeout=15, headers={"User-Agent":"Mozilla/5.0","Referer":"https://quote.eastmoney.com/"})
-            if r.status_code != 200: continue
+    """底层网络下载（akshare → eastmoney 兜底，减少重试避免卡顿）"""
+    # akshare：只试 1 次
+    try:
+        import akshare as ak
+        df = ak.futures_zh_daily_sina(symbol=ct)
+        if df is not None and not df.empty:
+            df["date"] = pd.to_datetime(df["date"]); df = df.sort_values("date")
+            return df[(df["date"]>=sd)&(df["date"]<=ed)].reset_index(drop=True)
+    except Exception:
+        pass
+    # eastmoney 兜底：只试 1 次
+    try:
+        r = requests.get("https://push2his.eastmoney.com/api/qt/stock/kline/get",
+            params={"secid":f"114.{ct}","fields1":"f1,f2,f3,f4,f5,f6","fields2":"f51,f52,f53,f54,f55,f56,f57","klt":"101","fqt":"1","end":"20500101","lmt":"3000"},
+            timeout=8, headers={"User-Agent":"Mozilla/5.0","Referer":"https://quote.eastmoney.com/"})
+        if r.status_code == 200:
             d = r.json()
-            if not d or not d.get("data") or not d["data"].get("klines"): continue
-            recs = []
-            for k in d["data"]["klines"]:
-                p = k.split(",")
-                if len(p) >= 7:
-                    recs.append({"date":pd.to_datetime(p[0]),"open":float(p[1]),"close":float(p[2]),
-                                 "high":float(p[3]),"low":float(p[4]),"volume":int(float(p[5])),"settle":float(p[2]),"hold":0})
-            if recs: return pd.DataFrame(recs).sort_values("date").reset_index(drop=True)
-        except Exception:
-            if i < 2: time.sleep(1)
+            if d and d.get("data") and d["data"].get("klines"):
+                recs = []
+                for k in d["data"]["klines"]:
+                    p = k.split(",")
+                    if len(p) >= 7:
+                        recs.append({"date":pd.to_datetime(p[0]),"open":float(p[1]),"close":float(p[2]),
+                                     "high":float(p[3]),"low":float(p[4]),"volume":int(float(p[5])),"settle":float(p[2]),"hold":0})
+                if recs: return pd.DataFrame(recs).sort_values("date").reset_index(drop=True)
+    except Exception:
+        pass
     return None
 
 
