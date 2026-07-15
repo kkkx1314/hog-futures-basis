@@ -2816,13 +2816,16 @@ def _build_seasonal_net_positions(contracts: Tuple[str, ...], sel_month: str) ->
     net_collector = defaultdict(list)
 
     for c in contracts:
-        # 纯本地读取，和成交量/持仓量一样——不联网
+        # 和 load_futures 一样：有本地文件就读，没有就下载
         agg_df = _load_aggregated_net(c)
         if agg_df is None or agg_df.empty:
-            _migrate_existing_to_aggregated(c)  # 尝试从已有 date-CSV 迁移（纯本地）
+            _migrate_existing_to_aggregated(c)    # 尝试从 date-CSV 迁移
             agg_df = _load_aggregated_net(c)
         if agg_df is None or agg_df.empty:
-            continue  # 无本地数据，跳过（同步靠"刷新数据"按钮或Tab5触发）
+            _ensure_net_cache(c)                   # 无本地数据，当场下载（首次慢，之后秒读）
+            agg_df = _load_aggregated_net(c)
+        if agg_df is None or agg_df.empty:
+            continue
 
         agg_df["plot_date"] = [pd.Timestamp(year=2020, month=d.month, day=d.day)
                                for d in agg_df["date"]]
