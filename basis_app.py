@@ -2517,9 +2517,25 @@ def tab6():
         # ── 图3：前20净持仓季节性对比 ──
         st.markdown("#### 🏢 前20净持仓季节性对比")
 
+        # 先检查哪些合约缺聚合文件
+        missing_agg = [c for c in available_cts if not _net_agg_path(c).exists()]
+
+        if missing_agg:
+            col_a, col_b = st.columns([2, 1])
+            with col_a:
+                st.warning(f"⚠️ 缺少本地数据：{'、'.join(missing_agg)}（需首次下载，约 1~3 分钟）")
+            with col_b:
+                if st.button("📡 一键下载", key="t6_dl_net", use_container_width=True):
+                    status = st.empty()
+                    for i, c in enumerate(missing_agg):
+                        status.text(f"⏳ {i+1}/{len(missing_agg)} 正在下载 {c} 全量历史数据…")
+                        _ensure_net_cache(c)
+                    status.text("✅ 下载完成！")
+                    _build_seasonal_net_positions.clear()
+                    st.rerun()
+
         with st.spinner("🔄 加载前20净持仓数据…"):
             net_data_full, _ = _build_seasonal_net_positions(tuple(available_cts), sel_month)
-            # 按日期范围在内存中筛选
             net_data: Dict[str, pd.DataFrame] = {}
             if net_data_full:
                 ref_start = pd.Timestamp(year=2020, month=sd.month, day=sd.day)
