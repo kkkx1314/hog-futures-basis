@@ -2441,10 +2441,9 @@ def tab6():
         # ── 图3：前20净持仓季节性对比 ──
         st.markdown("#### 🏢 前20净持仓季节性对比")
 
-        # ★ 预热缓存（首次较慢，之后秒出）
-        _prefetch_holdings_range(available_cts, sd, ed, silent=True)
-
-        net_data, net_collector = _build_seasonal_net_positions(available_cts, sd, ed)
+        # ★ 增量加载：只拉取最新缺失日期，历史数据从聚合缓存秒读
+        with st.spinner("🔄 加载前20净持仓数据…"):
+            net_data, net_collector = _build_seasonal_net_positions(tuple(available_cts), sd, ed)
         if net_data:
             fig_net = go.Figure()
             for label, ndf in net_data.items():
@@ -2496,165 +2495,256 @@ def tab6():
                 st.dataframe(pd.DataFrame(st_cols), use_container_width=True, hide_index=True)
 
 
-def _fetch_exact_holdings(ct: str, date_str: str) -> Optional[pd.DataFrame]:
-    """拉取指定合约在指定日期的真实持仓数据（无回退，无重试）
+def _fetch_exact_holdings(ct: str, date_str: str, use_fallback: bool = True) -> Optional[pd.DataFrame]:
+    """拉取指定合约在指定日期的真实持仓数据（支持交易日回退）
 
     成功返回合并后的 DataFrame，失败返回 None。
     结果缓存到日期精确文件。
-    """
-    cache_file = HOLDINGS_DIR / f"{ct}_{date_str}.csv"
-    generic_cache_file = HOLDINGS_DIR / f"{ct}.csv"
-    generic_meta_file = HOLDINGS_DIR / f"{ct}_meta.txt"
 
-    # ── 先查缓存 ──
-    if cache_file.exists():
+    use_fallback=True 时：若目标日期数据未发布，自动向前查找最近 10 个交易日。
+    """
+    # ── 辅助：标准化新浪表 ──
+    def _norm_sina(df, val_col, chg_col):
+        out = pd.DataFrame()
+        for c in df.columns:
+            if "会员" in str(c) or "简称" in str(c):
+                out["company"] = df[c].astype(str).str.strip()
+                break
+        for c in df.columns:
+            cs = str(c)
+            if "名次" in cs or "会员" in cs or "简称" in cs or "增减" in cs or "比上" in cs:
+                continue
+            out[val_col] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype(int)
+            break
+        for c in df.columns:
+            cs = str(c)
+            if "增减" in cs or "比上" in cs:
+                out[chg_col] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype(int)
+                break
+        if chg_col not in out.columns:
+            out[chg_col] = 0
+        return out[out["company"].notna() & (out["company"] != "")]
+
+    # ── 构建回退日期列表 ──
+    try_dates = [date_str]
+    if use_fallback:
         try:
-            df = pd.read_csv(cache_file)
-            if "company" in df.columns and "long" in df.columns and "short" in df.columns:
-                return df
+            base_dt = datetime.strptime(date_str, "%Y%m%d")
+            offset = 1
+            while len(try_dates) < 11:  # 当前日期 + 最多往前 10 个交易日
+                fallback_dt = base_dt - timedelta(days=offset)
+                offset += 1
+                if fallback_dt.weekday() >= 5:  # 跳过周末
+                    continue
+                try_dates.append(fallback_dt.strftime("%Y%m%d"))
         except Exception:
             pass
 
-    # ── 从新浪 API 拉取 ──
+    # ── 逐个尝试日期 ──
+    for try_date in try_dates:
+        cache_file = HOLDINGS_DIR / f"{ct}_{try_date}.csv"
+        generic_cache_file = HOLDINGS_DIR / f"{ct}.csv"
+        generic_meta_file = HOLDINGS_DIR / f"{ct}_meta.txt"
+
+        # 先查缓存
+        if cache_file.exists():
+            try:
+                df = pd.read_csv(cache_file)
+                if "company" in df.columns and "long" in df.columns and "short" in df.columns:
+                    return df
+            except Exception:
+                pass
+
+        # 从新浪 API 拉取（每个日期最多 2 次重试）
+        for attempt in range(2):
+            try:
+                import akshare as ak
+
+                df_vol = ak.futures_hold_pos_sina(symbol="成交量", contract=ct, date=try_date)
+                df_long = ak.futures_hold_pos_sina(symbol="多单持仓", contract=ct, date=try_date)
+                df_short = ak.futures_hold_pos_sina(symbol="空单持仓", contract=ct, date=try_date)
+
+                vol_df = _norm_sina(df_vol, "volume", "volume_chg")
+                long_df = _norm_sina(df_long, "long", "long_chg")
+                short_df = _norm_sina(df_short, "short", "short_chg")
+
+                merged = long_df.merge(short_df, on="company", how="outer")
+                merged = merged.merge(vol_df, on="company", how="outer")
+                merged = merged.fillna(0)
+                for col in ["long", "long_chg", "short", "short_chg", "volume", "volume_chg"]:
+                    if col in merged.columns:
+                        merged[col] = merged[col].astype(int)
+
+                if merged.empty or merged["long"].sum() == 0:
+                    break  # 数据未发布，跳到上一个日期
+
+                merged = merged.sort_values("long", ascending=False).reset_index(drop=True)
+
+                # 缓存（以请求的 try_date 为 key）
+                merged.to_csv(cache_file, index=False)
+                merged.to_csv(generic_cache_file, index=False)
+                generic_meta_file.write_text(try_date)
+                return merged
+
+            except Exception:
+                if attempt < 1:
+                    time.sleep(0.5)  # 重试前短暂等待
+        # 如果这个日期数据未发布（empty），继续尝试上一个日期
+        # 如果是网络错误，也继续尝试上一个日期
+
+    return None
+
+
+# ══════════════════════════════════════════════════════════════
+# 前20净持仓 聚合缓存（本地文件，快速加载）
+# ══════════════════════════════════════════════════════════════
+
+def _net_agg_path(ct: str) -> Path:
+    """每个合约一个聚合文件：date, net_position"""
+    return HOLDINGS_DIR / f"{ct}_net_agg.csv"
+
+
+def _load_aggregated_net(ct: str) -> Optional[pd.DataFrame]:
+    """读取合约的聚合净持仓缓存文件。不存在返回 None。"""
+    p = _net_agg_path(ct)
+    if not p.exists():
+        return None
     try:
-        import akshare as ak
-
-        df_vol = ak.futures_hold_pos_sina(symbol="成交量", contract=ct, date=date_str)
-        df_long = ak.futures_hold_pos_sina(symbol="多单持仓", contract=ct, date=date_str)
-        df_short = ak.futures_hold_pos_sina(symbol="空单持仓", contract=ct, date=date_str)
-
-        def _norm_sina(df, val_col, chg_col):
-            out = pd.DataFrame()
-            for c in df.columns:
-                if "会员" in str(c) or "简称" in str(c):
-                    out["company"] = df[c].astype(str).str.strip()
-                    break
-            for c in df.columns:
-                cs = str(c)
-                if "名次" in cs or "会员" in cs or "简称" in cs or "增减" in cs or "比上" in cs:
-                    continue
-                out[val_col] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype(int)
-                break
-            for c in df.columns:
-                cs = str(c)
-                if "增减" in cs or "比上" in cs:
-                    out[chg_col] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype(int)
-                    break
-            if chg_col not in out.columns:
-                out[chg_col] = 0
-            return out[out["company"].notna() & (out["company"] != "")]
-
-        vol_df = _norm_sina(df_vol, "volume", "volume_chg")
-        long_df = _norm_sina(df_long, "long", "long_chg")
-        short_df = _norm_sina(df_short, "short", "short_chg")
-
-        merged = long_df.merge(short_df, on="company", how="outer")
-        merged = merged.merge(vol_df, on="company", how="outer")
-        merged = merged.fillna(0)
-        for col in ["long", "long_chg", "short", "short_chg", "volume", "volume_chg"]:
-            if col in merged.columns:
-                merged[col] = merged[col].astype(int)
-
-        if merged.empty or merged["long"].sum() == 0:
-            return None  # 数据未发布
-
-        merged = merged.sort_values("long", ascending=False).reset_index(drop=True)
-
-        # 缓存
-        merged.to_csv(cache_file, index=False)
-        merged.to_csv(generic_cache_file, index=False)
-        generic_meta_file.write_text(date_str)
-        return merged
-
+        df = pd.read_csv(p)
+        if "date" not in df.columns or "net_position" not in df.columns:
+            return None
+        df["date"] = pd.to_datetime(df["date"])
+        return df.sort_values("date").reset_index(drop=True)
     except Exception:
         return None
 
 
-def _prefetch_holdings_range(contracts: List[str], sd, ed, silent: bool = False) -> int:
-    """全量同步：拉取日期范围内所有缺失的持仓数据。
+def _migrate_existing_to_aggregated(ct: str) -> int:
+    """一次性迁移：扫描所有 date-specific CSV，计算 net，写入聚合文件。
+    返回迁移的日期数。已存在聚合文件则跳过。"""
+    agg_path = _net_agg_path(ct)
+    if agg_path.exists():
+        return 0  # 已迁移
 
-    首次打开 Tab 6 会较慢，之后全部命中本地 CSV 缓存，秒出。
-    """
-    total_fetched = 0
-
-    for c in contracts:
-        fut_df, _ = load_futures(c)
-        if fut_df is None or fut_df.empty:
+    # 用 glob 只扫描该合约的 date-CSV 文件（避免遍历整个目录）
+    rows = []
+    for f in HOLDINGS_DIR.glob(f"{ct}_????????.csv"):
+        date_str = f.stem[len(ct)+1:]  # 提取 YYYYMMDD
+        if len(date_str) != 8:
             continue
-        all_dates = sorted(d for d in fut_df["date"].unique()
-                           if pd.to_datetime(sd) <= d <= pd.to_datetime(ed))
-        missing = [d for d in all_dates
-                   if not (HOLDINGS_DIR / f"{c}_{d.strftime('%Y%m%d')}.csv").exists()]
-        if not missing:
+        try:
+            df = pd.read_csv(f)
+            if "company" in df.columns and "long" in df.columns and "short" in df.columns:
+                net = int(df["long"].sum() - df["short"].sum())
+                rows.append({"date": date_str, "net_position": net})
+        except Exception:
             continue
 
-        if not silent:
-            msg = st.empty()
-            progress_bar = st.progress(0)
-
-        for i, dt in enumerate(missing):
-            date_str = dt.strftime("%Y%m%d")
-            _fetch_exact_holdings(c, date_str)
-            total_fetched += 1
-            if not silent and (i % 5 == 0 or i == len(missing) - 1):
-                progress_bar.progress((i + 1) / len(missing))
-                msg.caption(f"📡 {c}：同步历史持仓 {i+1}/{len(missing)}（首次较慢，缓存后秒出）")
-
-        if not silent:
-            progress_bar.empty()
-            msg.empty()
-
-    return total_fetched
+    if rows:
+        agg_df = pd.DataFrame(rows)
+        agg_df["date"] = pd.to_datetime(agg_df["date"])
+        agg_df = agg_df.sort_values("date").reset_index(drop=True)
+        agg_df.to_csv(agg_path, index=False)
+        return len(rows)
+    return 0
 
 
-def _build_seasonal_net_positions(contracts: List[str], sd, ed) -> Tuple[Dict[str, pd.DataFrame], defaultdict]:
-    """构建季节性净持仓数据 — 从本地 CSV 缓存读取每日真实净持仓。
+def _update_net_latest(ct: str, max_attempts: int = 3) -> int:
+    """增量更新：只拉取最新缺失日期的净持仓数据，追加到聚合文件。
+    返回新拉取的日期数。"""
+    # 加载期货行情，确定最新交易日
+    fut_df, _ = load_futures(ct)
+    if fut_df is None or fut_df.empty:
+        return 0
 
-    净持仓 = Σ多单 − Σ空单（全部上榜公司）。
-    数据由 _prefetch_holdings_range 在首次打开时全量拉取并缓存。
-    无缓存日期 → None（图中留空）。"""
+    latest_trade_date = fut_df["date"].max()
+
+    # 检查聚合文件是否已包含最新日期
+    agg_df = _load_aggregated_net(ct)
+    if agg_df is not None and not agg_df.empty:
+        if agg_df["date"].max() >= latest_trade_date:
+            return 0  # 已是最新
+
+    # 从最新日期往回找，拉取缺失的最近 N 个交易日
+    all_trading_dates = sorted(fut_df["date"].unique(), reverse=True)
+    cached_dates = set(agg_df["date"].dt.strftime("%Y%m%d")) if (agg_df is not None and not agg_df.empty) else set()
+    fetched = 0
+    for dt in all_trading_dates:
+        if fetched >= max_attempts:
+            break
+        date_str = dt.strftime("%Y%m%d")
+
+        # 跳过已缓存的日期
+        if date_str in cached_dates:
+            continue
+
+        # 从 API 拉取（带日期回退）
+        holdings = _fetch_exact_holdings(ct, date_str, use_fallback=True)
+        if holdings is not None and not holdings.empty:
+            net = int(holdings["long"].sum() - holdings["short"].sum())
+            new_row = pd.DataFrame([{"date": pd.to_datetime(date_str), "net_position": net}])
+            if agg_df is not None and not agg_df.empty:
+                agg_df = agg_df[agg_df["date"] != pd.to_datetime(date_str)]
+                agg_df = pd.concat([agg_df, new_row], ignore_index=True)
+            else:
+                agg_df = new_row
+            agg_df = agg_df.sort_values("date").reset_index(drop=True)
+            agg_df.to_csv(_net_agg_path(ct), index=False)
+            cached_dates.add(date_str)
+            fetched += 1
+        else:
+            # API 失败/数据未发布 → 标记为已尝试，不重复请求
+            cached_dates.add(date_str)
+            continue
+
+    return fetched
+
+
+def _ensure_net_cache(ct: str) -> Optional[pd.DataFrame]:
+    """确保合约的聚合净持仓缓存存在且最新。
+    1. 若聚合文件不存在 → 尝试从已有 date-CSV 迁移
+    2. 增量拉取最新缺失日期
+    返回完整的聚合 DataFrame。"""
+    # 步骤 1：迁移已有数据（仅首次）
+    _migrate_existing_to_aggregated(ct)
+
+    # 步骤 2：增量拉取最新日期
+    _update_net_latest(ct)
+
+    return _load_aggregated_net(ct)
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def _build_seasonal_net_positions(contracts: Tuple[str, ...], sd, ed) -> Tuple[Dict[str, pd.DataFrame], defaultdict]:
+    """构建季节性净持仓数据 — 从聚合缓存文件快速读取。
+
+    每个合约一个聚合文件 {ct}_net_agg.csv（date, net_position），读取极快。
+    首次访问时自动从已有 date-CSV 迁移 + 增量拉取最新日期。
+    净持仓 = Σ多单 − Σ空单（全部上榜公司）。"""
     net_data: Dict[str, pd.DataFrame] = {}
     net_collector = defaultdict(list)
 
     for c in contracts:
-        # ── 加载期货行情数据获取交易日列表 ──
+        # ── 加载期货行情数据 ──
         fut_df, _ = load_futures(c)
         if fut_df is None or fut_df.empty:
             continue
-        fut_df = fut_df.sort_values("date").copy()
-        fut_df = fut_df[(fut_df["date"] >= pd.to_datetime(sd)) & (fut_df["date"] <= pd.to_datetime(ed))]
-        if fut_df.empty:
+
+        # ── 确保聚合缓存存在且最新 ──
+        agg_df = _ensure_net_cache(c)
+        if agg_df is None or agg_df.empty:
             continue
 
-        fut_df["plot_date"] = [pd.Timestamp(year=2020, month=d.month, day=d.day)
-                                for d in fut_df["date"]]
-        fut_df["trade_year"] = fut_df["date"].dt.year
-        trading_dates = sorted(fut_df["date"].unique())
+        # ── 筛选日期范围并与期货数据对齐 ──
+        agg_df = agg_df[(agg_df["date"] >= pd.to_datetime(sd)) & (agg_df["date"] <= pd.to_datetime(ed))]
+        if agg_df.empty:
+            continue
 
-        # ── 只从缓存读取（需先调用 _prefetch_holdings_range 预热） ──
-        net_positions = []
+        agg_df["plot_date"] = [pd.Timestamp(year=2020, month=d.month, day=d.day)
+                               for d in agg_df["date"]]
+        agg_df["trade_year"] = agg_df["date"].dt.year
 
-        for dt in trading_dates:
-            date_str = dt.strftime("%Y%m%d")
-            cache_file = HOLDINGS_DIR / f"{c}_{date_str}.csv"
-
-            if cache_file.exists():
-                try:
-                    df = pd.read_csv(cache_file)
-                    if "company" in df.columns and "long" in df.columns and "short" in df.columns:
-                        net = int(df["long"].sum() - df["short"].sum())
-                    else:
-                        net = None
-                except Exception:
-                    net = None
-            else:
-                net = None  # 未缓存 → 留空
-
-            net_positions.append(net)
-
-        fut_df["net_position"] = net_positions
-
-        for trade_yr, grp in fut_df.groupby("trade_year"):
+        for trade_yr, grp in agg_df.groupby("trade_year"):
             grp = grp.sort_values("plot_date")
             ty_str = str(trade_yr)
             label = f"{c[2:]} ({ty_str})"
