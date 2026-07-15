@@ -328,22 +328,31 @@ def _parse_long(df):
 # ══════════════════════════════════════════════════════════════
 # 期货加载 & CSV 缓存
 # ══════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════
+# 期货数据：本地文件 → 内存缓存（纯读取，零网络）
+# ══════════════════════════════════════════════════════════════
+
 def _csv_path(ct: str) -> Path:
     return FUTURES_DIR / f"{ct}.csv"
 
-def _cache_fresh(ct: str) -> bool:
-    p = _csv_path(ct)
-    if not p.exists(): return False
+
+def _contract_status(ct: str) -> str:
+    """判断合约状态：'active'（仍在交易）, 'expired'（已到期）, 'no_data'（无本地文件）"""
+    cp = _csv_path(ct)
+    if not cp.exists():
+        return "no_data"
     try:
-        df = pd.read_csv(p)
-        if "date" not in df.columns or df.empty:
-            return False
+        df = pd.read_csv(cp, usecols=["date"])
+        if df.empty:
+            return "no_data"
         max_date = pd.to_datetime(df["date"].max()).date()
-        # 已到期合约（30天前就停更了）→ 视为"够新"，不再尝试下载
-        if max_date < (datetime.now().date() - timedelta(days=30)):
-            return True
-        return max_date >= datetime.now().date()
-    except Exception: return False
+        # 最近 7 天内有交易 → 活跃；否则 → 已到期
+        if max_date >= (datetime.now().date() - timedelta(days=7)):
+            return "active"
+        return "expired"
+    except Exception:
+        return "no_data"
+
 
 def get_cached_contracts() -> List[str]:
     if not FUTURES_DIR.exists(): return []
@@ -354,8 +363,8 @@ def _get_global_latest_date() -> Optional[pd.Timestamp]:
     latest = None
     for f in FUTURES_DIR.glob("LH*.csv"):
         try:
-            df = pd.read_csv(f)
-            if "date" not in df.columns or df.empty: continue
+            df = pd.read_csv(f, usecols=["date"])
+            if df.empty: continue
             d = pd.to_datetime(df["date"].max())
             if latest is None or d > latest: latest = d
         except Exception: pass
@@ -395,8 +404,8 @@ def get_latest_futures_date() -> Optional[str]:
     latest = None
     for f in FUTURES_DIR.glob("LH*.csv"):
         try:
-            df = pd.read_csv(f)
-            if "date" not in df.columns or df.empty: continue
+            df = pd.read_csv(f, usecols=["date"])
+            if df.empty: continue
             d = pd.to_datetime(df["date"].max())
             if latest is None or d > latest: latest = d
         except Exception: pass
@@ -407,140 +416,87 @@ def get_latest_trade_date() -> Optional[pd.Timestamp]:
     """获取所有合约CSV中最新的交易日（全局最大值）"""
     return _get_global_latest_date()
 
-def _get_row_at_md(df, target_month: int, target_day: int):
-    """在DataFrame中查找指定月/日的行，若不存在则取目标日期之前最近的行，兜底取最后一行"""
-    if df is None or df.empty:
-        return None
-    mask = (df['date'].dt.month == target_month) & (df['date'].dt.day == target_day)
-    match = df[mask]
-    if not match.empty:
-        return match.iloc[-1]
-    # 取目标月日之前的最近数据
-    target_ordinal = target_month * 100 + target_day
-    df_copy = df.copy()
-    df_copy['_md'] = df_copy['date'].dt.month * 100 + df_copy['date'].dt.day
-    before = df_copy[df_copy['_md'] <= target_ordinal]
-    if not before.empty:
-        return before.iloc[-1]
-    return df.iloc[-1]
 
-def get_spot_data_date() -> str:
-    """从现货Excel文件名或内部数据提取最新日期"""
+# ── 纯读取：只从本地 CSV 加载，绝不发起网络请求 ──
 
-    def _date_from_filename(fname: str) -> Optional[str]:
-        """从文件名提取日期：2026年7月2日 / 2026-07-02"""
-        m = re.search(r"(\d{4})[年\-/](\d{1,2})[月\-/](\d{1,2})", fname)
-        if m:
-            return f"{m.group(1)}年{int(m.group(2)):02d}月{int(m.group(3)):02d}日"
-        return None
-
-    def _date_from_excel(f: Path) -> Optional[str]:
-        """从 Excel 内容中提取最新日期（全表扫描，找出数据中最大日期）"""
-        try:
-            xls = pd.ExcelFile(f)
-            latest_dt = None
-            for sheet_name in xls.sheet_names[:3]:
-                try:
-                    # 读整个 sheet，不限制行列
-                    df = pd.read_excel(xls, sheet_name=sheet_name, header=None)
-                    # ★ 向量化转换：整表尝试转 datetime，取最大值
-                    for col in df.columns:
-                        s = pd.to_datetime(df[col], errors="coerce")
-                        valid = s.dropna()
-                        if not valid.empty:
-                            col_max = valid.max()
-                            if pd.Timestamp("2020-01-01") <= col_max <= pd.Timestamp("2030-12-31"):
-                                if latest_dt is None or col_max > latest_dt:
-                                    latest_dt = col_max
-                except Exception:
-                    pass
-            if latest_dt is not None:
-                return _cn(latest_dt)
-        except Exception:
-            pass
-        return None
-
-    # 1. 优先使用 SPOT_PATH（已确定的最新现货文件）
-    spot_path = SPOT_PATH
-    if spot_path.exists():
-        # 1a. 从文件名提取日期
-        d = _date_from_filename(spot_path.name)
-        if d:
-            return d
-        # 1b. 从文件内容提取日期（★ 不依赖文件修改时间）
-        d = _date_from_excel(spot_path)
-        if d:
-            return d
-
-    # 2. 扫描桌面和项目目录，从文件名提取日期
-    candidates = []
-    desktop = Path(r"D:\CC\Desktop")
-    for search_dir in [desktop, DATA_DIR]:
-        if not search_dir.exists():
-            continue
-        try:
-            for f in search_dir.iterdir():
-                if not f.is_file() or f.suffix not in ('.xlsx', '.xls'):
-                    continue
-                m = re.search(r"(\d{4})[年\-/](\d{1,2})[月\-/](\d{1,2})", f.name)
-                if m:
-                    candidates.append((f.stat().st_mtime, f, m))
-        except Exception:
-            continue
-
-    if candidates:
-        candidates.sort(key=lambda x: x[0], reverse=True)
-        _, best_file, best_match = candidates[0]
-        return f"{best_match.group(1)}年{int(best_match.group(2)):02d}月{int(best_match.group(3)):02d}日"
-
-    # 3. 扫描所有 xlsx 文件，从内容提取日期
-    for search_dir in [desktop, DATA_DIR]:
-        if not search_dir.exists():
-            continue
-        try:
-            for f in sorted(search_dir.glob("*.xlsx"), key=lambda x: x.stat().st_mtime, reverse=True):
-                d = _date_from_excel(f)
-                if d:
-                    return d
-        except Exception:
-            continue
-
-    return "无现货数据"
-
-@st.cache_data(ttl=1800, show_spinner=False)
-def load_futures(ct: str, force: bool = False) -> Tuple[Optional[pd.DataFrame], str]:
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_futures(ct: str) -> Tuple[Optional[pd.DataFrame], str]:
+    """纯本地读取期货数据。绝不联网——同步由 sync_futures 独立完成。"""
     cp = _csv_path(ct)
-    if not force and _cache_fresh(ct):
-        try:
-            df = pd.read_csv(cp); df["date"] = pd.to_datetime(df["date"])
-            return df.sort_values("date").reset_index(drop=True), "📁 本地缓存"
-        except Exception: pass
-    if not force and cp.exists():
-        try:
-            old = pd.read_csv(cp); old["date"] = pd.to_datetime(old["date"])
-            start = (old["date"].max()+timedelta(days=1)).strftime("%Y%m%d")
-            end = datetime.now().strftime("%Y%m%d")
-            new = _download_futures(ct, start, end)
-            if new is not None and not new.empty:
-                c = pd.concat([old,new],ignore_index=True).drop_duplicates(subset=["date"]).sort_values("date")
-                c.to_csv(cp,index=False); return c.reset_index(drop=True), "🔄 增量更新"
-            return old.sort_values("date").reset_index(drop=True), "📁 本地缓存（已最新）"
-        except Exception: pass
+    if not cp.exists():
+        return None, "❌ 本地无数据"
     try:
-        start = (datetime.now()-timedelta(days=365*5)).strftime("%Y%m%d")
-        end = datetime.now().strftime("%Y%m%d")
+        df = pd.read_csv(cp)
+        if "date" not in df.columns or df.empty:
+            return None, "❌ 数据为空"
+        df["date"] = pd.to_datetime(df["date"])
+        return df.sort_values("date").reset_index(drop=True), "📁 本地缓存"
+    except Exception:
+        return None, "❌ 读取失败"
+
+
+# ── 同步：全量 / 增量下载，写入本地 CSV ──
+
+def sync_futures(ct: str, force_full: bool = False) -> Tuple[bool, str]:
+    """同步合约期货数据到本地 CSV。
+    - 已到期合约（停更 7 天+）跳过
+    - 本地有数据 → 增量下载最新
+    - 本地无数据 → 全量下载
+    返回 (成功与否, 状态信息)"""
+    status = _contract_status(ct)
+
+    # 已到期合约永远跳过（除非 force_full）
+    if status == "expired" and not force_full:
+        return True, "⏭️ 已到期，跳过"
+
+    cp = _csv_path(ct)
+    today = datetime.now()
+
+    # ── 增量更新（本地有数据 且 不强制全量）──
+    if cp.exists() and not force_full:
+        try:
+            old = pd.read_csv(cp)
+            old["date"] = pd.to_datetime(old["date"])
+            start_dt = old["date"].max().date() + timedelta(days=1)
+            if start_dt > today.date():
+                return True, "📁 已是最新"
+            new = _download_futures(ct, start_dt.strftime("%Y%m%d"), today.strftime("%Y%m%d"))
+            if new is not None and not new.empty:
+                combined = pd.concat([old, new], ignore_index=True)
+                combined = combined.drop_duplicates(subset=["date"]).sort_values("date")
+                combined.to_csv(cp, index=False)
+                return True, f"🔄 增量 +{len(new)}条"
+            return True, "📁 已是最新"
+        except Exception as e:
+            return False, f"❌ 增量失败：{e}"
+
+    # ── 全量下载 ──
+    try:
+        start = (today - timedelta(days=365 * 6)).strftime("%Y%m%d")
+        end = today.strftime("%Y%m%d")
         df = _download_futures(ct, start, end)
         if df is not None and not df.empty:
-            df.to_csv(cp,index=False); return df.sort_values("date").reset_index(drop=True), "🌐 网络下载"
-    except Exception: pass
-    if cp.exists():
-        try:
-            df = pd.read_csv(cp); df["date"] = pd.to_datetime(df["date"])
-            return df.sort_values("date").reset_index(drop=True), "⚠️ 旧缓存（网络失败）"
-        except Exception: pass
-    return None, "❌ 获取失败"
+            df.to_csv(cp, index=False)
+            # 清除该合约的 load_futures 缓存，让它下次读到最新数据
+            load_futures.clear(ct)
+            return True, f"🌐 全量 {len(df)}条"
+        return False, "❌ 网络无数据"
+    except Exception as e:
+        return False, f"❌ 下载失败：{e}"
+
+
+def sync_active_contracts(silent: bool = True) -> Dict[str, str]:
+    """启动时同步所有活跃合约（增量为主）。返回 {合约: 状态}。"""
+    results = {}
+    active = get_active_contracts()
+    for ct in active:
+        ok, msg = sync_futures(ct)
+        results[ct] = msg
+    return results
+
 
 def _download_futures(ct: str, sd: str, ed: str) -> Optional[pd.DataFrame]:
+    """底层网络下载（akshare → eastmoney 兜底）"""
     for i in range(3):
         try:
             import akshare as ak
@@ -568,6 +524,96 @@ def _download_futures(ct: str, sd: str, ed: str) -> Optional[pd.DataFrame]:
         except Exception:
             if i < 2: time.sleep(1)
     return None
+
+
+def _get_row_at_md(df, target_month: int, target_day: int):
+    """在DataFrame中查找指定月/日的行，若不存在则取目标日期之前最近的行，兜底取最后一行"""
+    if df is None or df.empty:
+        return None
+    mask = (df['date'].dt.month == target_month) & (df['date'].dt.day == target_day)
+    match = df[mask]
+    if not match.empty:
+        return match.iloc[-1]
+    target_ordinal = target_month * 100 + target_day
+    df_copy = df.copy()
+    df_copy['_md'] = df_copy['date'].dt.month * 100 + df_copy['date'].dt.day
+    before = df_copy[df_copy['_md'] <= target_ordinal]
+    if not before.empty:
+        return before.iloc[-1]
+    return df.iloc[-1]
+
+
+def get_spot_data_date() -> str:
+    """从现货Excel文件名或内部数据提取最新日期"""
+
+    def _date_from_filename(fname: str) -> Optional[str]:
+        m = re.search(r"(\d{4})[年\-/](\d{1,2})[月\-/](\d{1,2})", fname)
+        if m:
+            return f"{m.group(1)}年{int(m.group(2)):02d}月{int(m.group(3)):02d}日"
+        return None
+
+    def _date_from_excel(f: Path) -> Optional[str]:
+        try:
+            xls = pd.ExcelFile(f)
+            latest_dt = None
+            for sheet_name in xls.sheet_names[:3]:
+                try:
+                    df = pd.read_excel(xls, sheet_name=sheet_name, header=None)
+                    for col in df.columns:
+                        s = pd.to_datetime(df[col], errors="coerce")
+                        valid = s.dropna()
+                        if not valid.empty:
+                            col_max = valid.max()
+                            if pd.Timestamp("2020-01-01") <= col_max <= pd.Timestamp("2030-12-31"):
+                                if latest_dt is None or col_max > latest_dt:
+                                    latest_dt = col_max
+                except Exception:
+                    pass
+            if latest_dt is not None:
+                return _cn(latest_dt)
+        except Exception:
+            pass
+        return None
+
+    # 1. 优先使用 SPOT_PATH
+    spot_path = SPOT_PATH
+    if spot_path.exists():
+        d = _date_from_filename(spot_path.name)
+        if d: return d
+        d = _date_from_excel(spot_path)
+        if d: return d
+
+    # 2. 扫描桌面和项目目录
+    candidates = []
+    desktop = Path(r"D:\CC\Desktop")
+    for search_dir in [desktop, DATA_DIR]:
+        if not search_dir.exists(): continue
+        try:
+            for f in search_dir.iterdir():
+                if not f.is_file() or f.suffix not in ('.xlsx', '.xls'): continue
+                m = re.search(r"(\d{4})[年\-/](\d{1,2})[月\-/](\d{1,2})", f.name)
+                if m:
+                    candidates.append((f.stat().st_mtime, f, m))
+        except Exception:
+            continue
+
+    if candidates:
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        _, best_file, best_match = candidates[0]
+        return f"{best_match.group(1)}年{int(best_match.group(2)):02d}月{int(best_match.group(3)):02d}日"
+
+    # 3. 从内容提取日期
+    for search_dir in [desktop, DATA_DIR]:
+        if not search_dir.exists(): continue
+        try:
+            for f in sorted(search_dir.glob("*.xlsx"), key=lambda x: x.stat().st_mtime, reverse=True):
+                d = _date_from_excel(f)
+                if d: return d
+        except Exception:
+            continue
+
+    return "无现货数据"
+
 
 # ══════════════════════════════════════════════════════════════
 # 基差计算
@@ -3206,6 +3252,12 @@ def main():
     <hr style="border: none; border-top: 1px solid #e9ecef; margin: 0.5rem 0 1.5rem 0;">
     """, unsafe_allow_html=True)
 
+    # ── 启动时同步活跃合约（增量为主，跳过已到期）──
+    if "_startup_sync_done" not in st.session_state:
+        with st.spinner("🔄 正在同步最新数据…"):
+            sync_active_contracts(silent=True)
+        st.session_state["_startup_sync_done"] = True
+
     # ── 七个 Tab ──
     t1, t2, t3, t4, t5, t6, t7 = st.tabs([
         "📊 当日基差分布", "📈 单合约基差走势", "🔄 合约基差比较",
@@ -3242,10 +3294,13 @@ def main():
     c1, c2, c3 = st.columns([1, 1, 8])
     with c1:
         if st.button("🔄 刷新数据", use_container_width=True, key="main_refresh"):
-            st.cache_data.clear(); st.rerun()
+            st.cache_data.clear()
+            st.session_state.pop("_startup_sync_done", None)
+            st.rerun()
     with c2:
         if st.button("🗑️ 清除缓存", use_container_width=True, key="main_clear"):
             st.cache_data.clear()
+            st.session_state.pop("_startup_sync_done", None)
             if FUTURES_DIR.exists(): shutil.rmtree(FUTURES_DIR); FUTURES_DIR.mkdir()
             st.rerun()
 
