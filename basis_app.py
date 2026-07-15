@@ -32,7 +32,6 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from collections import defaultdict
 from typing import Dict, List, Tuple, Optional
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import warnings
 
 warnings.filterwarnings("ignore")
@@ -2517,23 +2516,19 @@ def tab6():
         # ── 图3：前20净持仓季节性对比 ──
         st.markdown("#### 🏢 前20净持仓季节性对比")
 
-        # ★ 纯读取聚合文件（不同步），按日期范围在内存筛选
-        net_data_full, _, missing_cts = _build_seasonal_net_positions(tuple(available_cts), sel_month)
-        net_data = _filter_net_by_date(net_data_full, sd, ed) if net_data_full else {}
-
-        # 提示缺失合约 + 一键同步按钮
-        if missing_cts:
-            col_warn, col_btn = st.columns([3, 1])
-            with col_warn:
-                st.warning(f"⚠️ 以下合约缺少净持仓数据：{'、'.join(missing_cts)}")
-            with col_btn:
-                if st.button("📡 同步数据", key="t6_sync_net", use_container_width=True):
-                    with st.spinner(f"正在首次同步 {'、'.join(missing_cts)} …"):
-                        results = sync_net_positions_for_contracts(missing_cts)
-                        for ct_ok, status in results.items():
-                            st.caption(f"{ct_ok}: {status}")
-                    _build_seasonal_net_positions.clear()
-                    st.rerun()
+        with st.spinner("🔄 加载前20净持仓数据…"):
+            net_data_full, _ = _build_seasonal_net_positions(tuple(available_cts), sel_month)
+            # 按日期范围在内存中筛选
+            net_data: Dict[str, pd.DataFrame] = {}
+            if net_data_full:
+                ref_start = pd.Timestamp(year=2020, month=sd.month, day=sd.day)
+                ref_end = pd.Timestamp(year=2020, month=ed.month, day=ed.day)
+                for label, ndf in net_data_full.items():
+                    if ndf.empty: continue
+                    mask = (ndf["plot_date"] >= ref_start) & (ndf["plot_date"] <= ref_end)
+                    fdf = ndf[mask]
+                    if not fdf.empty:
+                        net_data[label] = fdf
 
         if net_data:
             fig_net = go.Figure()
@@ -2807,59 +2802,22 @@ def _update_net_latest(ct: str, max_attempts: int = 3) -> int:
 def _ensure_net_cache(ct: str) -> Optional[pd.DataFrame]:
     """确保合约的聚合净持仓缓存存在且最新。
     1. 若聚合文件不存在 → 尝试从已有 date-CSV 迁移
-    2. 增量拉取最新缺失日期
+    2. 拉取缺失的净持仓数据（首次采样、增量追加）
     返回完整的聚合 DataFrame。"""
-    # 步骤 1：迁移已有数据（仅首次）
     _migrate_existing_to_aggregated(ct)
-
-    # 步骤 2：增量拉取最新日期
     _update_net_latest(ct)
-
     return _load_aggregated_net(ct)
 
 
-def sync_net_positions_for_contracts(contracts: List[str]) -> Dict[str, str]:
-    """并行同步多个合约的净持仓数据（ThreadPoolExecutor）。
-    仅在用户主动触发时调用（如"刷新数据"按钮）。
-    返回 {合约: 状态信息}。"""
-    results = {}
-    if not contracts:
-        return results
-    with ThreadPoolExecutor(max_workers=3) as executor:
-        future_map = {executor.submit(_ensure_net_cache, ct): ct for ct in contracts}
-        for future in as_completed(future_map):
-            ct = future_map[future]
-            try:
-                df = future.result()
-                if df is not None and not df.empty:
-                    results[ct] = f"✅ {len(df)}条"
-                else:
-                    results[ct] = "⚠️ 无数据"
-            except Exception as e:
-                results[ct] = f"❌ {e}"
-    return results
-
-
 @st.cache_data(ttl=3600, show_spinner=False)
-def _build_seasonal_net_positions(contracts: Tuple[str, ...], sel_month: str) -> Tuple[Dict[str, pd.DataFrame], defaultdict, List[str]]:
-    """构建季节性净持仓数据 — 纯读取聚合文件，不做同步。
-    缓存键：contracts + sel_month（不含日期范围，全量加载后内存筛选）。
-    返回 (net_data, net_collector, missing_contracts)。"""
+def _build_seasonal_net_positions(contracts: Tuple[str, ...], sel_month: str) -> Tuple[Dict[str, pd.DataFrame], defaultdict]:
+    """构建季节性净持仓数据 — 和其他板块一样：有本地文件直接读，没有就当场下载。"""
     net_data: Dict[str, pd.DataFrame] = {}
     net_collector = defaultdict(list)
-    missing: List[str] = []
 
     for c in contracts:
-        # 1. 直接读取聚合文件
-        agg_df = _load_aggregated_net(c)
-
-        # 2. 聚合文件不存在 → 尝试从已有 date-CSV 迁移（纯本地，毫秒级）
+        agg_df = _ensure_net_cache(c)  # 有聚合文件→秒读，没有→当场下载
         if agg_df is None or agg_df.empty:
-            _migrate_existing_to_aggregated(c)
-            agg_df = _load_aggregated_net(c)
-
-        if agg_df is None or agg_df.empty:
-            missing.append(c)
             continue
 
         agg_df["plot_date"] = [pd.Timestamp(year=2020, month=d.month, day=d.day)
@@ -2880,7 +2838,6 @@ def _build_seasonal_net_positions(contracts: Tuple[str, ...], sel_month: str) ->
                 if v is not None and not pd.isna(v):
                     net_collector[md].append(int(v))
 
-    # 历史均值
     if net_collector:
         avg_rows = [{"plot_date": pd.Timestamp(year=2020, month=m, day=d),
                      "net_position": int(np.mean(v))}
@@ -2888,21 +2845,7 @@ def _build_seasonal_net_positions(contracts: Tuple[str, ...], sel_month: str) ->
         if avg_rows:
             net_data["历史均值"] = pd.DataFrame(avg_rows).sort_values("plot_date")
 
-    return net_data, net_collector, missing
-
-
-def _filter_net_by_date(net_data: Dict[str, pd.DataFrame], sd, ed) -> Dict[str, pd.DataFrame]:
-    """在内存中按日期范围筛选净持仓数据（不触发缓存失效）"""
-    filtered: Dict[str, pd.DataFrame] = {}
-    ref_start = pd.Timestamp(year=2020, month=sd.month, day=sd.day)
-    ref_end = pd.Timestamp(year=2020, month=ed.month, day=ed.day)
-    for label, ndf in net_data.items():
-        if ndf.empty: continue
-        mask = (ndf["plot_date"] >= ref_start) & (ndf["plot_date"] <= ref_end)
-        fdf = ndf[mask]
-        if not fdf.empty:
-            filtered[label] = fdf
-    return filtered
+    return net_data, net_collector
 
 
 # ══════════════════════════════════════════════════════════════
@@ -3373,11 +3316,8 @@ def main():
     with c1:
         if st.button("🔄 刷新数据", use_container_width=True, key="main_refresh"):
             st.cache_data.clear()
-            with st.spinner("🔄 正在同步期货数据…"):
+            with st.spinner("🔄 正在同步最新数据…"):
                 sync_active_contracts()
-            with st.spinner("🔄 正在同步净持仓数据…"):
-                active_cts = get_active_contracts()
-                sync_net_positions_for_contracts(active_cts)
             st.rerun()
     with c2:
         if st.button("🗑️ 清除缓存", use_container_width=True, key="main_clear"):
