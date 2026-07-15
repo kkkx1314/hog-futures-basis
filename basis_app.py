@@ -2521,9 +2521,19 @@ def tab6():
         net_data_full, _, missing_cts = _build_seasonal_net_positions(tuple(available_cts), sel_month)
         net_data = _filter_net_by_date(net_data_full, sd, ed) if net_data_full else {}
 
-        # 提示缺失合约
+        # 提示缺失合约 + 一键同步按钮
         if missing_cts:
-            st.warning(f"⚠️ 以下合约无净持仓聚合文件：{'、'.join(missing_cts)}。请点击底部 **🔄 刷新数据** 按钮同步。")
+            col_warn, col_btn = st.columns([3, 1])
+            with col_warn:
+                st.warning(f"⚠️ 以下合约缺少净持仓数据：{'、'.join(missing_cts)}")
+            with col_btn:
+                if st.button("📡 同步数据", key="t6_sync_net", use_container_width=True):
+                    with st.spinner(f"正在首次同步 {'、'.join(missing_cts)} …"):
+                        results = sync_net_positions_for_contracts(missing_cts)
+                        for ct_ok, status in results.items():
+                            st.caption(f"{ct_ok}: {status}")
+                    _build_seasonal_net_positions.clear()
+                    st.rerun()
 
         if net_data:
             fig_net = go.Figure()
@@ -2731,9 +2741,10 @@ def _migrate_existing_to_aggregated(ct: str) -> int:
 
 
 def _update_net_latest(ct: str, max_attempts: int = 3) -> int:
-    """增量更新：只拉取最新缺失日期的净持仓数据，追加到聚合文件。
-    返回新拉取的日期数。注意：直接读 CSV，不经过 load_futures（避免线程内缓存问题）。"""
-    # 从本地 CSV 读取期货交易日（不调用缓存装饰器）
+    """增量更新净持仓数据。
+    - 聚合文件不存在 → 全量采样（每 5 个交易日取 1 个点，兼顾速度与覆盖）
+    - 聚合文件已存在 → 只拉取最新缺失的 N 个交易日
+    返回新拉取的日期数。"""
     cp = _csv_path(ct)
     if not cp.exists():
         return 0
@@ -2745,28 +2756,34 @@ def _update_net_latest(ct: str, max_attempts: int = 3) -> int:
     except Exception:
         return 0
 
-    latest_trade_date = fut_df["date"].max()
-
-    # 检查聚合文件是否已包含最新日期
     agg_df = _load_aggregated_net(ct)
-    if agg_df is not None and not agg_df.empty:
-        if agg_df["date"].max() >= latest_trade_date:
-            return 0  # 已是最新
-
-    # 从最新日期往回找，拉取缺失的最近 N 个交易日
+    is_first_sync = (agg_df is None or agg_df.empty)
     all_trading_dates = sorted(fut_df["date"].unique(), reverse=True)
-    cached_dates = set(agg_df["date"].dt.strftime("%Y%m%d")) if (agg_df is not None and not agg_df.empty) else set()
-    fetched = 0
-    for dt in all_trading_dates:
-        if fetched >= max_attempts:
-            break
-        date_str = dt.strftime("%Y%m%d")
+    cached_dates = set(agg_df["date"].dt.strftime("%Y%m%d")) if not is_first_sync else set()
+    latest_trade_date = all_trading_dates[0] if all_trading_dates else None
 
-        # 跳过已缓存的日期
+    # 增量模式：已是最新则跳过
+    if not is_first_sync and latest_trade_date and agg_df["date"].max() >= latest_trade_date:
+        return 0
+
+    fetched = 0
+    for position, dt in enumerate(all_trading_dates):  # position 0 = 最新
+        # 增量模式：超出限制则停止
+        if not is_first_sync and fetched >= max_attempts:
+            break
+        # 首次全量：安全上限 300 点
+        if is_first_sync and fetched >= 300:
+            break
+
+        date_str = dt.strftime("%Y%m%d")
         if date_str in cached_dates:
             continue
 
-        # 从 API 拉取（精确日期，不回退——缺数据就留空）
+        # 首次全量采样：最新 30 天全取，其余每隔 5 个交易日取 1 点
+        if is_first_sync and position >= 30 and position % 5 != 0:
+            cached_dates.add(date_str)
+            continue
+
         holdings = _fetch_exact_holdings(ct, date_str, use_fallback=False)
         if holdings is not None and not holdings.empty:
             net = int(holdings["long"].sum() - holdings["short"].sum())
@@ -2781,7 +2798,6 @@ def _update_net_latest(ct: str, max_attempts: int = 3) -> int:
             cached_dates.add(date_str)
             fetched += 1
         else:
-            # API 失败/数据未发布 → 标记为已尝试，不重复请求
             cached_dates.add(date_str)
             continue
 
@@ -2834,10 +2850,11 @@ def _build_seasonal_net_positions(contracts: Tuple[str, ...], sel_month: str) ->
     missing: List[str] = []
 
     for c in contracts:
-        # 直接读取聚合文件（不触发同步）
+        # 1. 直接读取聚合文件
         agg_df = _load_aggregated_net(c)
+
+        # 2. 聚合文件不存在 → 尝试从已有 date-CSV 迁移（纯本地，毫秒级）
         if agg_df is None or agg_df.empty:
-            # 尝试迁移（仅聚合文件不存在时，纯本地操作）
             _migrate_existing_to_aggregated(c)
             agg_df = _load_aggregated_net(c)
 
