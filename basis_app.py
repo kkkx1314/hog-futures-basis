@@ -2732,10 +2732,17 @@ def _migrate_existing_to_aggregated(ct: str) -> int:
 
 def _update_net_latest(ct: str, max_attempts: int = 3) -> int:
     """增量更新：只拉取最新缺失日期的净持仓数据，追加到聚合文件。
-    返回新拉取的日期数。"""
-    # 加载期货行情，确定最新交易日
-    fut_df, _ = load_futures(ct)
-    if fut_df is None or fut_df.empty:
+    返回新拉取的日期数。注意：直接读 CSV，不经过 load_futures（避免线程内缓存问题）。"""
+    # 从本地 CSV 读取期货交易日（不调用缓存装饰器）
+    cp = _csv_path(ct)
+    if not cp.exists():
+        return 0
+    try:
+        fut_df = pd.read_csv(cp, usecols=["date"])
+        if fut_df.empty:
+            return 0
+        fut_df["date"] = pd.to_datetime(fut_df["date"])
+    except Exception:
         return 0
 
     latest_trade_date = fut_df["date"].max()
