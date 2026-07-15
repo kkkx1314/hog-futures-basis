@@ -32,6 +32,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from collections import defaultdict
 from typing import Dict, List, Tuple, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import warnings
 
 warnings.filterwarnings("ignore")
@@ -740,13 +741,26 @@ def _make_trace_label(ct: str, trade_year, item_label: str) -> str:
 # ══════════════════════════════════════════════════════════════
 # 技术指标计算 (Tab 6)
 # ══════════════════════════════════════════════════════════════
-def calculate_technicals(df: pd.DataFrame) -> pd.DataFrame:
-    """计算完整技术指标：MA5/10/20/60, 布林带, MACD, RSI14, KDJ"""
+def calculate_technicals(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
+    """计算完整技术指标：MA5/10/20/60, 布林带, MACD, RSI14, KDJ。
+    返回 (df, warnings) — warnings 为数据不足等提示列表。"""
+    warnings_list: List[str] = []
     if df is None or df.empty:
-        return df
-    close = df["close"].astype(float)
-    high = df["high"].astype(float)
-    low = df["low"].astype(float)
+        return df, ["数据为空，无法计算技术指标"]
+
+    n_rows = len(df)
+    try:
+        close = df["close"].astype(float)
+        high = df["high"].astype(float)
+        low = df["low"].astype(float)
+    except KeyError as e:
+        return df, [f"缺少必要列：{e}"]
+
+    # ── 数据量检查 ──
+    if n_rows < 20:
+        warnings_list.append(f"数据仅 {n_rows} 个交易日，MA20/布林带/MACD 可能不完整")
+    if n_rows < 60:
+        warnings_list.append(f"数据仅 {n_rows} 个交易日（<60），MA60 不可用，请扩大日期范围")
 
     # ── 移动均线 ──
     df["ma5"] = close.rolling(5).mean()
@@ -776,27 +790,22 @@ def calculate_technicals(df: pd.DataFrame) -> pd.DataFrame:
     rs = avg_gain / avg_loss.replace(0, np.nan)
     df["rsi14"] = 100 - (100 / (1 + rs))
 
-    # ── KDJ (9, 3, 3) ──
+    # ── KDJ (9, 3, 3) — 向量化，避免 Python 循环 ──
     n = 9
     lowest_low = low.rolling(n).min()
     highest_high = high.rolling(n).max()
     rsv = ((close - lowest_low) / (highest_high - lowest_low).replace(0, np.nan)) * 100
-    k_vals, d_vals, j_vals = [], [], []
-    k_prev, d_prev = 50.0, 50.0
-    for r in rsv:
-        if pd.isna(r):
-            k_vals.append(np.nan); d_vals.append(np.nan); j_vals.append(np.nan)
-        else:
-            k = 2/3 * k_prev + 1/3 * r
-            d = 2/3 * d_prev + 1/3 * k
-            j = 3 * k - 2 * d
-            k_vals.append(k); d_vals.append(d); j_vals.append(j)
-            k_prev, d_prev = k, d
-    df["kdj_k"] = k_vals
-    df["kdj_d"] = d_vals
-    df["kdj_j"] = j_vals
+    # ewm(alpha=1/3, adjust=False) 等价于 K = 2/3*K_prev + 1/3*RSV
+    k_series = rsv.ewm(alpha=1/3, adjust=False).mean()
+    # 前 n-1 个值为 NaN，手动回退到 50
+    k_series = k_series.fillna(50.0)
+    d_series = k_series.ewm(alpha=1/3, adjust=False).mean()
+    j_series = 3 * k_series - 2 * d_series
+    df["kdj_k"] = k_series
+    df["kdj_d"] = d_series
+    df["kdj_j"] = j_series
 
-    return df
+    return df, warnings_list
 
 
 # ══════════════════════════════════════════════════════════════
@@ -2508,9 +2517,14 @@ def tab6():
         # ── 图3：前20净持仓季节性对比 ──
         st.markdown("#### 🏢 前20净持仓季节性对比")
 
-        # ★ 增量加载：只拉取最新缺失日期，历史数据从聚合缓存秒读
-        with st.spinner("🔄 加载前20净持仓数据…"):
-            net_data, net_collector = _build_seasonal_net_positions(tuple(available_cts), sd, ed)
+        # ★ 纯读取聚合文件（不同步），按日期范围在内存筛选
+        net_data_full, _, missing_cts = _build_seasonal_net_positions(tuple(available_cts), sel_month)
+        net_data = _filter_net_by_date(net_data_full, sd, ed) if net_data_full else {}
+
+        # 提示缺失合约
+        if missing_cts:
+            st.warning(f"⚠️ 以下合约无净持仓聚合文件：{'、'.join(missing_cts)}。请点击底部 **🔄 刷新数据** 按钮同步。")
+
         if net_data:
             fig_net = go.Figure()
             for label, ndf in net_data.items():
@@ -2781,30 +2795,47 @@ def _ensure_net_cache(ct: str) -> Optional[pd.DataFrame]:
     return _load_aggregated_net(ct)
 
 
-@st.cache_data(ttl=600, show_spinner=False)
-def _build_seasonal_net_positions(contracts: Tuple[str, ...], sd, ed) -> Tuple[Dict[str, pd.DataFrame], defaultdict]:
-    """构建季节性净持仓数据 — 从聚合缓存文件快速读取。
+def sync_net_positions_for_contracts(contracts: List[str]) -> Dict[str, str]:
+    """并行同步多个合约的净持仓数据（ThreadPoolExecutor）。
+    仅在用户主动触发时调用（如"刷新数据"按钮）。
+    返回 {合约: 状态信息}。"""
+    results = {}
+    if not contracts:
+        return results
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        future_map = {executor.submit(_ensure_net_cache, ct): ct for ct in contracts}
+        for future in as_completed(future_map):
+            ct = future_map[future]
+            try:
+                df = future.result()
+                if df is not None and not df.empty:
+                    results[ct] = f"✅ {len(df)}条"
+                else:
+                    results[ct] = "⚠️ 无数据"
+            except Exception as e:
+                results[ct] = f"❌ {e}"
+    return results
 
-    每个合约一个聚合文件 {ct}_net_agg.csv（date, net_position），读取极快。
-    首次访问时自动从已有 date-CSV 迁移 + 增量拉取最新日期。
-    净持仓 = Σ多单 − Σ空单（全部上榜公司）。"""
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _build_seasonal_net_positions(contracts: Tuple[str, ...], sel_month: str) -> Tuple[Dict[str, pd.DataFrame], defaultdict, List[str]]:
+    """构建季节性净持仓数据 — 纯读取聚合文件，不做同步。
+    缓存键：contracts + sel_month（不含日期范围，全量加载后内存筛选）。
+    返回 (net_data, net_collector, missing_contracts)。"""
     net_data: Dict[str, pd.DataFrame] = {}
     net_collector = defaultdict(list)
+    missing: List[str] = []
 
     for c in contracts:
-        # ── 加载期货行情数据 ──
-        fut_df, _ = load_futures(c)
-        if fut_df is None or fut_df.empty:
-            continue
-
-        # ── 确保聚合缓存存在且最新 ──
-        agg_df = _ensure_net_cache(c)
+        # 直接读取聚合文件（不触发同步）
+        agg_df = _load_aggregated_net(c)
         if agg_df is None or agg_df.empty:
-            continue
+            # 尝试迁移（仅聚合文件不存在时，纯本地操作）
+            _migrate_existing_to_aggregated(c)
+            agg_df = _load_aggregated_net(c)
 
-        # ── 筛选日期范围并与期货数据对齐 ──
-        agg_df = agg_df[(agg_df["date"] >= pd.to_datetime(sd)) & (agg_df["date"] <= pd.to_datetime(ed))]
-        if agg_df.empty:
+        if agg_df is None or agg_df.empty:
+            missing.append(c)
             continue
 
         agg_df["plot_date"] = [pd.Timestamp(year=2020, month=d.month, day=d.day)
@@ -2833,7 +2864,21 @@ def _build_seasonal_net_positions(contracts: Tuple[str, ...], sd, ed) -> Tuple[D
         if avg_rows:
             net_data["历史均值"] = pd.DataFrame(avg_rows).sort_values("plot_date")
 
-    return net_data, net_collector
+    return net_data, net_collector, missing
+
+
+def _filter_net_by_date(net_data: Dict[str, pd.DataFrame], sd, ed) -> Dict[str, pd.DataFrame]:
+    """在内存中按日期范围筛选净持仓数据（不触发缓存失效）"""
+    filtered: Dict[str, pd.DataFrame] = {}
+    ref_start = pd.Timestamp(year=2020, month=sd.month, day=sd.day)
+    ref_end = pd.Timestamp(year=2020, month=ed.month, day=ed.day)
+    for label, ndf in net_data.items():
+        if ndf.empty: continue
+        mask = (ndf["plot_date"] >= ref_start) & (ndf["plot_date"] <= ref_end)
+        fdf = ndf[mask]
+        if not fdf.empty:
+            filtered[label] = fdf
+    return filtered
 
 
 # ══════════════════════════════════════════════════════════════
@@ -2877,7 +2922,10 @@ def tab7():
             st.warning("⚠️ 所选日期范围无数据"); return
 
         # 计算技术指标
-        df = calculate_technicals(df)
+        df, tech_warnings = calculate_technicals(df)
+        if tech_warnings:
+            for w in tech_warnings:
+                st.warning(f"⚠️ {w}")
 
         # ── K 线图（蜡烛图 + MA + 布林带） ──
         fig_kline = go.Figure()
@@ -3301,8 +3349,11 @@ def main():
     with c1:
         if st.button("🔄 刷新数据", use_container_width=True, key="main_refresh"):
             st.cache_data.clear()
-            with st.spinner("🔄 正在同步最新数据…"):
+            with st.spinner("🔄 正在同步期货数据…"):
                 sync_active_contracts()
+            with st.spinner("🔄 正在同步净持仓数据…"):
+                active_cts = get_active_contracts()
+                sync_net_positions_for_contracts(active_cts)
             st.rerun()
     with c2:
         if st.button("🗑️ 清除缓存", use_container_width=True, key="main_clear"):
