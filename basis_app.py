@@ -2816,9 +2816,13 @@ def _build_seasonal_net_positions(contracts: Tuple[str, ...], sel_month: str) ->
     net_collector = defaultdict(list)
 
     for c in contracts:
-        agg_df = _ensure_net_cache(c)  # 有聚合文件→秒读，没有→当场下载
+        # 纯本地读取，和成交量/持仓量一样——不联网
+        agg_df = _load_aggregated_net(c)
         if agg_df is None or agg_df.empty:
-            continue
+            _migrate_existing_to_aggregated(c)  # 尝试从已有 date-CSV 迁移（纯本地）
+            agg_df = _load_aggregated_net(c)
+        if agg_df is None or agg_df.empty:
+            continue  # 无本地数据，跳过（同步靠"刷新数据"按钮或Tab5触发）
 
         agg_df["plot_date"] = [pd.Timestamp(year=2020, month=d.month, day=d.day)
                                for d in agg_df["date"]]
@@ -3318,6 +3322,10 @@ def main():
             st.cache_data.clear()
             with st.spinner("🔄 正在同步最新数据…"):
                 sync_active_contracts()
+                # 同时迁移净持仓聚合文件（从已有 date-CSV，纯本地操作）
+                for ct in get_active_contracts():
+                    _migrate_existing_to_aggregated(ct)
+                    _update_net_latest(ct)
             st.rerun()
     with c2:
         if st.button("🗑️ 清除缓存", use_container_width=True, key="main_clear"):
