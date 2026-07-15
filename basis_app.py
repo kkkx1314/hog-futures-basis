@@ -2678,8 +2678,8 @@ def _update_net_latest(ct: str, max_attempts: int = 3) -> int:
         if date_str in cached_dates:
             continue
 
-        # 从 API 拉取（带日期回退）
-        holdings = _fetch_exact_holdings(ct, date_str, use_fallback=True)
+        # 从 API 拉取（精确日期，不回退——缺数据就留空）
+        holdings = _fetch_exact_holdings(ct, date_str, use_fallback=False)
         if holdings is not None and not holdings.empty:
             net = int(holdings["long"].sum() - holdings["short"].sum())
             new_row = pd.DataFrame([{"date": pd.to_datetime(date_str), "net_position": net}])
