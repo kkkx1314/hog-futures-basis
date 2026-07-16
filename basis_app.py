@@ -920,6 +920,23 @@ def fig_spread_season(data: Dict[str, pd.DataFrame], ma: str, mb: str, data_date
     fig.update_yaxes(autorange=True)
     return fig
 
+def _compute_y_padding(all_values: list, padding_pct: float = 0.08):
+    """根据数据范围计算 Y 轴显示范围，上下各留 padding_pct 百分比边距。
+    确保零轴始终可见（若数据跨越正负）。"""
+    if not all_values:
+        return None
+    ymin, ymax = min(all_values), max(all_values)
+    # 若数据全为正或全为负，向零轴方向扩展
+    if ymin > 0:
+        ymin = 0
+    if ymax < 0:
+        ymax = 0
+    data_range = ymax - ymin
+    if data_range == 0:
+        data_range = max(abs(ymax), 100)
+    pad = data_range * padding_pct
+    return [ymin - pad, ymax + pad]
+
 # ══════════════════════════════════════════════════════════════
 # 统一结论展示组件
 # ══════════════════════════════════════════════════════════════
@@ -2480,7 +2497,16 @@ def tab6():
                 template="plotly_white", height=420, hovermode="x unified",
                 legend=dict(orientation="h", y=1.02, x=0),
             )
-            fig_vol_s.update_yaxes(autorange=True)
+            # ★ 根据数据范围调整纵轴
+            vol_all_vals = []
+            for vdf in vol_data.values():
+                if not vdf.empty and "volume" in vdf.columns:
+                    vol_all_vals.extend(vdf["volume"].tolist())
+            vol_yrange = _compute_y_padding(vol_all_vals) if vol_all_vals else None
+            if vol_yrange:
+                fig_vol_s.update_yaxes(range=vol_yrange)
+            else:
+                fig_vol_s.update_yaxes(autorange=True)
             st.plotly_chart(fig_vol_s, use_container_width=True)
         else:
             st.warning("⚠️ 无成交量数据")
@@ -2509,7 +2535,16 @@ def tab6():
                 template="plotly_white", height=420, hovermode="x unified",
                 legend=dict(orientation="h", y=1.02, x=0),
             )
-            fig_oi_s.update_yaxes(autorange=True)
+            # ★ 根据数据范围调整纵轴
+            oi_all_vals = []
+            for odf in oi_data.values():
+                if not odf.empty and "open_interest" in odf.columns:
+                    oi_all_vals.extend(odf["open_interest"].tolist())
+            oi_yrange = _compute_y_padding(oi_all_vals) if oi_all_vals else None
+            if oi_yrange:
+                fig_oi_s.update_yaxes(range=oi_yrange)
+            else:
+                fig_oi_s.update_yaxes(autorange=True)
             st.plotly_chart(fig_oi_s, use_container_width=True)
         else:
             st.warning("⚠️ 无持仓量数据")
@@ -2517,22 +2552,19 @@ def tab6():
         # ── 图3：前20净持仓季节性对比 ──
         st.markdown("#### 🏢 前20净持仓季节性对比")
 
-        # 先检查哪些合约缺聚合文件
+        # ★ 自动后台下载：检查缺失的聚合文件，无需手动点击按钮
         missing_agg = [c for c in available_cts if not _net_agg_path(c).exists()]
-
         if missing_agg:
-            col_a, col_b = st.columns([2, 1])
-            with col_a:
-                st.warning(f"⚠️ 缺少本地数据：{'、'.join(missing_agg)}（需首次下载，约 1~3 分钟）")
-            with col_b:
-                if st.button("📡 一键下载", key="t6_dl_net", use_container_width=True):
-                    status = st.empty()
-                    for i, c in enumerate(missing_agg):
-                        status.text(f"⏳ {i+1}/{len(missing_agg)} 正在下载 {c} 全量历史数据…")
-                        _ensure_net_cache(c)
-                    status.text("✅ 下载完成！")
-                    _build_seasonal_net_positions.clear()
-                    st.rerun()
+            with st.spinner(f"📡 正在自动下载 {len(missing_agg)} 个合约的前20净持仓数据（首次约 1~3 分钟）…"):
+                progress_bar = st.progress(0, text="准备下载…")
+                for i, c in enumerate(missing_agg):
+                    progress_bar.progress(
+                        (i + 1) / len(missing_agg),
+                        text=f"⏳ {i+1}/{len(missing_agg)} 正在下载 {c} 全量历史数据…"
+                    )
+                    _ensure_net_cache(c)
+                progress_bar.empty()
+                _build_seasonal_net_positions.clear()
 
         with st.spinner("🔄 加载前20净持仓数据…"):
             net_data_full, _ = _build_seasonal_net_positions(tuple(available_cts), sel_month)
@@ -2570,7 +2602,16 @@ def tab6():
                 legend=dict(orientation="h", y=1.02, x=0),
             )
             fig_net.add_hline(y=0, line_dash="solid", line_color="gray", opacity=0.4)
-            fig_net.update_yaxes(autorange=True)
+            # ★ 根据数据范围调整纵轴（净持仓数据可能正负跨度大）
+            net_all_vals = []
+            for ndf in net_data.values():
+                if not ndf.empty and "net_position" in ndf.columns:
+                    net_all_vals.extend(ndf["net_position"].tolist())
+            net_yrange = _compute_y_padding(net_all_vals) if net_all_vals else None
+            if net_yrange:
+                fig_net.update_yaxes(range=net_yrange)
+            else:
+                fig_net.update_yaxes(autorange=True)
             st.plotly_chart(fig_net, use_container_width=True)
         else:
             st.warning("⚠️ 前20净持仓数据暂不可用，请先同步数据后再查看")
@@ -3325,6 +3366,30 @@ def main():
     </div>
     <hr style="border: none; border-top: 1px solid #e9ecef; margin: 0.5rem 0 1.5rem 0;">
     """, unsafe_allow_html=True)
+
+    # ── 启动时预下载所有合约的净持仓聚合数据（仅首次）──
+    if "_net_startup_synced" not in st.session_state:
+        st.session_state["_net_startup_synced"] = False
+
+    if not st.session_state["_net_startup_synced"]:
+        # 扫描所有有期货 CSV 但缺净持仓聚合文件的合约
+        all_with_futures = [c for c in ALL_CONTRACTS if _csv_path(c).exists()]
+        missing_net = [c for c in all_with_futures if not _net_agg_path(c).exists()]
+        if missing_net:
+            placeholder = st.empty()
+            with placeholder.container():
+                st.info(f"📡 首次启动：正在预下载 **{len(missing_net)}** 个合约的前20净持仓数据，"
+                        f"之后切换 Tab 即可秒开…")
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                for i, c in enumerate(missing_net):
+                    status_text.text(f"⏳ {i+1}/{len(missing_net)} 正在下载 {c} 全量历史净持仓…")
+                    _ensure_net_cache(c)
+                    progress_bar.progress((i + 1) / len(missing_net))
+                status_text.text(f"✅ {len(missing_net)} 个合约净持仓数据全部下载完成！")
+                _build_seasonal_net_positions.clear()
+            placeholder.empty()
+        st.session_state["_net_startup_synced"] = True
 
     # ── 七个 Tab ──
     t1, t2, t3, t4, t5, t6, t7 = st.tabs([
