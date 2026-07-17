@@ -2185,14 +2185,15 @@ def tab5():
 
             # ── 图例说明 ──
             st.caption(
-                "🟢 **正指**（国泰君安、中粮期货、东证期货）—— 方向与行情正相关 ｜ "
-                "🔴 **反指**（东方财富、徽商期货、平安期货）—— 方向与行情负相关"
+                "🟢 **正指**（国泰君安、中粮期货、东证期货）—— 操作方向即市场方向 ｜ "
+                "🔴 **反指**（东方财富、徽商期货、平安期货）—— 操作方向与市场相反"
             )
 
-            # ── 正指/反指 动向结论（使用与季节性持仓一致的 display_conclusion 卡片） ──
+            # ── 正指/反指 动向结论 ──
             def _analyze_direction(name: str, lc: int, sc: int, is_zhengzhi: bool) -> str:
-                """根据多空变化判断方向意图，返回分析文字。
-                正指和反指均直接描述实际行为，不反转方向。"""
+                """根据多空变化判断方向意图。
+                正指和反指均直接描述实际持仓行为方向，不做反转。
+                返回 (tag, name, action, intent, detail)"""
                 parts = []
                 if lc > 0: parts.append(f"加多+{lc:,}")
                 elif lc < 0: parts.append(f"减多{lc:,}")
@@ -2200,25 +2201,24 @@ def tab5():
                 elif sc < 0: parts.append(f"减空{sc:,}")
                 action = "、".join(parts) if parts else "持仓不变"
 
-                # 判断方向（正指和反指统一逻辑，直接描述实际操作方向）
                 if lc > 0 and sc < 0:
-                    intent = "看多"
-                    detail = "加多减空"
+                    intent = "看多"; detail = "加多减空"
                 elif lc < 0 and sc > 0:
-                    intent = "看空"
-                    detail = "减多加空"
+                    intent = "看空"; detail = "减多加空"
                 elif lc > 0 and sc > 0:
-                    intent = "多空分歧"
-                    detail = "双向加仓，方向不明确"
+                    intent = "多空分歧"; detail = "双向加仓"
                 elif lc < 0 and sc < 0:
-                    intent = "观望离场"
-                    detail = "双向减仓，资金流出"
+                    intent = "观望离场"; detail = "双向减仓"
                 else:
-                    intent = "中性"
-                    detail = "持仓变化不大"
+                    intent = "中性"; detail = "持仓变化不大"
 
                 tag = "🟢正指" if is_zhengzhi else "🔴反指"
-                return f"{tag} {name}：{action} → {detail}（{intent}）"
+                # 市场含义：正指方向=市场方向，反指方向=市场反向
+                if is_zhengzhi:
+                    market = "利多" if intent == "看多" else ("利空" if intent == "看空" else intent)
+                else:
+                    market = "利空" if intent == "看多" else ("利多" if intent == "看空" else intent)
+                return f"{tag} {name}：{action} → {intent}（{market}）"
 
             zhengzhi_found = []
             fanzhi_found = []
@@ -2227,49 +2227,53 @@ def tab5():
                 lc = int(row["long_change"])
                 sc = int(row["short_change"])
                 if co in ZHENGZHI_COMPANIES:
-                    zhengzhi_found.append((co, lc, sc, True))
+                    zhengzhi_found.append((co, lc, sc))
                 elif co in FANZHI_COMPANIES:
-                    fanzhi_found.append((co, lc, sc, False))
+                    fanzhi_found.append((co, lc, sc))
 
             if zhengzhi_found or fanzhi_found:
                 conclusion_items = []
                 zz_bull = zz_bear = fz_bull = fz_bear = 0
-                zz_dir = ""  # 正指方向总结
-                fz_dir = ""  # 反指方向总结
+                zz_dir = fz_dir = ""
 
-                if zhengzhi_found:
-                    zz_lines = []
-                    for co, lc, sc, _ in zhengzhi_found:
-                        line = _analyze_direction(co, lc, sc, True)
-                        zz_lines.append(f"• {line}")
-                        if "看多" in line: zz_bull += 1
-                        elif "看空" in line: zz_bear += 1
-                    zz_dir = "看多" if zz_bull > zz_bear else ("看空" if zz_bear > zz_bull else "中性")
-                    conclusion_items.append(f"🟢 正指：{zz_dir}（{'、'.join(l.replace('🟢正指 ','').split('：')[0] for l in zz_lines)}）")
+                # 逐行展示每个席位
+                for co, lc, sc in zhengzhi_found:
+                    line = _analyze_direction(co, lc, sc, True)
+                    conclusion_items.append(f"• {line}")
+                    if "看多" in line: zz_bull += 1
+                    elif "看空" in line: zz_bear += 1
+                for co, lc, sc in fanzhi_found:
+                    line = _analyze_direction(co, lc, sc, False)
+                    conclusion_items.append(f"• {line}")
+                    if "看多" in line: fz_bull += 1
+                    elif "看空" in line: fz_bear += 1
 
-                if fanzhi_found:
-                    fz_lines = []
-                    for co, lc, sc, _ in fanzhi_found:
-                        line = _analyze_direction(co, lc, sc, False)
-                        fz_lines.append(f"• {line}")
-                        if "看多" in line: fz_bull += 1
-                        elif "看空" in line: fz_bear += 1
-                    fz_dir = "看多" if fz_bull > fz_bear else ("看空" if fz_bear > fz_bull else "中性")
-                    conclusion_items.append(f"🔴 反指：{fz_dir}（{'、'.join(l.replace('🔴反指 ','').split('：')[0] for l in fz_lines)}）")
+                # 方向汇总
+                zz_dir = "看多" if zz_bull > zz_bear else ("看空" if zz_bear > zz_bull else "分歧")
+                fz_dir = "看多" if fz_bull > fz_bear else ("看空" if fz_bear > fz_bull else "分歧")
 
-                # 综合判断（正指反指不再反转，直接统计方向）
-                bull_score = zz_bull + fz_bull
-                bear_score = zz_bear + fz_bear
+                # 市场含义：正指方向=市场方向，反指方向相反
+                zz_market = "利多" if zz_dir == "看多" else ("利空" if zz_dir == "看空" else "分歧")
+                fz_market = "利空" if fz_dir == "看多" else ("利多" if fz_dir == "看空" else "分歧")
+
+                # 综合评分：正指看多+1，反指看空+1（反指看空=市场利多）
+                bull_score = zz_bull + fz_bear
+                bear_score = zz_bear + fz_bull
+
                 if bull_score > bear_score:
                     overall_sentiment = "bullish"
-                    judgment = f"🐂 偏多"
+                    judgment = "🐂 偏多"
                 elif bear_score > bull_score:
                     overall_sentiment = "bearish"
-                    judgment = f"🐻 偏空"
+                    judgment = "🐻 偏空"
                 else:
                     overall_sentiment = "neutral"
-                    judgment = f"⚖️ 方向分歧"
-                conclusion_items.append(f"• 综合判断：{judgment} — 正指{zz_dir}，反指{fz_dir}")
+                    judgment = "⚖️ 方向分歧"
+
+                conclusion_items.append(
+                    f"• 综合判断：{judgment} — "
+                    f"正指{zz_dir}（{zz_market}），反指{fz_dir}（{fz_market}）"
+                )
 
                 display_conclusion("🔍 关键席位动向分析", conclusion_items, overall_sentiment)
 
