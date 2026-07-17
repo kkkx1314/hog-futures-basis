@@ -2967,49 +2967,26 @@ def _build_seasonal_net_positions(contracts: Tuple[str, ...], sel_month: str) ->
             _ensure_net_cache(c)                   # 无本地数据，当场下载（首次慢，之后秒读）
             agg_df = _load_aggregated_net(c)
 
-        # ★ 净持仓聚合为空 → fallback 用期货持仓量 (open_interest)
         if agg_df is None or agg_df.empty:
-            fut_df, _ = load_futures(c)
-            if fut_df is None or fut_df.empty:
-                continue
-            oi_col = "open_interest" if "open_interest" in fut_df.columns else ("hold" if "hold" in fut_df.columns else None)
-            if oi_col is None:
-                continue
-            fut_df = fut_df.sort_values("date").copy()
-            fut_df["plot_date"] = [pd.Timestamp(year=2020, month=d.month, day=d.day)
-                                   for d in fut_df["date"]]
-            fut_df["trade_year"] = fut_df["date"].dt.year
-            for trade_yr, grp in fut_df.groupby("trade_year"):
-                grp = grp.sort_values("plot_date")
-                ty_str = str(trade_yr)
-                label = f"{c[2:]} ({ty_str}) [OI近似]"
-                net_data[label] = pd.DataFrame({
-                    "plot_date": grp["plot_date"].values,
-                    "net_position": grp[oi_col].values,
-                }).sort_values("plot_date")
-                for _, row in grp.iterrows():
-                    md = (row["date"].month, row["date"].day)
-                    v = row[oi_col]
-                    if v is not None and not pd.isna(v):
-                        net_collector[md].append(int(v))
-        else:
-            agg_df["plot_date"] = [pd.Timestamp(year=2020, month=d.month, day=d.day)
-                                   for d in agg_df["date"]]
-            agg_df["trade_year"] = agg_df["date"].dt.year
+            continue  # 无真实净持仓数据，跳过（不使用近似值）
 
-            for trade_yr, grp in agg_df.groupby("trade_year"):
-                grp = grp.sort_values("plot_date")
-                ty_str = str(trade_yr)
-                label = f"{c[2:]} ({ty_str})"
-                net_data[label] = pd.DataFrame({
-                    "plot_date": grp["plot_date"].values,
-                    "net_position": grp["net_position"].values,
-                }).sort_values("plot_date")
-                for _, row in grp.iterrows():
-                    md = (row["date"].month, row["date"].day)
-                    v = row["net_position"]
-                    if v is not None and not pd.isna(v):
-                        net_collector[md].append(int(v))
+        agg_df["plot_date"] = [pd.Timestamp(year=2020, month=d.month, day=d.day)
+                               for d in agg_df["date"]]
+        agg_df["trade_year"] = agg_df["date"].dt.year
+
+        for trade_yr, grp in agg_df.groupby("trade_year"):
+            grp = grp.sort_values("plot_date")
+            ty_str = str(trade_yr)
+            label = f"{c[2:]} ({ty_str})"
+            net_data[label] = pd.DataFrame({
+                "plot_date": grp["plot_date"].values,
+                "net_position": grp["net_position"].values,
+            }).sort_values("plot_date")
+            for _, row in grp.iterrows():
+                md = (row["date"].month, row["date"].day)
+                v = row["net_position"]
+                if v is not None and not pd.isna(v):
+                    net_collector[md].append(int(v))
 
     if net_collector:
         avg_rows = [{"plot_date": pd.Timestamp(year=2020, month=m, day=d),
