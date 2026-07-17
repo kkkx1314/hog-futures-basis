@@ -133,6 +133,8 @@ FALLBACK_COLOR = "#95A5A6"
 AVG_LINE_COLOR = "#6B7280"
 AVG_LINE_WIDTH = 0.8
 AVG_LINE_DASH = "dot"
+# 后台并行下载线程数
+_sync_parallel_workers = 5
 
 # Tab 2 汇总指标固定颜色
 SUMMARY_COLORS = {
@@ -505,6 +507,41 @@ def sync_active_contracts(silent: bool = True) -> Dict[str, str]:
     for ct in active:
         ok, msg = sync_futures(ct)
         results[ct] = msg
+    return results
+
+
+def sync_all_contracts(max_workers: int = 5, progress_callback=None) -> Dict[str, str]:
+    """后台下载 ALL_CONTRACTS 中所有缺失的合约期货数据（并行）。
+
+    只下载本地无 CSV 的合约，已有数据的合约秒过。
+    max_workers: 并行下载线程数。
+    progress_callback: 可选，签名 (current, total, contract, status) -> None。
+    返回 {合约: 状态信息}。
+    """
+    missing = [c for c in ALL_CONTRACTS if not _csv_path(c).exists()]
+    if not missing:
+        return {}
+
+    results = {}
+    total = len(missing)
+
+    def _download_one(ct):
+        ok, msg = sync_futures(ct, force_full=True)
+        return ct, ok, msg
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_map = {executor.submit(_download_one, ct): ct for ct in missing}
+        completed = 0
+        for future in as_completed(future_map):
+            ct, ok, msg = future.result()
+            results[ct] = msg
+            completed += 1
+            if progress_callback:
+                progress_callback(completed, total, ct, msg)
+            # 清除该合约的 load_futures 缓存，确保后续读取最新数据
+            if ok:
+                load_futures.clear(ct)
+
     return results
 
 
@@ -1559,12 +1596,19 @@ def _tab3_calendar(contracts, spot_dict, ref_regions, sel_items, data_date, acti
     tmon = ct_month(contracts[0])
     same_month = [c for c in ALL_CONTRACTS if ct_month(c)==tmon]
     avail = []
+    skipped = []
     for c in same_month:
         df, _ = load_futures(c)
-        if df is not None and not df.empty: avail.append(c)
+        if df is not None and not df.empty:
+            avail.append(c)
+        else:
+            skipped.append(c)
     if len(avail) < 1:
         st.warning(f"⚠️ {tmon}月合约暂无可用的历史数据"); return
-    st.info(f"📌 {tmon}月合约，共 {len(avail)} 个可用：{'、'.join(avail)}")
+    info_msg = f"📌 {tmon}月合约，共 {len(avail)} 个可用：{'、'.join(avail)}"
+    if skipped:
+        info_msg += f"  ｜ ⚠️ 无数据：{'、'.join(skipped)}"
+    st.info(info_msg)
 
     series: Dict[str, pd.DataFrame] = {}
     # ★ 修复：用 (month, day) 聚合，避免闰年/非闰年 doy 混乱
@@ -1709,18 +1753,13 @@ def tab4():
         for y in range(21, 28):
             ca, cb = f"LH{y}{ma}", f"LH{y}{mb}"
             if ca not in ALL_CONTRACTS or cb not in ALL_CONTRACTS: continue
-            ca_ok = _csv_path(ca).exists()
-            cb_ok = _csv_path(cb).exists()
+            # ★ 使用 load_futures 而非仅检查 CSV 存在 —— 缺失数据自动下载，不跳过任何年份
+            dfa, _ = load_futures(ca)
+            dfb, _ = load_futures(cb)
+            ca_ok = dfa is not None and not dfa.empty
+            cb_ok = dfb is not None and not dfb.empty
             if ca_ok and cb_ok: valid_years.append(y)
             elif ca_ok or cb_ok: skipped_years.append(y)
-
-        if not valid_years:
-            for y in range(21, 28):
-                ca, cb = f"LH{y}{ma}", f"LH{y}{mb}"
-                if ca not in ALL_CONTRACTS or cb not in ALL_CONTRACTS: continue
-                dfa, _ = load_futures(ca); dfb, _ = load_futures(cb)
-                if dfa is not None and not dfa.empty and dfb is not None and not dfb.empty: valid_years.append(y)
-                elif (dfa is not None and not dfa.empty) or (dfb is not None and not dfb.empty): skipped_years.append(y)
 
         if not valid_years:
             st.warning(f"⚠️ 暂无同时存在 {ma}月 和 {mb}月 合约的年份数据"); return
@@ -2379,14 +2418,23 @@ def tab6():
                                  index=active_months.index("09") if "09" in active_months else 0,
                                  format_func=lambda m: f"{m}月合约", key="t6_month")
 
-        # 找出该月份所有可用合约（轻量：只检查 CSV 文件是否存在）
+        # ★ 找出该月份所有合约 —— 不跳过任何往年同期合约
+        # 使用 load_futures 逐一加载（已有 CSV 秒读，缺失的自动下载）
         same_month_cts = [c for c in ALL_CONTRACTS if ct_month(c) == sel_month]
-        available_cts = [c for c in same_month_cts if _csv_path(c).exists()]
-        if not available_cts:
-            available_cts = same_month_cts
+        available_cts = []
+        skipped_cts = []
+        for c in same_month_cts:
+            df, _ = load_futures(c)
+            if df is not None and not df.empty:
+                available_cts.append(c)
+            else:
+                skipped_cts.append(c)
 
-        st.caption(f"已发现 {len(available_cts)} 个 {sel_month} 月合约：{'、'.join(available_cts[:8])}"
-                   f"{'…' if len(available_cts) > 8 else ''}")
+        if not available_cts:
+            st.warning(f"⚠️ 暂无可用的 {sel_month} 月合约数据"); return
+
+        st.caption(f"✅ 已加载 {len(available_cts)} 个 {sel_month} 月合约：{'、'.join(available_cts)}"
+                   + (f"  ｜ ⚠️ 跳过：{'、'.join(skipped_cts)}" if skipped_cts else ""))
 
         # 日期范围（轻量：只读 CSV 首尾行）
         all_dates = []
@@ -3367,29 +3415,84 @@ def main():
     <hr style="border: none; border-top: 1px solid #e9ecef; margin: 0.5rem 0 1.5rem 0;">
     """, unsafe_allow_html=True)
 
-    # ── 启动时预下载所有合约的净持仓聚合数据（仅首次）──
-    if "_net_startup_synced" not in st.session_state:
-        st.session_state["_net_startup_synced"] = False
+    # ── 启动时后台下载所有合约信息（仅首次）──
+    # Step 1: 下载所有缺失的期货合约数据（并行）
+    # Step 2: 下载所有缺失的净持仓聚合数据
+    # 完成后，所有 Tab 的季节性对比均可秒开，不会跳过任何历史同期合约
+    if "_startup_all_synced" not in st.session_state:
+        st.session_state["_startup_all_synced"] = False
 
-    if not st.session_state["_net_startup_synced"]:
-        # 扫描所有有期货 CSV 但缺净持仓聚合文件的合约
-        all_with_futures = [c for c in ALL_CONTRACTS if _csv_path(c).exists()]
-        missing_net = [c for c in all_with_futures if not _net_agg_path(c).exists()]
-        if missing_net:
+    if not st.session_state["_startup_all_synced"]:
+        # 统计缺失项
+        missing_futures = [c for c in ALL_CONTRACTS if not _csv_path(c).exists()]
+        all_with_futures_now = [c for c in ALL_CONTRACTS if _csv_path(c).exists()]
+        missing_net = [c for c in all_with_futures_now if not _net_agg_path(c).exists()]
+
+        total_tasks = len(missing_futures) + len(missing_net)
+        if total_tasks > 0:
             placeholder = st.empty()
             with placeholder.container():
-                st.info(f"📡 首次启动：正在预下载 **{len(missing_net)}** 个合约的前20净持仓数据，"
-                        f"之后切换 Tab 即可秒开…")
+                st.info(
+                    f"📡 首次启动：正在后台下载所有历史合约数据，确保季节性对比不遗漏任何合约…\n\n"
+                    f"📦 缺失期货数据：**{len(missing_futures)}** 个合约 ｜ "
+                    f"📦 缺失净持仓数据：**{len(missing_net)}** 个合约 ｜ "
+                    f"🔢 共 **{total_tasks}** 项任务"
+                )
                 progress_bar = st.progress(0)
                 status_text = st.empty()
-                for i, c in enumerate(missing_net):
-                    status_text.text(f"⏳ {i+1}/{len(missing_net)} 正在下载 {c} 全量历史净持仓…")
-                    _ensure_net_cache(c)
-                    progress_bar.progress((i + 1) / len(missing_net))
-                status_text.text(f"✅ {len(missing_net)} 个合约净持仓数据全部下载完成！")
-                _build_seasonal_net_positions.clear()
+                completed = 0
+
+                # ── Step 1: 并行下载所有缺失的期货合约 ──
+                if missing_futures:
+                    status_text.text(f"⏳ 正在并行下载 {len(missing_futures)} 个合约的期货数据（{_sync_parallel_workers} 线程）…")
+
+                    def _fut_progress(current, total, ct, msg):
+                        nonlocal completed
+                        completed = current
+                        progress_bar.progress(
+                            completed / total_tasks,
+                            text=f"📈 期货 {completed}/{total} — {ct}: {msg}"
+                        )
+                        status_text.text(
+                            f"⏳ 期货下载中… {completed}/{len(missing_futures)} — {ct}: {msg}"
+                        )
+
+                    sync_all_contracts(
+                        max_workers=_sync_parallel_workers,
+                        progress_callback=_fut_progress,
+                    )
+                    completed = len(missing_futures)
+                    progress_bar.progress(completed / total_tasks)
+                    status_text.text(f"✅ 期货数据下载完成！{len(missing_futures)} 个合约已缓存。")
+
+                # ── Step 2: 重新扫描有期货数据的合约，下载缺失的净持仓 ──
+                all_with_futures_now = [c for c in ALL_CONTRACTS if _csv_path(c).exists()]
+                missing_net = [c for c in all_with_futures_now if not _net_agg_path(c).exists()]
+                # ★ 重新计算总数（Step 1 可能新增了合约，导致 missing_net 变化）
+                total_tasks = len(missing_futures) + len(missing_net)
+                if total_tasks > 0:
+                    progress_bar.progress(completed / total_tasks)
+                if missing_net:
+                    status_text.text(f"⏳ 正在下载 {len(missing_net)} 个合约的前20净持仓数据…")
+                    for i, c in enumerate(missing_net):
+                        progress_bar.progress(
+                            (completed + i + 1) / total_tasks,
+                            text=f"📊 净持仓 {i+1}/{len(missing_net)} — {c}"
+                        )
+                        status_text.text(
+                            f"⏳ {i+1}/{len(missing_net)} 正在下载 {c} 全量历史净持仓…"
+                        )
+                        _ensure_net_cache(c)
+                    completed += len(missing_net)
+                    progress_bar.progress(1.0)
+                    _build_seasonal_net_positions.clear()
+
+                status_text.text(
+                    f"✅ 全部完成！期货 {len(missing_futures)} 个 + 净持仓 {len(missing_net)} 个合约数据已就绪，"
+                    f"季节性对比将覆盖所有历史同期合约。"
+                )
             placeholder.empty()
-        st.session_state["_net_startup_synced"] = True
+        st.session_state["_startup_all_synced"] = True
 
     # ── 七个 Tab ──
     t1, t2, t3, t4, t5, t6, t7 = st.tabs([
@@ -3428,17 +3531,25 @@ def main():
     with c1:
         if st.button("🔄 刷新数据", use_container_width=True, key="main_refresh"):
             st.cache_data.clear()
-            with st.spinner("🔄 正在同步最新数据…"):
+            # 重置启动标记，下次启动时重新检查缺失数据
+            st.session_state["_startup_all_synced"] = False
+            with st.spinner("🔄 正在同步最新数据（含所有历史合约）…"):
+                # ★ 同步所有合约（活跃 + 历史），确保季节性对比不遗漏
                 sync_active_contracts()
-                # 同时迁移净持仓聚合文件（从已有 date-CSV，纯本地操作）
-                for ct in get_active_contracts():
-                    _migrate_existing_to_aggregated(ct)
-                    _update_net_latest(ct)
+                sync_all_contracts(max_workers=_sync_parallel_workers)
+                # 同时更新净持仓聚合文件
+                for ct in ALL_CONTRACTS:
+                    if _csv_path(ct).exists():
+                        _migrate_existing_to_aggregated(ct)
+                        _update_net_latest(ct)
+                _build_seasonal_net_positions.clear()
             st.rerun()
     with c2:
         if st.button("🗑️ 清除缓存", use_container_width=True, key="main_clear"):
             st.cache_data.clear()
+            st.session_state["_startup_all_synced"] = False
             if FUTURES_DIR.exists(): shutil.rmtree(FUTURES_DIR); FUTURES_DIR.mkdir()
+            HOLDINGS_DIR.mkdir(exist_ok=True)
             st.rerun()
 
     st.caption("⚠️ 免责声明：本平台数据仅供参考，不构成任何投资建议。投资有风险，入市需谨慎。")
