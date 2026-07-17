@@ -2533,9 +2533,8 @@ def tab6():
             st.warning(f"⚠️ 暂无可用的 {sel_month} 月合约"); return
 
         # ── 收集各合约的成交量和持仓量数据（缓存加速）──
-        shash = _spot_hash(spot_dict) if spot_dict else 0
         vol_data, oi_data, net_data_full = _build_vol_oi_seasonal_cached(
-            tuple(available_cts), str(sd), str(ed), shash
+            tuple(available_cts), str(sd), str(ed), 0  # spot_hash_key=0, Tab6 不依赖现货数据
         )
 
         # ── 图1：成交量季节性对比 ──
