@@ -926,8 +926,11 @@ def fig_calendar_comparison(series: Dict[str, pd.DataFrame], tmon: str, data_dat
             c, w, d = _contract_color_from_label(label), 2, "solid"
         # ★ 从 label 提取合约代码用于点击联动（格式如 "2409 (2024) 全国均价" → LH2409）
         ct_code = "LH" + label[:4] if len(label) >= 4 else ""
-        fig.add_trace(go.Scatter(x=df["plot_date"], y=df["basis"], mode="lines", name=label,
+        # 用 lines+markers 确保有点可点击（marker 极小透明，不影响视觉）
+        fig.add_trace(go.Scatter(x=df["plot_date"], y=df["basis"],
+            mode="lines+markers", name=label,
             line=dict(color=c, width=w, dash=d),
+            marker=dict(size=4, opacity=0.01, color=c),
             hovertemplate=f"<b>{label}</b><br>%{{customdata[1]}}<br>基差：%{{y:+,}}元/吨<extra></extra>",
             customdata=[[ct_code, _cn_md(r["plot_date"])] for _,r in df.iterrows()]))
     fig.add_hline(y=0, line_dash="dash", line_color="gray", opacity=0.5)
@@ -1701,19 +1704,30 @@ def _tab3_calendar(contracts, spot_dict, ref_regions, sel_items, data_date, acti
                                 selection_mode="points", key="t3_calendar")
 
     _clicked_ct = None
-    if sel_event and sel_event.selection and sel_event.selection.points:
-        pt = sel_event.selection.points[0]
-        # customdata 格式: [contract_code, formatted_date]
-        cd = pt.get("customdata", None)
-        if cd and isinstance(cd, (list, tuple)) and len(cd) >= 1:
-            _clicked_ct = str(cd[0]) if cd[0] else None
-        # Fallback: 从 curve_number 反查 trace label
-        if not _clicked_ct and "curve_number" in pt:
-            cn = pt["curve_number"]
-            labels = [l for l in series.keys() if "历史均值" not in l]
-            if 0 <= cn < len(labels):
-                lbl = labels[cn]
-                _clicked_ct = "LH" + lbl[:4] if len(lbl) >= 4 else None
+    if sel_event is not None:
+        # Streamlit 1.55+ 返回 PlotlySelection；兼容多种访问路径
+        pts = None
+        try:
+            pts = sel_event.selection.points
+        except AttributeError:
+            try:
+                pts = sel_event.get("selection", {}).get("points", [])
+            except Exception:
+                pass
+
+        if pts:
+            pt = pts[0]
+            # 优先从 customdata 取合约代码
+            cd = pt.get("customdata", None) if isinstance(pt, dict) else getattr(pt, "customdata", None)
+            if cd and isinstance(cd, (list, tuple)) and len(cd) >= 1:
+                _clicked_ct = str(cd[0]) if cd[0] else None
+            # Fallback: 从 curve_number 反查
+            if not _clicked_ct:
+                cn = pt.get("curve_number", None) if isinstance(pt, dict) else getattr(pt, "curve_number", None)
+                labels = [l for l in series.keys() if "历史均值" not in l]
+                if cn is not None and 0 <= cn < len(labels):
+                    lbl = labels[cn]
+                    _clicked_ct = "LH" + lbl[:4] if len(lbl) >= 4 else None
 
     if _clicked_ct:
         st.markdown(f"---")
