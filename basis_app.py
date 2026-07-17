@@ -2843,7 +2843,7 @@ def _migrate_existing_to_aggregated(ct: str) -> int:
 
 def _update_net_latest(ct: str, max_attempts: int = 3) -> int:
     """更新净持仓数据。
-    - 聚合文件不存在 → 全量下载所有历史交易日
+    - 聚合文件不存在 → 全量下载所有历史交易日（老合约仅采样前30天快速探测）
     - 聚合文件已存在 → 只拉取最新缺失的 N 个交易日"""
     cp = _csv_path(ct)
     if not cp.exists():
@@ -2868,9 +2868,15 @@ def _update_net_latest(ct: str, max_attempts: int = 3) -> int:
             return 0
 
     # ── 收集待下载日期 ──
+    # ★ 老合约（2023年前上市）首次同步：仅采样最近 30 天快速探测，避免大量无效 API 调用
+    is_old_contract = ct < "LH2301"
+    first_sync_sample_limit = 30 if (is_first_sync and is_old_contract) else None
+
     pending_dates = []
     for dt in all_trading_dates:
         if not is_first_sync and len(pending_dates) >= max_attempts:
+            break
+        if first_sync_sample_limit and len(pending_dates) >= first_sync_sample_limit:
             break
         date_str = dt.strftime("%Y%m%d")
         if date_str not in cached_dates:
@@ -2884,6 +2890,9 @@ def _update_net_latest(ct: str, max_attempts: int = 3) -> int:
 
     if is_first_sync:
         # 首次全量：并行下载（5 线程），大幅缩短等待时间
+        # 老合约采样探测模式：采样全部失败 → 写入空聚合文件，避免后续重复探测
+        is_sampling = (first_sync_sample_limit is not None)
+
         def _fetch_one(ds: str):
             h = _fetch_exact_holdings(ct, ds, use_fallback=False)
             if h is not None and not h.empty:
@@ -2907,6 +2916,9 @@ def _update_net_latest(ct: str, max_attempts: int = 3) -> int:
             if agg_df is not None and not agg_df.empty:
                 agg_df = agg_df.sort_values("date").reset_index(drop=True)
                 agg_df.to_csv(agg_path, index=False)
+            # ★ 老合约采样探测：全部失败 → 写入空聚合文件，避免后续启动重复探测
+            if is_sampling and fetched == 0:
+                pd.DataFrame(columns=["date", "net_position"]).to_csv(agg_path, index=False)
     else:
         # 增量模式：串行即可（最多 3 天）
         for ds in pending_dates:
