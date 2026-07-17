@@ -2878,10 +2878,11 @@ def _migrate_existing_to_aggregated(ct: str) -> int:
     return 0
 
 
-def _update_net_latest(ct: str, max_attempts: int = 3) -> int:
-    """更新净持仓数据。
-    - 聚合文件不存在 → 全量下载所有历史交易日（老合约仅采样前30天快速探测）
-    - 聚合文件已存在 → 只拉取最新缺失的 N 个交易日"""
+def _update_net_latest(ct: str) -> int:
+    """更新净持仓数据 — 与 sync_futures 逻辑完全一致。
+    - 本地无聚合文件 → 全量下载该合约所有历史交易日（从上市日到最新日）
+    - 本地有聚合文件 → 增量下载最新缺失的交易日（不限制数量）
+    - 只写入真实 API 数据，无采样、无近似、无 max_attempts 限制"""
     cp = _csv_path(ct)
     if not cp.exists():
         return 0
@@ -2895,26 +2896,18 @@ def _update_net_latest(ct: str, max_attempts: int = 3) -> int:
 
     agg_df = _load_aggregated_net(ct)
     is_first_sync = (agg_df is None or agg_df.empty)
-    all_trading_dates = sorted(fut_df["date"].unique(), reverse=True)
+    all_trading_dates = sorted(fut_df["date"].unique())
     cached_dates = set(agg_df["date"].dt.strftime("%Y%m%d")) if not is_first_sync else set()
 
-    # 增量模式：已是最新则跳过
+    # ── 增量模式：已是最新则秒过 ──
     if not is_first_sync:
-        latest_trade_date = all_trading_dates[0] if all_trading_dates else None
+        latest_trade_date = all_trading_dates[-1] if all_trading_dates else None
         if latest_trade_date and agg_df["date"].max() >= latest_trade_date:
-            return 0
+            return 0  # 已是最新
 
-    # ── 收集待下载日期 ──
-    # ★ 老合约（2023年前上市）首次同步：仅采样最近 30 天快速探测，避免大量无效 API 调用
-    is_old_contract = ct < "LH2301"
-    first_sync_sample_limit = 30 if (is_first_sync and is_old_contract) else None
-
+    # ── 收集所有待下载日期（无数量限制）──
     pending_dates = []
     for dt in all_trading_dates:
-        if not is_first_sync and len(pending_dates) >= max_attempts:
-            break
-        if first_sync_sample_limit and len(pending_dates) >= first_sync_sample_limit:
-            break
         date_str = dt.strftime("%Y%m%d")
         if date_str not in cached_dates:
             pending_dates.append(date_str)
@@ -2925,17 +2918,14 @@ def _update_net_latest(ct: str, max_attempts: int = 3) -> int:
     fetched = 0
     agg_path = _net_agg_path(ct)
 
+    def _fetch_one(ds: str):
+        h = _fetch_exact_holdings(ct, ds, use_fallback=False)
+        if h is not None and not h.empty:
+            return ds, int(h["long"].sum() - h["short"].sum())
+        return ds, None
+
     if is_first_sync:
-        # 首次全量：并行下载（5 线程），大幅缩短等待时间
-        # 老合约采样探测模式：采样全部失败 → 写入空聚合文件，避免后续重复探测
-        is_sampling = (first_sync_sample_limit is not None)
-
-        def _fetch_one(ds: str):
-            h = _fetch_exact_holdings(ct, ds, use_fallback=False)
-            if h is not None and not h.empty:
-                return ds, int(h["long"].sum() - h["short"].sum())
-            return ds, None
-
+        # 首次全量：并行下载所有交易日（5 线程）
         with ThreadPoolExecutor(max_workers=5) as executor:
             future_map = {executor.submit(_fetch_one, ds): ds for ds in pending_dates}
             for future in as_completed(future_map):
@@ -2949,15 +2939,8 @@ def _update_net_latest(ct: str, max_attempts: int = 3) -> int:
                         agg_df = new_row
                     fetched += 1
                 cached_dates.add(ds)
-            # 排序并写入
-            if agg_df is not None and not agg_df.empty:
-                agg_df = agg_df.sort_values("date").reset_index(drop=True)
-                agg_df.to_csv(agg_path, index=False)
-            # ★ 老合约采样探测：全部失败 → 写入空聚合文件，避免后续启动重复探测
-            if is_sampling and fetched == 0:
-                pd.DataFrame(columns=["date", "net_position"]).to_csv(agg_path, index=False)
     else:
-        # 增量模式：串行即可（最多 3 天）
+        # 增量模式：串行拉取缺失交易日（通常只有几天）
         for ds in pending_dates:
             holdings = _fetch_exact_holdings(ct, ds, use_fallback=False)
             if holdings is not None and not holdings.empty:
@@ -2970,19 +2953,44 @@ def _update_net_latest(ct: str, max_attempts: int = 3) -> int:
                     agg_df = new_row
                 fetched += 1
             cached_dates.add(ds)
-        if agg_df is not None and not agg_df.empty and fetched > 0:
-            agg_df = agg_df.sort_values("date").reset_index(drop=True)
-            agg_df.to_csv(agg_path, index=False)
+
+    # 写入聚合文件
+    if agg_df is not None and not agg_df.empty:
+        agg_df = agg_df.sort_values("date").reset_index(drop=True)
+        agg_df.to_csv(agg_path, index=False)
 
     return fetched
 
 
 def _ensure_net_cache(ct: str) -> Optional[pd.DataFrame]:
-    """确保合约的聚合净持仓缓存存在且最新。
-    1. 若聚合文件不存在 → 尝试从已有 date-CSV 迁移
-    2. 拉取缺失的净持仓数据（首次采样、增量追加）
+    """确保合约的聚合净持仓缓存存在且最新 — 与 load_futures 逻辑完全一致。
+    1. 本地有聚合文件 → 直接读取 + 增量追加缺失交易日
+    2. 本地无聚合文件 → 迁移旧 CSV → 全量下载所有交易日
     返回完整的聚合 DataFrame。"""
+    agg_path = _net_agg_path(ct)
+
+    # ── 本地有聚合文件 → 先读，再增量 ──
+    if agg_path.exists():
+        try:
+            agg_df = pd.read_csv(agg_path)
+            if not agg_df.empty and "date" in agg_df.columns and "net_position" in agg_df.columns:
+                agg_df["date"] = pd.to_datetime(agg_df["date"])
+                # 增量追加最新缺失的交易日
+                _update_net_latest(ct)
+                # 重新读取（可能已追加新数据）
+                return _load_aggregated_net(ct)
+        except Exception:
+            pass
+
+    # ── 本地无聚合文件 → 迁移 + 全量下载 ──
     _migrate_existing_to_aggregated(ct)
+    agg_df = _load_aggregated_net(ct)
+    if agg_df is not None and not agg_df.empty:
+        # 迁移成功 → 增量追加
+        _update_net_latest(ct)
+        return _load_aggregated_net(ct)
+
+    # 无任何本地数据 → 全量下载
     _update_net_latest(ct)
     return _load_aggregated_net(ct)
 
@@ -2994,17 +3002,10 @@ def _build_seasonal_net_positions(contracts: Tuple[str, ...], sel_month: str) ->
     net_collector = defaultdict(list)
 
     for c in contracts:
-        # 和 load_futures 一样：有本地文件就读，没有就下载
-        agg_df = _load_aggregated_net(c)
+        # 与 load_futures 完全一致：有本地文件秒读，缺失则当场下载
+        agg_df = _ensure_net_cache(c)
         if agg_df is None or agg_df.empty:
-            _migrate_existing_to_aggregated(c)    # 尝试从 date-CSV 迁移
-            agg_df = _load_aggregated_net(c)
-        if agg_df is None or agg_df.empty:
-            _ensure_net_cache(c)                   # 无本地数据，当场下载（首次慢，之后秒读）
-            agg_df = _load_aggregated_net(c)
-
-        if agg_df is None or agg_df.empty:
-            continue  # 无真实净持仓数据，跳过（不使用近似值）
+            continue
 
         agg_df["plot_date"] = [pd.Timestamp(year=2020, month=d.month, day=d.day)
                                for d in agg_df["date"]]
