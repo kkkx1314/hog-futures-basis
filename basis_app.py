@@ -2957,40 +2957,40 @@ def _ensure_net_cache(ct: str) -> Optional[pd.DataFrame]:
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def _build_seasonal_net_positions(contracts: Tuple[str, ...], sel_month: str) -> Tuple[Dict[str, pd.DataFrame], defaultdict]:
-    """构建季节性净持仓数据 — 和其他板块一样：有本地文件直接读，没有就当场下载。"""
+    """构建季节性净持仓数据 — 每个合约一条完整生命周期折线。
+    不复用 trade_year 分组，确保从上市日到退市日的数据连续显示。"""
     net_data: Dict[str, pd.DataFrame] = {}
     net_collector = defaultdict(list)
 
     for c in contracts:
-        # 和 load_futures 一样：有本地文件就读，没有就下载
         agg_df = _load_aggregated_net(c)
         if agg_df is None or agg_df.empty:
-            _migrate_existing_to_aggregated(c)    # 尝试从 date-CSV 迁移
+            _migrate_existing_to_aggregated(c)
             agg_df = _load_aggregated_net(c)
         if agg_df is None or agg_df.empty:
-            _ensure_net_cache(c)                   # 无本地数据，当场下载（首次慢，之后秒读）
+            _ensure_net_cache(c)
             agg_df = _load_aggregated_net(c)
 
         if agg_df is None or agg_df.empty:
-            continue  # 无真实净持仓数据，跳过（不使用近似值）
+            continue
 
+        # ★ 不复用 trade_year 分组 —— 整个合约一条折线，完整生命周期
         agg_df["plot_date"] = [pd.Timestamp(year=2020, month=d.month, day=d.day)
                                for d in agg_df["date"]]
-        agg_df["trade_year"] = agg_df["date"].dt.year
+        # 按实际日期排序，确保 Oct→Nov→Dec→Jan→...→Sep 顺序正确
+        agg_df = agg_df.sort_values("date")
 
-        for trade_yr, grp in agg_df.groupby("trade_year"):
-            grp = grp.sort_values("plot_date")
-            ty_str = str(trade_yr)
-            label = f"{c[2:]} ({ty_str})"
-            net_data[label] = pd.DataFrame({
-                "plot_date": grp["plot_date"].values,
-                "net_position": grp["net_position"].values,
-            }).sort_values("plot_date")
-            for _, row in grp.iterrows():
-                md = (row["date"].month, row["date"].day)
-                v = row["net_position"]
-                if v is not None and not pd.isna(v):
-                    net_collector[md].append(int(v))
+        label = c[2:]  # e.g., "2409"
+        net_data[label] = pd.DataFrame({
+            "plot_date": agg_df["plot_date"].values,
+            "net_position": agg_df["net_position"].values,
+        })
+
+        for _, row in agg_df.iterrows():
+            md = (row["date"].month, row["date"].day)
+            v = row["net_position"]
+            if v is not None and not pd.isna(v):
+                net_collector[md].append(int(v))
 
     if net_collector:
         avg_rows = [{"plot_date": pd.Timestamp(year=2020, month=m, day=d),
@@ -3090,9 +3090,9 @@ def _build_vol_oi_seasonal_cached(
     sd_str: str,
     ed_str: str,
     spot_hash_key: int,
-) -> Tuple[Dict[str, pd.DataFrame], Dict[str, pd.DataFrame], Dict[str, pd.DataFrame], Dict[str, pd.DataFrame]]:
+) -> Tuple[Dict[str, pd.DataFrame], Dict[str, pd.DataFrame], Dict[str, pd.DataFrame]]:
     """缓存 Tab6 的成交量/持仓量季节性数据构建。
-    返回 (vol_data, oi_data, net_data, all_available_cts_data)"""
+    返回 (vol_data, oi_data, net_data_full) — 每个合约一条完整生命周期折线。"""
     contracts = list(contracts_tuple)
     sd = pd.to_datetime(sd_str)
     ed = pd.to_datetime(ed_str)
@@ -3110,31 +3110,28 @@ def _build_vol_oi_seasonal_cached(
         df = df[(df["date"] >= sd) & (df["date"] <= ed)]
         if df.empty: continue
         df["plot_date"] = [pd.Timestamp(year=2020, month=d.month, day=d.day) for d in df["date"]]
-        df["trade_year"] = df["date"].dt.year
 
-        for trade_yr, grp in df.groupby("trade_year"):
-            grp = grp.sort_values("date")
-            ty_str = str(trade_yr)
-            label = f"{c[2:]} ({ty_str})"
-            if "volume" in grp.columns:
-                vol_data[label] = pd.DataFrame({
-                    "plot_date": grp["plot_date"].values,
-                    "volume": grp["volume"].values,
-                    "date": grp["date"].values,
-                }).sort_values("plot_date")
-            oi_col = "open_interest" if "open_interest" in grp.columns else ("hold" if "hold" in grp.columns else None)
+        # ★ 不复用 trade_year 分组 —— 每个合约一条完整生命周期折线
+        label = c[2:]  # e.g., "2409"
+        if "volume" in df.columns:
+            vol_data[label] = pd.DataFrame({
+                "plot_date": df["plot_date"].values,
+                "volume": df["volume"].values,
+                "date": df["date"].values,
+            }).sort_values("date")
+        oi_col = "open_interest" if "open_interest" in df.columns else ("hold" if "hold" in df.columns else None)
+        if oi_col:
+            oi_data[label] = pd.DataFrame({
+                "plot_date": df["plot_date"].values,
+                "open_interest": df[oi_col].values,
+                "date": df["date"].values,
+            }).sort_values("date")
+        for _, row in df.iterrows():
+            md = (row["date"].month, row["date"].day)
+            if "volume" in df.columns:
+                vol_collector[md].append(int(row["volume"]))
             if oi_col:
-                oi_data[label] = pd.DataFrame({
-                    "plot_date": grp["plot_date"].values,
-                    "open_interest": grp[oi_col].values,
-                    "date": grp["date"].values,
-                }).sort_values("plot_date")
-            for _, row in grp.iterrows():
-                md = (row["date"].month, row["date"].day)
-                if "volume" in grp.columns:
-                    vol_collector[md].append(int(row["volume"]))
-                if oi_col:
-                    oi_collector[md].append(int(row[oi_col]))
+                oi_collector[md].append(int(row[oi_col]))
 
     # 历史均值
     avg_vol = pd.DataFrame()
