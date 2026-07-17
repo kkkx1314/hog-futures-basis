@@ -340,7 +340,8 @@ def _csv_path(ct: str) -> Path:
 
 
 def _contract_status(ct: str) -> str:
-    """判断合约状态：'active'（仍在交易）, 'expired'（已到期）, 'no_data'（无本地文件）"""
+    """判断合约状态：'active'（仍在交易）, 'expired'（已到期）, 'no_data'（无本地文件）
+    使用合约交割月+数据新鲜度双重判断，避免数据延迟导致误判为到期。"""
     cp = _csv_path(ct)
     if not cp.exists():
         return "no_data"
@@ -349,10 +350,27 @@ def _contract_status(ct: str) -> str:
         if df.empty:
             return "no_data"
         max_date = pd.to_datetime(df["date"].max()).date()
-        # 最近 7 天内有交易 → 活跃；否则 → 已到期
-        if max_date >= (datetime.now().date() - timedelta(days=7)):
+        days_behind = (datetime.now().date() - max_date).days
+
+        # 数据在 7 天内 → 活跃
+        if days_behind <= 7:
             return "active"
-        return "expired"
+
+        # 判断合约是否真正到期：交割月份距今超过 2 个月
+        try:
+            ct_year = int(f"20{ct[2:4]}")
+            ct_month = int(ct[4:6])
+            delivery_date = datetime(ct_year, ct_month, 15).date()
+            months_since_delivery = (datetime.now().date().year - delivery_date.year) * 12 + \
+                                     (datetime.now().date().month - delivery_date.month)
+            # 交割后超过 2 个月且数据超过 7 天 → 真正到期
+            if months_since_delivery > 2:
+                return "expired"
+        except Exception:
+            pass
+
+        # 交割月未过或刚过 → 数据只是延迟，仍视为活跃
+        return "active"
     except Exception:
         return "no_data"
 
@@ -377,7 +395,7 @@ def _get_global_latest_date() -> Optional[pd.Timestamp]:
 def get_active_contracts() -> List[str]:
     """动态识别当前上市合约，并确保兜底列表始终包含"""
     # 硬编码保底列表：当前正在交易的合约
-    FALLBACK_ACTIVE = ['LH2607', 'LH2609', 'LH2611', 'LH2701', 'LH2703', 'LH2705']
+    FALLBACK_ACTIVE = ['LH2609', 'LH2611', 'LH2701', 'LH2703', 'LH2705', 'LH2707']
     global_latest = _get_global_latest_date()
     if global_latest is None:
         return [c for c in ALL_CONTRACTS if c in FALLBACK_ACTIVE]
@@ -3683,6 +3701,22 @@ def main():
                 )
             placeholder.empty()
         st.session_state["_startup_all_synced"] = True
+
+    # ── 自动增量同步：每 30 分钟拉取最新交易数据 ──
+    if "_last_auto_sync" not in st.session_state:
+        st.session_state["_last_auto_sync"] = datetime.now() - timedelta(hours=1)  # 首次强制同步
+
+    _mins_since_sync = (datetime.now() - st.session_state["_last_auto_sync"]).total_seconds() / 60
+    if _mins_since_sync >= 30:
+        # 后台静默增量更新活跃合约（不清缓存，仅追加新数据）
+        with st.spinner("📡 自动同步最新行情…"):
+            for ct in get_active_contracts():
+                sync_futures(ct, force_full=False)
+            # 同时更新净持仓
+            for ct in get_active_contracts():
+                if _csv_path(ct).exists():
+                    _update_net_latest(ct)
+        st.session_state["_last_auto_sync"] = datetime.now()
 
     # ── 七个 Tab ──
     t1, t2, t3, t4, t5, t6, t7 = st.tabs([
