@@ -8,6 +8,10 @@ venv/
 # Futures cache (auto-downloaded at runtime)
 data/futures/*.csv
 
+# Holdings cache (individual date files are large, only commit aggregated net position data)
+data/holdings/*
+!data/holdings/*_net_agg.csv
+
 # Streamlit
 .streamlit/secrets.toml
 
