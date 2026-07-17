@@ -403,6 +403,28 @@ def get_active_contracts() -> List[str]:
     # 过滤：只保留存在于ALL_CONTRACTS中的合约
     return sorted([c for c in active if c in ALL_CONTRACTS])
 
+
+def get_main_contract() -> str:
+    """返回主力合约（活跃合约中近20日成交量最高的）。
+    兜底返回活跃合约列表中最后一个，或硬编码 LH2609。"""
+    active = get_active_contracts()
+    best_ct, best_vol = None, 0
+    for ct in active:
+        cp = _csv_path(ct)
+        if not cp.exists():
+            continue
+        try:
+            df = pd.read_csv(cp, usecols=["volume"])
+            if df.empty or "volume" not in df.columns:
+                continue
+            recent_vol = df["volume"].tail(20).mean()
+            if recent_vol > best_vol:
+                best_vol, best_ct = recent_vol, ct
+        except Exception:
+            continue
+    return best_ct or (active[-1] if active else "LH2609")
+
+
 def get_latest_futures_date() -> Optional[str]:
     latest = None
     for f in FUTURES_DIR.glob("LH*.csv"):
@@ -671,6 +693,7 @@ def get_spot_data_date() -> str:
 def _to_ton(p: float) -> float:
     return float(p) * 1000
 
+@st.cache_data(ttl=3600, show_spinner=False)
 def calc_basis(ct: str, region: str, spot_df: pd.DataFrame, fut_df: pd.DataFrame) -> Optional[pd.DataFrame]:
     """basis = 现货(元/吨) − (期货收盘价 + 升贴水)"""
     if fut_df is None or fut_df.empty or spot_df is None or spot_df.empty: return None
@@ -901,10 +924,12 @@ def fig_calendar_comparison(series: Dict[str, pd.DataFrame], tmon: str, data_dat
             c, w, d = AVG_LINE_COLOR, AVG_LINE_WIDTH, AVG_LINE_DASH
         else:
             c, w, d = _contract_color_from_label(label), 2, "solid"
+        # ★ 从 label 提取合约代码用于点击联动（格式如 "2409 (2024) 全国均价" → LH2409）
+        ct_code = "LH" + label[:4] if len(label) >= 4 else ""
         fig.add_trace(go.Scatter(x=df["plot_date"], y=df["basis"], mode="lines", name=label,
             line=dict(color=c, width=w, dash=d),
-            hovertemplate=f"<b>{label}</b><br>%{{customdata}}<br>基差：%{{y:+,}}元/吨<extra></extra>",
-            customdata=[_cn_md(r["plot_date"]) for _,r in df.iterrows()]))
+            hovertemplate=f"<b>{label}</b><br>%{{customdata[1]}}<br>基差：%{{y:+,}}元/吨<extra></extra>",
+            customdata=[[ct_code, _cn_md(r["plot_date"])] for _,r in df.iterrows()]))
     fig.add_hline(y=0, line_dash="dash", line_color="gray", opacity=0.5)
     title = f"{tmon}月合约基差季节图（同比 — 自然日对齐）"
     if data_date: title += f"<br><sup>📡 期货数据来源：akshare，数据日期：{data_date}</sup>"
@@ -914,6 +939,56 @@ def fig_calendar_comparison(series: Dict[str, pd.DataFrame], tmon: str, data_dat
     fig.update_xaxes(tickformat="%m-%d", dtick="M1", range=["2020-01-01","2020-12-31"])
     fig.update_yaxes(autorange=True)
     return fig
+
+
+def _make_spot_futures_chart(ct: str, spot_dict: dict) -> go.Figure:
+    """双轴图：左轴现货价格（元/公斤），右轴期货收盘价（元/吨）。
+    用于 Tab3 点击合约线时联动展示。"""
+    fut_df, _ = load_futures(ct)
+    if fut_df is None or fut_df.empty:
+        return go.Figure()
+
+    df = fut_df.sort_values("date").reset_index(drop=True)
+    fig = go.Figure()
+
+    # 期货收盘价（右轴，红色）
+    fig.add_trace(go.Scatter(
+        x=df["date"], y=df["close"],
+        name=f"{ct} 期货收盘价", mode="lines",
+        line=dict(color="#E74C3C", width=2),
+        yaxis="y2",
+        hovertemplate="<b>%{x|%Y年%m月%d日}</b><br>期货：%{y:.0f}元/吨<extra></extra>"
+    ))
+
+    # 现货 — 全国均价（左轴，绿色）
+    national_spot = spot_dict.get("全国均价")
+    if national_spot is not None and "date" in national_spot.columns:
+        merged = df[["date", "close"]].merge(
+            national_spot[["date", "price"]], on="date", how="inner"
+        )
+        if not merged.empty:
+            fig.add_trace(go.Scatter(
+                x=merged["date"], y=merged["price"],
+                name="现货（全国均价）", mode="lines",
+                line=dict(color="#27AE60", width=2),
+                yaxis="y",
+                hovertemplate="<b>%{x|%Y年%m月%d日}</b><br>现货：%{y:.2f}元/公斤<extra></extra>"
+            ))
+
+    fig.update_layout(
+        title=f"{ct} 现货与期货价格走势",
+        xaxis=dict(title="日期", tickformat="%Y年%m月"),
+        yaxis=dict(title="现货价格（元/公斤）", side="left", showgrid=True),
+        yaxis2=dict(title="期货收盘价（元/吨）", side="right", overlaying="y", showgrid=False),
+        template="plotly_white", height=350,
+        hovermode="x unified",
+        legend=dict(orientation="h", y=1.02, x=0),
+        margin=dict(t=50, b=30, l=60, r=60),
+    )
+    fig.update_xaxes(rangeslider_visible=True)
+    fig.update_yaxes(autorange=True)
+    return fig
+
 
 def fig_delivery_comparison(series: Dict[str, pd.DataFrame], data_date: str = "") -> go.Figure:
     if not series: return go.Figure()
@@ -1565,12 +1640,13 @@ def tab3():
     col_ctrl, col_chart = st.columns([1, 3.5])
 
     with col_ctrl:
-        # 合约多选：列出所有合约（含历史），默认选中当前上市合约
-        st.caption(f"🔍 目前已识别 **{len(active_cts)}** 个上市合约（默认选中），可手动添加历史合约对比")
-        default_t3 = [c for c in active_cts if c in ALL_CONTRACTS]
+        # ★ 默认选中主力合约，自动对比所有同月历史合约
+        main_ct = get_main_contract()
+        st.caption(f"🔍 主力合约：**{ct_display(main_ct)}** ｜ 已自动加载所有同月历史合约进行对比")
+        default_t3 = [main_ct] if main_ct in ALL_CONTRACTS else [c for c in active_cts if c in ALL_CONTRACTS]
         contracts = st.multiselect("📋 合约选择（多选）", options=ALL_CONTRACTS, default=default_t3,
             format_func=ct_display, key="t3_ct")
-        if not contracts: contracts = [active_cts[-1] if active_cts else ALL_CONTRACTS[-1]]
+        if not contracts: contracts = [main_ct if main_ct in ALL_CONTRACTS else active_cts[-1] if active_cts else ALL_CONTRACTS[-1]]
 
         mode = st.selectbox("🔄 比较模式", options=["同比（自然日对齐）","距离交易日对齐"], key="t3_mode")
 
@@ -1611,61 +1687,42 @@ def _tab3_calendar(contracts, spot_dict, ref_regions, sel_items, data_date, acti
     st.info(info_msg)
 
     series: Dict[str, pd.DataFrame] = {}
-    # ★ 修复：用 (month, day) 聚合，避免闰年/非闰年 doy 混乱
-    md_collectors: Dict[str, Dict[Tuple[int, int], List[int]]] = defaultdict(lambda: defaultdict(list))
-
-    for sel_item in sel_items:
-        is_national = "全国均价" in sel_item
-        is_max = "最大基差" in sel_item
-        is_min = "最小基差" in sel_item
-        is_avg = "基差平均值" in sel_item
-        is_region = sel_item in ref_regions
-
-        if is_national: item_short = "全国均价"
-        elif is_max: item_short = "最大"
-        elif is_min: item_short = "最小"
-        elif is_avg: item_short = "均值"
-        else: item_short = sel_item
-
-        for c in avail:
-            fut_df, _ = load_futures(c)
-            if fut_df is None or fut_df.empty: continue
-            fut_df = fut_df.sort_values("date").reset_index(drop=True)
-            df_basis = None
-            if is_region and sel_item in spot_dict:
-                df_basis = calc_basis(c, sel_item, spot_dict[sel_item], fut_df)
-            elif is_national:
-                df_basis = calc_national_basis(spot_dict, fut_df)
-            elif is_max:
-                _, mx, _, _ = get_summary_series(c, spot_dict, fut_df, ref_regions); df_basis = mx
-            elif is_min:
-                _, _, mn, _ = get_summary_series(c, spot_dict, fut_df, ref_regions); df_basis = mn
-            elif is_avg:
-                _, _, _, av = get_summary_series(c, spot_dict, fut_df, ref_regions); df_basis = av
-            if df_basis is None or df_basis.empty: continue
-            df_basis["year"] = df_basis["date"].dt.year
-            df_basis["doy"] = df_basis["date"].dt.dayofyear
-            # ★ 修复：传入 source_year，正确处理闰年/非闰年
-            df_basis["plot_date"] = df_basis.apply(
-                lambda r: _doy_to_date(int(r["doy"]), int(r["year"])), axis=1)
-            for yr, grp in df_basis.groupby("year"):
-                grp = grp.sort_values("doy").copy()
-                label = _make_trace_label(c, yr, item_short)
-                series[label] = grp
-                for _, row in grp.iterrows():
-                    md_collectors[item_short][(row["date"].month, row["date"].day)].append(row["basis"])
+    # ★ 使用缓存批量计算基差序列（性能优化 — 避免重复 load_futures / calc_basis）
+    shash = _spot_hash(spot_dict)
+    series = _build_calendar_series_cached(
+        tuple(avail), tuple(sel_items), shash, tuple(ref_regions)
+    )
 
     if not series: st.warning("⚠️ 无可用数据"); return
 
-    # ★ 修复：每个 item 一条历史均值线，用 (month, day) 构造正确的 plot_date
-    for item_short, mdc in md_collectors.items():
-        avg_rows = [{"doy": m*100+d, "basis": int(round(np.mean(v))),
-                      "plot_date": pd.Timestamp(year=2020, month=m, day=d)}
-                    for (m, d), v in sorted(mdc.items()) if v]
-        if avg_rows:
-            series[f"历史均值-{item_short}"] = pd.DataFrame(avg_rows).sort_values("doy")
+    fig = fig_calendar_comparison(series, tmon, data_date)
+    # ★ 点击联动：选中某条合约线时展示该合约的现货+期货价格双轴图
+    sel_event = st.plotly_chart(fig, use_container_width=True, on_select="rerun",
+                                selection_mode="points", key="t3_calendar")
 
-    st.plotly_chart(fig_calendar_comparison(series, tmon, data_date), use_container_width=True)
+    _clicked_ct = None
+    if sel_event and sel_event.selection and sel_event.selection.points:
+        pt = sel_event.selection.points[0]
+        # customdata 格式: [contract_code, formatted_date]
+        cd = pt.get("customdata", None)
+        if cd and isinstance(cd, (list, tuple)) and len(cd) >= 1:
+            _clicked_ct = str(cd[0]) if cd[0] else None
+        # Fallback: 从 curve_number 反查 trace label
+        if not _clicked_ct and "curve_number" in pt:
+            cn = pt["curve_number"]
+            labels = [l for l in series.keys() if "历史均值" not in l]
+            if 0 <= cn < len(labels):
+                lbl = labels[cn]
+                _clicked_ct = "LH" + lbl[:4] if len(lbl) >= 4 else None
+
+    if _clicked_ct:
+        st.markdown(f"---")
+        st.markdown(f"### 📈 {_clicked_ct} 现货与期货价格走势")
+        fig_sf = _make_spot_futures_chart(_clicked_ct, spot_dict)
+        if fig_sf.data:
+            st.plotly_chart(fig_sf, use_container_width=True)
+        else:
+            st.caption(f"⚠️ 无法加载 {_clicked_ct} 的现货/期货数据")
 
     # ── 自动结论（仅针对用户选择的合约）──
     result = _gen_tab3_conclusion_calendar(series, tmon, sel_items, contracts)
@@ -2134,7 +2191,8 @@ def tab5():
 
             # ── 正指/反指 动向结论（使用与季节性持仓一致的 display_conclusion 卡片） ──
             def _analyze_direction(name: str, lc: int, sc: int, is_zhengzhi: bool) -> str:
-                """根据多空变化判断方向意图，返回分析文字"""
+                """根据多空变化判断方向意图，返回分析文字。
+                正指和反指均直接描述实际行为，不反转方向。"""
                 parts = []
                 if lc > 0: parts.append(f"加多+{lc:,}")
                 elif lc < 0: parts.append(f"减多{lc:,}")
@@ -2142,13 +2200,13 @@ def tab5():
                 elif sc < 0: parts.append(f"减空{sc:,}")
                 action = "、".join(parts) if parts else "持仓不变"
 
-                # 判断方向
+                # 判断方向（正指和反指统一逻辑，直接描述实际操作方向）
                 if lc > 0 and sc < 0:
-                    intent = "看多" if is_zhengzhi else "看空"
-                    detail = "加多减空，主动做多" if is_zhengzhi else "加多减空，但反指行为暗示行情偏空"
+                    intent = "看多"
+                    detail = "加多减空"
                 elif lc < 0 and sc > 0:
-                    intent = "看空" if is_zhengzhi else "看多"
-                    detail = "减多加空，主动做空" if is_zhengzhi else "减多加空，但反指行为暗示行情偏多"
+                    intent = "看空"
+                    detail = "减多加空"
                 elif lc > 0 and sc > 0:
                     intent = "多空分歧"
                     detail = "双向加仓，方向不明确"
@@ -2160,7 +2218,7 @@ def tab5():
                     detail = "持仓变化不大"
 
                 tag = "🟢正指" if is_zhengzhi else "🔴反指"
-                return f"{tag} {name}：{action} → {intent}（{detail}）"
+                return f"{tag} {name}：{action} → {detail}（{intent}）"
 
             zhengzhi_found = []
             fanzhi_found = []
@@ -2176,35 +2234,42 @@ def tab5():
             if zhengzhi_found or fanzhi_found:
                 conclusion_items = []
                 zz_bull = zz_bear = fz_bull = fz_bear = 0
+                zz_dir = ""  # 正指方向总结
+                fz_dir = ""  # 反指方向总结
 
                 if zhengzhi_found:
-                    conclusion_items.append("🟢 正指席位（国泰君安、中粮期货、东证期货 — 方向与行情一致）")
+                    zz_lines = []
                     for co, lc, sc, _ in zhengzhi_found:
                         line = _analyze_direction(co, lc, sc, True)
-                        conclusion_items.append(f"• {line}")
+                        zz_lines.append(f"• {line}")
                         if "看多" in line: zz_bull += 1
                         elif "看空" in line: zz_bear += 1
+                    zz_dir = "看多" if zz_bull > zz_bear else ("看空" if zz_bear > zz_bull else "中性")
+                    conclusion_items.append(f"🟢 正指：{zz_dir}（{'、'.join(l.replace('🟢正指 ','').split('：')[0] for l in zz_lines)}）")
 
                 if fanzhi_found:
-                    conclusion_items.append("🔴 反指席位（东方财富、徽商期货、平安期货 — 方向与行情相反）")
+                    fz_lines = []
                     for co, lc, sc, _ in fanzhi_found:
                         line = _analyze_direction(co, lc, sc, False)
-                        conclusion_items.append(f"• {line}")
+                        fz_lines.append(f"• {line}")
                         if "看多" in line: fz_bull += 1
                         elif "看空" in line: fz_bear += 1
+                    fz_dir = "看多" if fz_bull > fz_bear else ("看空" if fz_bear > fz_bull else "中性")
+                    conclusion_items.append(f"🔴 反指：{fz_dir}（{'、'.join(l.replace('🔴反指 ','').split('：')[0] for l in fz_lines)}）")
 
-                # 综合判断
-                bull_score = zz_bull + fz_bear
-                bear_score = zz_bear + fz_bull
+                # 综合判断（正指反指不再反转，直接统计方向）
+                bull_score = zz_bull + fz_bull
+                bear_score = zz_bear + fz_bear
                 if bull_score > bear_score:
                     overall_sentiment = "bullish"
-                    conclusion_items.append(f"• 综合判断：🐂 偏多 — 正指做多（{zz_bull}家）+ 反指看空（{fz_bear}家），方向一致性较强")
+                    judgment = f"🐂 偏多"
                 elif bear_score > bull_score:
                     overall_sentiment = "bearish"
-                    conclusion_items.append(f"• 综合判断：🐻 偏空 — 正指做空（{zz_bear}家）+ 反指看多（{fz_bull}家），方向一致性较强")
+                    judgment = f"🐻 偏空"
                 else:
                     overall_sentiment = "neutral"
-                    conclusion_items.append(f"• 综合判断：⚖️ 方向分歧 — 正指和反指信号不一致，市场缺乏明确方向")
+                    judgment = f"⚖️ 方向分歧"
+                conclusion_items.append(f"• 综合判断：{judgment} — 正指{zz_dir}，反指{fz_dir}")
 
                 display_conclusion("🔍 关键席位动向分析", conclusion_items, overall_sentiment)
 
@@ -2467,59 +2532,11 @@ def tab6():
         if len(available_cts) < 1:
             st.warning(f"⚠️ 暂无可用的 {sel_month} 月合约"); return
 
-        # ── 收集各合约的成交量和持仓量数据 ──
-        vol_data: Dict[str, pd.DataFrame] = {}
-        oi_data: Dict[str, pd.DataFrame] = {}
-        vol_collector = defaultdict(list)   # (month, day) → [values]
-        oi_collector = defaultdict(list)
-
-        for c in available_cts:
-            df, _ = load_futures(c)
-            if df is None or df.empty: continue
-            df = df.sort_values("date").copy()
-            df = df[(df["date"] >= pd.to_datetime(sd)) & (df["date"] <= pd.to_datetime(ed))]
-            if df.empty: continue
-            df["plot_date"] = [pd.Timestamp(year=2020, month=d.month, day=d.day) for d in df["date"]]
-            df["trade_year"] = df["date"].dt.year
-
-            for trade_yr, grp in df.groupby("trade_year"):
-                grp = grp.sort_values("date")
-                cy = ct_year(c)
-                ty_str = str(trade_yr)
-                label = f"{c[2:]} ({ty_str})"
-                if "volume" in grp.columns:
-                    vol_data[label] = pd.DataFrame({
-                        "plot_date": grp["plot_date"].values,
-                        "volume": grp["volume"].values,
-                        "date": grp["date"].values,
-                    }).sort_values("plot_date")
-                oi_col = "open_interest" if "open_interest" in grp.columns else ("hold" if "hold" in grp.columns else None)
-                if oi_col:
-                    oi_data[label] = pd.DataFrame({
-                        "plot_date": grp["plot_date"].values,
-                        "open_interest": grp[oi_col].values,
-                        "date": grp["date"].values,
-                    }).sort_values("plot_date")
-                for _, row in grp.iterrows():
-                    md = (row["date"].month, row["date"].day)
-                    if "volume" in grp.columns:
-                        vol_collector[md].append(int(row["volume"]))
-                    if oi_col:
-                        oi_collector[md].append(int(row[oi_col]))
-
-        # ── 历史均值 ──
-        if vol_collector:
-            avg_vol_rows = [{"plot_date": pd.Timestamp(year=2020, month=m, day=d),
-                             "volume": int(np.mean(v))}
-                            for (m, d), v in sorted(vol_collector.items()) if v]
-            if avg_vol_rows:
-                vol_data["历史均值"] = pd.DataFrame(avg_vol_rows).sort_values("plot_date")
-        if oi_collector:
-            avg_oi_rows = [{"plot_date": pd.Timestamp(year=2020, month=m, day=d),
-                            "open_interest": int(np.mean(v))}
-                           for (m, d), v in sorted(oi_collector.items()) if v]
-            if avg_oi_rows:
-                oi_data["历史均值"] = pd.DataFrame(avg_oi_rows).sort_values("plot_date")
+        # ── 收集各合约的成交量和持仓量数据（缓存加速）──
+        shash = _spot_hash(spot_dict) if spot_dict else 0
+        vol_data, oi_data, net_data_full = _build_vol_oi_seasonal_cached(
+            tuple(available_cts), str(sd), str(ed), shash
+        )
 
         # ── 图1：成交量季节性对比 ──
         st.markdown("#### 📊 成交量季节性对比")
@@ -2598,34 +2615,19 @@ def tab6():
             st.warning("⚠️ 无持仓量数据")
 
         # ── 图3：前20净持仓季节性对比 ──
+        # net_data_full 已由 _build_vol_oi_seasonal_cached 缓存返回，只需按日期范围筛选
         st.markdown("#### 🏢 前20净持仓季节性对比")
 
-        # ★ 自动后台下载：检查缺失的聚合文件，无需手动点击按钮
-        missing_agg = [c for c in available_cts if not _net_agg_path(c).exists()]
-        if missing_agg:
-            with st.spinner(f"📡 正在自动下载 {len(missing_agg)} 个合约的前20净持仓数据（首次约 1~3 分钟）…"):
-                progress_bar = st.progress(0, text="准备下载…")
-                for i, c in enumerate(missing_agg):
-                    progress_bar.progress(
-                        (i + 1) / len(missing_agg),
-                        text=f"⏳ {i+1}/{len(missing_agg)} 正在下载 {c} 全量历史数据…"
-                    )
-                    _ensure_net_cache(c)
-                progress_bar.empty()
-                _build_seasonal_net_positions.clear()
-
-        with st.spinner("🔄 加载前20净持仓数据…"):
-            net_data_full, _ = _build_seasonal_net_positions(tuple(available_cts), sel_month)
-            net_data: Dict[str, pd.DataFrame] = {}
-            if net_data_full:
-                ref_start = pd.Timestamp(year=2020, month=sd.month, day=sd.day)
-                ref_end = pd.Timestamp(year=2020, month=ed.month, day=ed.day)
-                for label, ndf in net_data_full.items():
-                    if ndf.empty: continue
-                    mask = (ndf["plot_date"] >= ref_start) & (ndf["plot_date"] <= ref_end)
-                    fdf = ndf[mask]
-                    if not fdf.empty:
-                        net_data[label] = fdf
+        net_data: Dict[str, pd.DataFrame] = {}
+        if net_data_full:
+            ref_start = pd.Timestamp(year=2020, month=sd.month, day=sd.day)
+            ref_end = pd.Timestamp(year=2020, month=ed.month, day=ed.day)
+            for label, ndf in net_data_full.items():
+                if ndf.empty: continue
+                mask = (ndf["plot_date"] >= ref_start) & (ndf["plot_date"] <= ref_end)
+                fdf = ndf[mask]
+                if not fdf.empty:
+                    net_data[label] = fdf
 
         if net_data:
             fig_net = go.Figure()
@@ -2965,26 +2967,50 @@ def _build_seasonal_net_positions(contracts: Tuple[str, ...], sel_month: str) ->
         if agg_df is None or agg_df.empty:
             _ensure_net_cache(c)                   # 无本地数据，当场下载（首次慢，之后秒读）
             agg_df = _load_aggregated_net(c)
+
+        # ★ 净持仓聚合为空 → fallback 用期货持仓量 (open_interest)
         if agg_df is None or agg_df.empty:
-            continue
+            fut_df, _ = load_futures(c)
+            if fut_df is None or fut_df.empty:
+                continue
+            oi_col = "open_interest" if "open_interest" in fut_df.columns else ("hold" if "hold" in fut_df.columns else None)
+            if oi_col is None:
+                continue
+            fut_df = fut_df.sort_values("date").copy()
+            fut_df["plot_date"] = [pd.Timestamp(year=2020, month=d.month, day=d.day)
+                                   for d in fut_df["date"]]
+            fut_df["trade_year"] = fut_df["date"].dt.year
+            for trade_yr, grp in fut_df.groupby("trade_year"):
+                grp = grp.sort_values("plot_date")
+                ty_str = str(trade_yr)
+                label = f"{c[2:]} ({ty_str}) [OI近似]"
+                net_data[label] = pd.DataFrame({
+                    "plot_date": grp["plot_date"].values,
+                    "net_position": grp[oi_col].values,
+                }).sort_values("plot_date")
+                for _, row in grp.iterrows():
+                    md = (row["date"].month, row["date"].day)
+                    v = row[oi_col]
+                    if v is not None and not pd.isna(v):
+                        net_collector[md].append(int(v))
+        else:
+            agg_df["plot_date"] = [pd.Timestamp(year=2020, month=d.month, day=d.day)
+                                   for d in agg_df["date"]]
+            agg_df["trade_year"] = agg_df["date"].dt.year
 
-        agg_df["plot_date"] = [pd.Timestamp(year=2020, month=d.month, day=d.day)
-                               for d in agg_df["date"]]
-        agg_df["trade_year"] = agg_df["date"].dt.year
-
-        for trade_yr, grp in agg_df.groupby("trade_year"):
-            grp = grp.sort_values("plot_date")
-            ty_str = str(trade_yr)
-            label = f"{c[2:]} ({ty_str})"
-            net_data[label] = pd.DataFrame({
-                "plot_date": grp["plot_date"].values,
-                "net_position": grp["net_position"].values,
-            }).sort_values("plot_date")
-            for _, row in grp.iterrows():
-                md = (row["date"].month, row["date"].day)
-                v = row["net_position"]
-                if v is not None and not pd.isna(v):
-                    net_collector[md].append(int(v))
+            for trade_yr, grp in agg_df.groupby("trade_year"):
+                grp = grp.sort_values("plot_date")
+                ty_str = str(trade_yr)
+                label = f"{c[2:]} ({ty_str})"
+                net_data[label] = pd.DataFrame({
+                    "plot_date": grp["plot_date"].values,
+                    "net_position": grp["net_position"].values,
+                }).sort_values("plot_date")
+                for _, row in grp.iterrows():
+                    md = (row["date"].month, row["date"].day)
+                    v = row["net_position"]
+                    if v is not None and not pd.isna(v):
+                        net_collector[md].append(int(v))
 
     if net_collector:
         avg_rows = [{"plot_date": pd.Timestamp(year=2020, month=m, day=d),
@@ -2994,6 +3020,164 @@ def _build_seasonal_net_positions(contracts: Tuple[str, ...], sel_month: str) ->
             net_data["历史均值"] = pd.DataFrame(avg_rows).sort_values("plot_date")
 
     return net_data, net_collector
+
+
+# ══════════════════════════════════════════════════════════════
+# 性能优化：缓存批量计算
+# ══════════════════════════════════════════════════════════════
+
+def _spot_hash(spot_dict: dict) -> int:
+    """生成 spot_dict 的轻量哈希，用于缓存 key"""
+    items = []
+    for k in sorted(spot_dict.keys()):
+        df = spot_dict[k]
+        items.append((k, len(df), float(df["price"].sum()) if not df.empty else 0.0))
+    return hash(tuple(items))
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def _build_calendar_series_cached(
+    avail_tuple: Tuple[str, ...],
+    sel_items_tuple: Tuple[str, ...],
+    spot_hash_key: int,
+    ref_regions_tuple: Tuple[str, ...],
+) -> Dict[str, pd.DataFrame]:
+    """缓存 Tab3 同比模式的 series 构建（最耗时的部分）。
+    输入全部转为可哈希类型，spot_dict 通过 spot_hash_key 标识版本。"""
+    # 重新加载 spot_dict（从缓存 key 匹配确保一致性）
+    spot_dict, _ = load_spot(str(SPOT_PATH))
+    avail = list(avail_tuple)
+    sel_items = list(sel_items_tuple)
+    ref_regions = list(ref_regions_tuple)
+
+    series: Dict[str, pd.DataFrame] = {}
+    md_collectors: Dict[str, Dict[Tuple[int, int], List[int]]] = defaultdict(lambda: defaultdict(list))
+
+    for sel_item in sel_items:
+        is_national = "全国均价" in sel_item
+        is_max = "最大基差" in sel_item
+        is_min = "最小基差" in sel_item
+        is_avg = "基差平均值" in sel_item
+        is_region = sel_item in ref_regions
+
+        if is_national: item_short = "全国均价"
+        elif is_max: item_short = "最大"
+        elif is_min: item_short = "最小"
+        elif is_avg: item_short = "均值"
+        else: item_short = sel_item
+
+        for c in avail:
+            fut_df, _ = load_futures(c)
+            if fut_df is None or fut_df.empty: continue
+            fut_df = fut_df.sort_values("date").reset_index(drop=True)
+            df_basis = None
+            if is_region and sel_item in spot_dict:
+                df_basis = calc_basis(c, sel_item, spot_dict[sel_item], fut_df)
+            elif is_national:
+                df_basis = calc_national_basis(spot_dict, fut_df)
+            elif is_max:
+                _, mx, _, _ = get_summary_series(c, spot_dict, fut_df, ref_regions); df_basis = mx
+            elif is_min:
+                _, _, mn, _ = get_summary_series(c, spot_dict, fut_df, ref_regions); df_basis = mn
+            elif is_avg:
+                _, _, _, av = get_summary_series(c, spot_dict, fut_df, ref_regions); df_basis = av
+            if df_basis is None or df_basis.empty: continue
+            df_basis["year"] = df_basis["date"].dt.year
+            df_basis["doy"] = df_basis["date"].dt.dayofyear
+            df_basis["plot_date"] = df_basis.apply(
+                lambda r: _doy_to_date(int(r["doy"]), int(r["year"])), axis=1)
+            for yr, grp in df_basis.groupby("year"):
+                grp = grp.sort_values("doy").copy()
+                label = _make_trace_label(c, yr, item_short)
+                series[label] = grp
+                for _, row in grp.iterrows():
+                    md_collectors[item_short][(row["date"].month, row["date"].day)].append(row["basis"])
+
+    # 历史均值线
+    for item_short, mdc in md_collectors.items():
+        avg_rows = [{"doy": m*100+d, "basis": int(round(np.mean(v))),
+                      "plot_date": pd.Timestamp(year=2020, month=m, day=d)}
+                    for (m, d), v in sorted(mdc.items()) if v]
+        if avg_rows:
+            series[f"历史均值-{item_short}"] = pd.DataFrame(avg_rows).sort_values("doy")
+
+    return series
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def _build_vol_oi_seasonal_cached(
+    contracts_tuple: Tuple[str, ...],
+    sd_str: str,
+    ed_str: str,
+    spot_hash_key: int,
+) -> Tuple[Dict[str, pd.DataFrame], Dict[str, pd.DataFrame], Dict[str, pd.DataFrame], Dict[str, pd.DataFrame]]:
+    """缓存 Tab6 的成交量/持仓量季节性数据构建。
+    返回 (vol_data, oi_data, net_data, all_available_cts_data)"""
+    contracts = list(contracts_tuple)
+    sd = pd.to_datetime(sd_str)
+    ed = pd.to_datetime(ed_str)
+    sel_month = ct_month(contracts[0]) if contracts else "09"
+
+    vol_data: Dict[str, pd.DataFrame] = {}
+    oi_data: Dict[str, pd.DataFrame] = {}
+    vol_collector = defaultdict(list)
+    oi_collector = defaultdict(list)
+
+    for c in contracts:
+        df, _ = load_futures(c)
+        if df is None or df.empty: continue
+        df = df.sort_values("date").copy()
+        df = df[(df["date"] >= sd) & (df["date"] <= ed)]
+        if df.empty: continue
+        df["plot_date"] = [pd.Timestamp(year=2020, month=d.month, day=d.day) for d in df["date"]]
+        df["trade_year"] = df["date"].dt.year
+
+        for trade_yr, grp in df.groupby("trade_year"):
+            grp = grp.sort_values("date")
+            ty_str = str(trade_yr)
+            label = f"{c[2:]} ({ty_str})"
+            if "volume" in grp.columns:
+                vol_data[label] = pd.DataFrame({
+                    "plot_date": grp["plot_date"].values,
+                    "volume": grp["volume"].values,
+                    "date": grp["date"].values,
+                }).sort_values("plot_date")
+            oi_col = "open_interest" if "open_interest" in grp.columns else ("hold" if "hold" in grp.columns else None)
+            if oi_col:
+                oi_data[label] = pd.DataFrame({
+                    "plot_date": grp["plot_date"].values,
+                    "open_interest": grp[oi_col].values,
+                    "date": grp["date"].values,
+                }).sort_values("plot_date")
+            for _, row in grp.iterrows():
+                md = (row["date"].month, row["date"].day)
+                if "volume" in grp.columns:
+                    vol_collector[md].append(int(row["volume"]))
+                if oi_col:
+                    oi_collector[md].append(int(row[oi_col]))
+
+    # 历史均值
+    avg_vol = pd.DataFrame()
+    avg_oi = pd.DataFrame()
+    if vol_collector:
+        avg_vol_rows = [{"plot_date": pd.Timestamp(year=2020, month=m, day=d),
+                         "volume": int(np.mean(v))}
+                        for (m, d), v in sorted(vol_collector.items()) if v]
+        if avg_vol_rows:
+            avg_vol = pd.DataFrame(avg_vol_rows).sort_values("plot_date")
+            vol_data["历史均值"] = avg_vol
+    if oi_collector:
+        avg_oi_rows = [{"plot_date": pd.Timestamp(year=2020, month=m, day=d),
+                        "open_interest": int(np.mean(v))}
+                       for (m, d), v in sorted(oi_collector.items()) if v]
+        if avg_oi_rows:
+            avg_oi = pd.DataFrame(avg_oi_rows).sort_values("plot_date")
+            oi_data["历史均值"] = avg_oi
+
+    # 净持仓数据
+    net_data_full, _ = _build_seasonal_net_positions(tuple(contracts), sel_month)
+
+    return vol_data, oi_data, net_data_full
 
 
 # ══════════════════════════════════════════════════════════════
