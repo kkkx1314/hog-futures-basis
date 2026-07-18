@@ -4644,14 +4644,14 @@ def _compute_key_spread(main_ct: str, ltd=None):
     历史同期均值 = 所有年份同月合约对在同月同日的价差均值。"""
     active = get_active_contracts()
     if len(active) < 2:
-        return "暂无足够合约计算价差"
+        return "暂无足够合约计算价差", ""
     try:
         ct_a = main_ct
         others = [c for c in active if ct_month(c) != ct_month(main_ct)]
         if not others:
             others = [c for c in active if c != ct_a]
         if not others:
-            return "暂无其他上市合约"
+            return "暂无其他上市合约", ""
         ct_b = others[0]
         ma, mb = ct_month(ct_a), ct_month(ct_b)
 
@@ -4718,11 +4718,11 @@ def _compute_key_spread(main_ct: str, ltd=None):
                 pos = f"处于历史同期均值附近（偏离{dev:+.0f}%）"
         else:
             return (f"{ct_a}-{ct_b} 价差 <b>{latest_spread:+,.0f}元/吨</b>"
-                    f"（{_cn(pd.Timestamp(latest_dt))}），暂无同月同日历史数据")
+                    f"（{_cn(pd.Timestamp(latest_dt))}），暂无同月同日历史数据", "")
 
         return (f"{ct_a}-{ct_b} 价差 <b>{latest_spread:+,.0f}元/吨</b>"
                 f"（{_cn(pd.Timestamp(latest_dt))}），"
-                f"历史同期均值 <b>{hist_avg:+,.0f}元/吨</b>，{pos}")
+                f"历史同期均值 <b>{hist_avg:+,.0f}元/吨</b>，{pos}", _cn(pd.Timestamp(latest_dt)))
     except Exception as e:
         return f"价差计算异常: {e}", ""
 
