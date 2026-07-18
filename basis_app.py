@@ -3775,9 +3775,156 @@ def tab7():
 # Tab 1：每日期货分析日报
 # ══════════════════════════════════════════════════════════════
 
+def _analyze_basis_historical(main_ct, spot_dict, fut_df, ltd, regions, snap) -> dict:
+    """分析基差各指标的历史分位水平。
+    返回 {indicator: {current, hist_avg, hist_pct, label, hist_count}}"""
+    result = {}
+    if fut_df is None or fut_df.empty:
+        return result
+
+    fc = float(fut_df[fut_df["date"] == ltd]["close"].iloc[0])
+    target_m, target_d = ltd.month, ltd.day
+
+    # 构建历史基差序列：对每个指标，收集所有年份同月同日的数据
+    indicators = {
+        "全国均价基差": {"current": snap.get("national_avg", 0)},
+        "最大基差": {"current": snap.get("max_basis", 0), "region": snap.get("max_region", "")},
+        "最小基差": {"current": snap.get("min_basis", 0), "region": snap.get("min_region", "")},
+        "基差均值": {"current": snap.get("avg_basis", 0)},
+    }
+
+    # 收集所有同月合约的历史基差数据
+    tmon = ct_month(main_ct)
+    same_month_cts = [c for c in ALL_CONTRACTS if ct_month(c) == tmon]
+    for indicator, info in indicators.items():
+        hist_vals = []
+        for c in same_month_cts:
+            if c == main_ct:
+                continue  # 跳过自己
+            fdf, _ = load_futures(c)
+            if fdf is None or fdf.empty:
+                continue
+            row = fdf[fdf["date"].dt.month == target_m]
+            row = row[row["date"].dt.day == target_d]
+            if row.empty:
+                continue
+            fc_hist = float(row["close"].iloc[0])
+            # 计算该合约该日的基差指标
+            try:
+                c_regions = get_regions(c)
+                c_snap = compute_snapshot(c, spot_dict, fdf, row["date"].iloc[0], c_regions)
+                if c_snap:
+                    if indicator == "全国均价基差":
+                        hist_vals.append(c_snap.get("national_avg", 0))
+                    elif indicator == "最大基差":
+                        hist_vals.append(c_snap.get("max_basis", 0))
+                    elif indicator == "最小基差":
+                        hist_vals.append(c_snap.get("min_basis", 0))
+                    elif indicator == "基差均值":
+                        hist_vals.append(c_snap.get("avg_basis", 0))
+            except Exception:
+                continue
+
+        cur = info["current"]
+        if hist_vals and len(hist_vals) >= 1:
+            hist_avg = int(np.mean(hist_vals))
+            # 计算当前值在历史中的分位
+            sorted_vals = sorted(hist_vals)
+            rank = sum(1 for v in sorted_vals if v < cur)
+            pct = rank / len(sorted_vals) * 100
+
+            if pct >= 80:
+                level = "历史偏高水平"
+            elif pct <= 20:
+                level = "历史偏低水平"
+            else:
+                level = "历史均值附近"
+
+            result[indicator] = {
+                "current": cur,
+                "hist_avg": hist_avg,
+                "hist_count": len(hist_vals),
+                "pct": pct,
+                "level": level,
+            }
+        else:
+            result[indicator] = {
+                "current": cur,
+                "hist_avg": None,
+                "hist_count": 0,
+                "pct": None,
+                "level": "暂无历史数据",
+            }
+
+    return result
+
+
+def _build_basis_analysis_html(snap, basis_enhanced, na_basis, max_region, max_basis, min_region, min_basis):
+    """构建基差分析板块HTML，含历史分位"""
+    if not basis_enhanced:
+        return f"""全国均价基差 <b>{na_basis:+,}元/吨</b>。<br>
+最大基差：<b>{max_region}</b>（{max_basis:+,}元/吨）｜ 最小基差：<b>{min_region}</b>（{min_basis:+,}元/吨）。"""
+
+    be = basis_enhanced
+    parts = []
+
+    # 全国均价基差
+    na = be.get("全国均价基差", {})
+    if na:
+        na_cur = na.get("current", 0)
+        na_hist = na.get("hist_avg")
+        na_level = na.get("level", "")
+        na_pct = na.get("pct")
+        na_cnt = na.get("hist_count", 0)
+        if na_hist is not None and na_cnt >= 1:
+            tag_cls = "bull" if (na_pct and na_pct >= 80) else ("bear" if (na_pct and na_pct <= 20) else "neutral")
+            parts.append(f"全国均价基差 <b>{na_cur:+,}元/吨</b>，"
+                       f"历史同期均值 {na_hist:+,}元/吨（{na_cnt}年），"
+                       f"处于<span class=\"tag tag-{tag_cls}\">{na_level}</span>（分位{na_pct:.0f}%）")
+        else:
+            parts.append(f"全国均价基差 <b>{na_cur:+,}元/吨</b>（{na_level}）")
+
+    # 最大基差
+    mx = be.get("最大基差", {})
+    if mx:
+        mx_region = snap.get("max_region", "") if snap else ""
+        mx_cur = mx.get("current", 0)
+        mx_level = mx.get("level", "")
+        mx_pct = mx.get("pct")
+        pct_str = f"，分位{mx_pct:.0f}%" if mx_pct is not None else ""
+        parts.append(f"最大基差：<b>{mx_region} {mx_cur:+,}元/吨</b>（{mx_level}{pct_str}）")
+
+    # 最小基差
+    mn = be.get("最小基差", {})
+    if mn:
+        mn_region = snap.get("min_region", "") if snap else ""
+        mn_cur = mn.get("current", 0)
+        mn_level = mn.get("level", "")
+        mn_pct = mn.get("pct")
+        pct_str = f"，分位{mn_pct:.0f}%" if mn_pct is not None else ""
+        parts.append(f"最小基差：<b>{mn_region} {mn_cur:+,}元/吨</b>（{mn_level}{pct_str}）")
+
+    # 基差均值
+    avg = be.get("基差均值", {})
+    if avg:
+        avg_cur = avg.get("current", 0)
+        avg_level = avg.get("level", "")
+        avg_pct = avg.get("pct")
+        avg_hist = avg.get("hist_avg")
+        avg_cnt = avg.get("hist_count", 0)
+        if avg_hist is not None and avg_cnt >= 1:
+            pct_str = f"，分位{avg_pct:.0f}%" if avg_pct is not None else ""
+            parts.append(f"基差均值 <b>{avg_cur:+,}元/吨</b>，历史同期均值 {avg_hist:+,}元/吨（{avg_cnt}年）{pct_str}")
+        else:
+            parts.append(f"基差均值 <b>{avg_cur:+,}元/吨</b>（{avg_level}）")
+
+    return "<br>".join(f"• {p}" for p in parts) if parts else "基差数据暂不可用"
+
+
 def _build_daily_report_html(main_ct: str, fut_df, spot_dict, ltd, prev_td,
                               snap, holdings_analysis, key_spread_info,
-                              trend_direction, sr_lines_info, chart_images=None) -> str:
+                              trend_direction, sr_lines_info, chart_images=None,
+                              basis_enhanced=None) -> str:
     """构建日报 HTML 内容"""
     cn_date = _cn(ltd)
     cn_prev = _cn(prev_td) if prev_td else "前一交易日"
@@ -3876,6 +4023,9 @@ def _build_daily_report_html(main_ct: str, fut_df, spot_dict, ltd, prev_td,
 <img src="data:image/png;base64,{chart_images['spread_trend']}" style="width:100%;max-width:860px;" alt="价差走势">
 </div>'''
 
+    # ── 构建基差分析HTML（含历史分位）──
+    basis_analysis_html = _build_basis_analysis_html(snap, basis_enhanced, na_basis, max_region, max_basis, min_region, min_basis)
+
     # ── 构建 HTML ──
     html = f"""
 <!DOCTYPE html>
@@ -3917,7 +4067,7 @@ body {{ font-family: 'Microsoft YaHei', 'SimHei', sans-serif; background: #f5f6f
 
 <!-- 1. 市场概况 -->
 <div class="card">
-<h2><span class="icon">📊</span>市场概况 — {main_ct}</h2>
+<h2><span class="icon">📊</span>市场概况 — {main_ct}（{cn_date}）</h2>
 <div class="grid2">
 <div class="kv"><span class="k">收盘价</span><span class="v">{close_v:.0f} 元/吨</span></div>
 <div class="kv"><span class="k">涨跌幅</span><span class="v {chg_class}">{chg_sign}{chg:.0f} ({chg_sign}{chg_pct:.2f}%)</span></div>
@@ -3933,10 +4083,9 @@ body {{ font-family: 'Microsoft YaHei', 'SimHei', sans-serif; background: #f5f6f
 
 <!-- 2. 基差分析 -->
 <div class="card">
-<h2><span class="icon">📐</span>基差分析</h2>
-<p>
-全国均价基差 <b>{na_basis:+,}元/吨</b>，处于<span class="tag tag-{'bull' if basis_judge=='偏高' else ('bear' if basis_judge=='偏低' else 'neutral')}">{basis_judge}</span>水平。<br>
-基差最大区域：<b>{max_region}</b>（{max_basis:+,}元/吨）｜ 最小区域：<b>{min_region}</b>（{min_basis:+,}元/吨）。
+<h2><span class="icon">📐</span>基差分析（{cn_date}）</h2>
+<p style="font-size:0.92rem;line-height:1.9;">
+{basis_analysis_html}
 </p>
 </div>
 
@@ -3948,7 +4097,7 @@ body {{ font-family: 'Microsoft YaHei', 'SimHei', sans-serif; background: #f5f6f
 
 <!-- 4. 前20净持仓分析 -->
 <div class="card">
-<h2><span class="icon">🏢</span>前20净持仓分析</h2>
+<h2><span class="icon">🏢</span>前20净持仓分析（{ha.get('data_date', '—') if ha else '—'}）</h2>
 {pos_section}
 </div>
 
@@ -3977,7 +4126,7 @@ body {{ font-family: 'Microsoft YaHei', 'SimHei', sans-serif; background: #f5f6f
 
 def _build_daily_report_md(main_ct, fut_df, spot_dict, ltd, prev_td,
                             snap, holdings_analysis, key_spread_info,
-                            trend_direction, sr_lines_info) -> str:
+                            trend_direction, sr_lines_info, basis_enhanced=None) -> str:
     """构建日报 Markdown 内容"""
     cn_date = _cn(ltd)
     cn_prev = _cn(prev_td) if prev_td else "前一交易日"
@@ -4174,11 +4323,30 @@ def _compute_daily_report_cache(main_ct: str, spot_hash: int) -> dict:
     regions = get_regions(main_ct)
     snap = compute_snapshot(main_ct, spot_dict, fut_df, ltd_ts, regions)
 
-    # ── 持仓数据（真实的akshare数据，记录实际数据日期）──
+    # ── 持仓数据（如果API数据日期≠报告日期则不显示详情）──
     holdings_df, holdings_actual_date, holdings_source = _get_holdings(
         main_ct, ltd_ts, return_meta=True)
-    holdings_analysis = _analyze_holdings_for_report(
-        holdings_df, main_ct, ltd_ts, holdings_actual_date)
+    # 判断持仓数据是否与报告日期一致
+    holdings_date_match = False
+    try:
+        hdt = pd.to_datetime(holdings_actual_date, format="%Y%m%d")
+        if hdt.date() == ltd_ts.date():
+            holdings_date_match = True
+    except Exception:
+        pass
+    if holdings_date_match:
+        holdings_analysis = _analyze_holdings_for_report(
+            holdings_df, main_ct, ltd_ts, holdings_actual_date)
+    else:
+        holdings_analysis = {"available": False, "data_date": str(holdings_actual_date)[:8] if holdings_actual_date else _cn(ltd_ts),
+                            "total_long": 0, "total_short": 0, "net_pos": 0,
+                            "net_judge": "数据未更新",
+                            "zhengzhi_summary": "数据未更新",
+                            "fanzhi_summary": "数据未更新",
+                            "overall_judge": "数据未更新"}
+
+    # ── 增强基差分析：计算历史分位 ──
+    basis_enhanced = _analyze_basis_historical(main_ct, spot_dict, fut_df, ltd_ts, regions, snap)
 
     # ── 价差（使用期货数据日期）──
     spread_info = _compute_key_spread(main_ct, ltd_ts)
@@ -4192,10 +4360,10 @@ def _compute_daily_report_cache(main_ct: str, spot_hash: int) -> dict:
     # ── 构建HTML和MD ──
     html = _build_daily_report_html(main_ct, fut_df, spot_dict, ltd_ts, prev_td,
                                      snap, holdings_analysis, spread_info,
-                                     trend_dir, sr_info, chart_images)
+                                     trend_dir, sr_info, chart_images, basis_enhanced)
     md = _build_daily_report_md(main_ct, fut_df, spot_dict, ltd_ts, prev_td,
                                  snap, holdings_analysis, spread_info,
-                                 trend_dir, sr_info)
+                                 trend_dir, sr_info, basis_enhanced)
 
     return {"html": html, "md": md, "error": None,
             "ltd": ltd_ts, "cn_date": _cn(ltd_ts),
@@ -4402,7 +4570,7 @@ def _generate_report_charts(main_ct, spot_dict, ltd) -> dict:
 
 
 def _compute_key_spread(main_ct: str, ltd=None) -> str:
-    """计算主力合约与次主力合约的价差（使用指定交易日数据）"""
+    """计算主力合约与次主力合约的价差，使用历史同期（同月同日）均值对比"""
     active = get_active_contracts()
     if len(active) < 2:
         return "暂无足够合约计算价差"
@@ -4423,16 +4591,45 @@ def _compute_key_spread(main_ct: str, ltd=None) -> str:
         cm = sorted(ac.index.intersection(bc.index))
         if len(cm) == 0:
             return f"{ct_a}-{ct_b} 无共同交易日"
-        # 使用指定日期或最新共同日期
+
+        # 最新价差
         if ltd and ltd in ac.index and ltd in bc.index:
             latest_dt = ltd
         else:
             latest_dt = cm[-1]
         latest_spread = float(ac[latest_dt] - bc[latest_dt])
-        hist_spread = float((ac[cm] - bc[cm]).mean())
-        diff = latest_spread - hist_spread
-        label = "偏高" if diff > 200 else ("偏低" if diff < -200 else "中性")
-        return f"{ct_a}-{ct_b} 价差 <b>{latest_spread:+,.0f}元/吨</b>（{_cn(pd.Timestamp(latest_dt))}），历史均值 {hist_spread:+,.0f}元/吨，当前{label}"
+
+        # ★ 历史同期均值：相同月/日的所有年份平均
+        target_m, target_d = latest_dt.month, latest_dt.day
+        same_day_vals = []
+        for d in cm:
+            if d.month == target_m and d.day == target_d:
+                same_day_vals.append(float(ac[d] - bc[d]))
+        # Fallback: 如果同日期数据<2个，用近30天均值
+        if len(same_day_vals) >= 2:
+            hist_avg = float(np.mean(same_day_vals))
+            hist_label = f"历史同期（{len(same_day_vals)}年）均值"
+        else:
+            nearby = [d for d in cm if abs((d - pd.Timestamp(year=2020, month=target_m, day=target_d)).days) <= 15]
+            if nearby:
+                hist_avg = float(np.mean([float(ac[d] - bc[d]) for d in nearby]))
+                hist_label = f"近15日历史均值"
+            else:
+                hist_avg = float((ac[cm] - bc[cm]).mean())
+                hist_label = "全历史均值"
+
+        diff = latest_spread - hist_avg
+        if diff > 300:
+            label = "偏高"
+        elif diff < -300:
+            label = "偏低"
+        else:
+            label = "中性"
+
+        cn_dt = _cn(pd.Timestamp(latest_dt))
+        return (f"{ct_a}-{ct_b} 价差 <b>{latest_spread:+,.0f}元/吨</b>（{cn_dt}），"
+                f"{hist_label} <b>{hist_avg:+,.0f}元/吨</b>，"
+                f"偏离{abs(diff):.0f}元/吨，当前<span class=\"tag tag-{'bull' if diff > 300 else ('bear' if diff < -300 else 'neutral')}\">{label}</span>")
     except Exception as e:
         return f"价差计算异常: {e}"
 
