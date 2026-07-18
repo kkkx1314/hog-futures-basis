@@ -3741,15 +3741,26 @@ def main():
             placeholder.empty()
         st.session_state["_startup_all_synced"] = True
 
-    # ── 自动增量同步：每天下午 4 点后拉取一次最新期货数据（已是最新时秒过）──
+    # ── 自动增量同步：每天首次打开时快速检查并拉取最新期货数据 ──
     if "_last_auto_sync_date" not in st.session_state:
         st.session_state["_last_auto_sync_date"] = None
 
-    _now = datetime.now()
-    _today_str = _now.strftime("%Y%m%d")
-    if st.session_state["_last_auto_sync_date"] != _today_str and _now.hour >= 16:
+    _today_str = datetime.now().strftime("%Y%m%d")
+    if st.session_state["_last_auto_sync_date"] != _today_str:
+        # 只增量同步有期货 CSV 的活跃合约（已是最新时 <0.1s 秒过）
         for ct in get_active_contracts():
-            sync_futures(ct, force_full=False)  # 已是最新时秒过（<0.1s）
+            cp = _csv_path(ct)
+            if cp.exists():
+                try:
+                    df = pd.read_csv(cp, usecols=["date"])
+                    if not df.empty:
+                        last_date = pd.to_datetime(df["date"].max()).date()
+                        # 数据已经是今天或周末/假日（最近2天内）→ 跳过
+                        if last_date >= (datetime.now().date() - timedelta(days=2)):
+                            continue
+                except Exception:
+                    pass
+                sync_futures(ct, force_full=False)
         st.session_state["_last_auto_sync_date"] = _today_str
 
     # ── 七个 Tab ──
