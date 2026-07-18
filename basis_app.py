@@ -4310,7 +4310,7 @@ def _build_reportlab_pdf(html_content: str, cn_date: str, chart_images: dict = N
 
 
 # ★ 修改日报逻辑后递增此版本号，使旧缓存自动失效
-_DAILY_REPORT_VERSION = 5
+_DAILY_REPORT_VERSION = 6
 
 @st.cache_data(ttl=120, show_spinner=False)
 def _compute_daily_report_cache(main_ct: str, spot_hash: int, _version: int = 0) -> dict:
@@ -4857,7 +4857,6 @@ def tab_daily_report():
                 help="PDF库不可用，提供HTML格式（浏览器打开后可打印为PDF）"
             )
     with col_btn3:
-        # 下载整个日报为PNG图片（使用plotly图表合成）
         png_data = _compose_report_image(chart_images, cn_date, main_ct)
         if png_data:
             st.download_button(
@@ -4869,14 +4868,15 @@ def tab_daily_report():
                 key="dl_img"
             )
         else:
+            # 兜底：直接导出HTML
             st.download_button(
-                label="🖼️ 下载图片",
+                label="🖼️ 下载 HTML",
                 data=html.encode("utf-8"),
                 file_name=f"生猪期货日报_{cn_date.replace('年','').replace('月','').replace('日','')}.html",
                 mime="text/html",
                 use_container_width=True,
                 key="dl_img_fb",
-                help="图片生成库不可用，提供HTML格式"
+                help="图片生成失败，提供HTML（浏览器打开后可截图）"
             )
 
     # ── 渲染 HTML 日报（使用 components.html 避免 sanitizer 破坏样式）──
@@ -4901,64 +4901,128 @@ def _build_weasyprint_pdf(html: str, cn_date: str) -> Optional[bytes]:
 
 
 def _compose_report_image(chart_images: dict, cn_date: str, main_ct: str) -> Optional[bytes]:
-    """将图表合成为一张日报图片，使用PIL"""
+    """将日报图表生成为一张PNG图片。
+    方案1: 直接用plotly subplots组合所有图表（最可靠）
+    方案2: PIL拼接已有的chart_images PNG"""
+    import base64
+    from plotly.subplots import make_subplots
+
+    # ── 方案1: 用plotly直接生成组合图 ──
+    try:
+        figs_to_combine = []
+        titles = []
+
+        # 重建基差季节图
+        tmon = ct_month(main_ct)
+        same_month = [c for c in ALL_CONTRACTS if ct_month(c) == tmon]
+        avail = [c for c in same_month if load_futures(c)[0] is not None and not load_futures(c)[0].empty]
+        if len(avail) >= 2:
+            spot_dict, _ = load_spot(str(SPOT_PATH))
+            series = {}
+            md_collector = defaultdict(list)
+            for c in avail:
+                fdf, _ = load_futures(c)
+                na_df = calc_national_basis(spot_dict, fdf)
+                if na_df is None or na_df.empty:
+                    continue
+                na_df["year"] = na_df["date"].dt.year
+                na_df["doy"] = na_df["date"].dt.dayofyear
+                na_df["plot_date"] = na_df.apply(lambda r: _doy_to_date(int(r["doy"]), int(r["year"])), axis=1)
+                for yr, grp in na_df.groupby("year"):
+                    grp = grp.sort_values("doy").copy()
+                    series[_make_trace_label(c, yr, "全国均价")] = grp
+                    for _, row in grp.iterrows():
+                        md_collector[(row["date"].month, row["date"].day)].append(row["basis"])
+            if series:
+                avg_rows = [{"doy": m*100+d, "basis": int(round(np.mean(v))),
+                             "plot_date": pd.Timestamp(year=2020, month=m, day=d)}
+                            for (m, d), v in sorted(md_collector.items()) if v]
+                if avg_rows:
+                    series["历史均值"] = pd.DataFrame(avg_rows).sort_values("doy")
+                figs_to_combine.append(fig_calendar_comparison(series, tmon, ""))
+                titles.append(f"基差季节对比")
+
+        # 重建价差图
+        active = get_active_contracts()
+        others = [c for c in active if c != main_ct]
+        if others:
+            ct_b = others[0]
+            dfa, _ = load_futures(main_ct)
+            dfb, _ = load_futures(ct_b)
+            if dfa is not None and dfb is not None:
+                ac = dfa.set_index("date")["close"]
+                bc = dfb.set_index("date")["close"]
+                cm = sorted(ac.index.intersection(bc.index))
+                if len(cm) > 0:
+                    fig_sp = go.Figure()
+                    fig_sp.add_trace(go.Scatter(
+                        x=cm[-90:], y=[float(ac[d] - bc[d]) for d in cm[-90:]],
+                        mode="lines", name=f"{main_ct}-{ct_b}",
+                        line=dict(color="#E74C3C", width=2)))
+                    fig_sp.add_hline(y=0, line_dash="dash", line_color="gray", opacity=0.3)
+                    fig_sp.update_layout(
+                        title=f"{main_ct}-{ct_b} 价差走势（近90日）",
+                        xaxis=dict(tickformat="%m-%d"), yaxis=dict(title="价差"),
+                        template="plotly_white", height=350, margin=dict(t=50, b=40, l=50, r=20))
+                    figs_to_combine.append(fig_sp)
+                    titles.append("价差走势")
+
+        if figs_to_combine:
+            # 组合为垂直subplots
+            n = len(figs_to_combine)
+            combined_fig = make_subplots(rows=n, cols=1, subplot_titles=titles,
+                                          vertical_spacing=0.08)
+            for i, fig in enumerate(figs_to_combine):
+                for trace in fig.data:
+                    combined_fig.add_trace(trace, row=i+1, col=1)
+            combined_fig.update_layout(
+                title=dict(text=f"生猪期货每日分析报告  {cn_date}  主力:{main_ct}",
+                          font=dict(size=18, color='#1a1a2e')),
+                height=400 * n, template="plotly_white",
+                margin=dict(t=60, b=30, l=50, r=30))
+            img_bytes = combined_fig.to_image(format="png", scale=1.2, width=1100)
+            return img_bytes
+    except Exception:
+        pass
+
+    # ── 方案2: PIL拼接已有chart_images ──
     try:
         from PIL import Image, ImageDraw, ImageFont
-        import base64
         images_to_stack = []
-        # Title bar
-        title_img = Image.new('RGB', (1200, 80), color=(26, 26, 46))
+        title_img = Image.new('RGB', (1200, 60), color=(26, 26, 46))
         draw = ImageDraw.Draw(title_img)
-        # Try to use a Chinese font
-        font_paths = [
-            'C:/Windows/Fonts/simhei.ttf',
-            'C:/Windows/Fonts/msyh.ttf',
-            'C:/Windows/Fonts/simsun.ttc',
-        ]
         font_title = None
-        for fp in font_paths:
+        for fp in ['C:/Windows/Fonts/simhei.ttf', 'C:/Windows/Fonts/msyh.ttf']:
             try:
-                font_title = ImageFont.truetype(fp, 28)
+                font_title = ImageFont.truetype(fp, 24)
                 break
             except Exception:
                 continue
-        if font_title is None:
-            font_title = ImageFont.load_default()
-        draw.text((20, 20), f"生猪期货每日分析报告  {cn_date}  主力:{main_ct}",
-                  fill=(255, 255, 255), font=font_title)
+        if font_title:
+            draw.text((15, 15), f"生猪期货每日分析报告  {cn_date}  主力:{main_ct}",
+                      fill=(255, 255, 255), font=font_title)
         images_to_stack.append(title_img)
-
-        # Add charts
         for key in ["basis_comparison", "spread_trend"]:
             b64 = chart_images.get(key)
             if b64:
                 img_bytes = base64.b64decode(b64)
                 img = Image.open(BytesIO(img_bytes))
-                # Resize to fit width
                 if img.width > 1200:
-                    ratio = 1200 / img.width
-                    img = img.resize((1200, int(img.height * ratio)), Image.LANCZOS)
+                    img = img.resize((1200, int(img.height * 1200 / img.width)), Image.LANCZOS)
                 images_to_stack.append(img)
-
-        if len(images_to_stack) <= 1:
-            return None
-
-        # Stack vertically
-        total_height = sum(im.height for im in images_to_stack) + 10 * (len(images_to_stack) - 1)
-        combined = Image.new('RGB', (1200, total_height + 20), color=(245, 246, 250))
-        y_offset = 10
-        for im in images_to_stack:
-            x_offset = (1200 - im.width) // 2
-            combined.paste(im, (x_offset, y_offset))
-            y_offset += im.height + 10
-
-        buf = BytesIO()
-        combined.save(buf, format='PNG', optimize=True)
-        return buf.getvalue()
-    except ImportError:
-        pass
+        if len(images_to_stack) > 1:
+            total_h = sum(im.height for im in images_to_stack) + 5 * (len(images_to_stack) - 1)
+            combined = Image.new('RGB', (1200, total_h + 10), color=(245, 246, 250))
+            y = 5
+            for im in images_to_stack:
+                combined.paste(im, ((1200 - im.width) // 2, y))
+                y += im.height + 5
+            buf = BytesIO()
+            combined.save(buf, format='PNG')
+            return buf.getvalue()
     except Exception:
         pass
+
     return None
 
 
