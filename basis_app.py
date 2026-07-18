@@ -3863,15 +3863,15 @@ def _build_daily_report_html(main_ct: str, fut_df, spot_dict, ltd, prev_td,
     # 图表嵌入
     chart_html = ""
     if chart_images:
-        if "basis_dist" in chart_images:
-            chart_html += f'''<div class="card">
-<h2><span class="icon">📊</span>基差分布图</h2>
-<img src="data:image/png;base64,{chart_images['basis_dist']}" style="width:100%;max-width:880px;" alt="基差分布">
+        if "basis_comparison" in chart_images:
+            chart_html += f'''<div class="card chart-card">
+<h2><span class="icon">📊</span>主力合约基差季节对比</h2>
+<img src="data:image/png;base64,{chart_images['basis_comparison']}" style="width:100%;max-width:860px;" alt="基差对比">
 </div>'''
         if "spread_trend" in chart_images:
-            chart_html += f'''<div class="card">
+            chart_html += f'''<div class="card chart-card">
 <h2><span class="icon">📉</span>价差走势图</h2>
-<img src="data:image/png;base64,{chart_images['spread_trend']}" style="width:100%;max-width:880px;" alt="价差走势">
+<img src="data:image/png;base64,{chart_images['spread_trend']}" style="width:100%;max-width:860px;" alt="价差走势">
 </div>'''
 
     # ── 构建 HTML ──
@@ -3948,8 +3948,10 @@ body {{ font-family: 'Microsoft YaHei', 'SimHei', sans-serif; background: #f5f6f
 <!-- 5. 技术分析 -->
 <div class="card">
 <h2><span class="icon">📉</span>技术分析</h2>
-<p>
-趋势判断：<span class="tag tag-{'bull' if tech_summary in ('多头','偏多') else ('bear' if tech_summary in ('空头','偏空') else 'neutral')}">{tech_summary}</span><br>
+<p style="font-size:0.92rem;line-height:1.8;">
+{tech_summary.replace(' | ', '<br>• ')}
+</p>
+<p style="margin-top:4px;font-size:0.88rem;color:#666;">
 压力位：{res_str} ｜ 支撑位：{sup_str}
 </p>
 </div>
@@ -4303,41 +4305,51 @@ def _generate_report_charts(main_ct, spot_dict, fut_df, ltd, regions, snap) -> d
     import base64
     charts = {}
 
-    # 1. 基差分布图
+    # 1. 主力合约基差季节对比图（收盘价基差同比）
     try:
-        fc = float(fut_df[fut_df["date"] == ltd]["close"].iloc[0])
-        recs = []
-        for reg in regions:
-            if reg in spot_dict:
-                r = spot_dict[reg][spot_dict[reg]["date"] == ltd]
-                if not r.empty:
-                    sp = float(r["price"].iloc[0])
-                    pm = get_premium(main_ct, reg)
-                    recs.append({
-                        "region": reg, "basis": int(round(_to_ton(sp) - (fc + pm))),
-                        "spot_price": sp, "futures_close": fc, "premium": pm,
-                        "is_indicator": False
-                    })
-        if recs:
-            # Add indicator values
-            na_basis = snap.get("national_avg", 0)
-            recs.append({"region": "全国均价", "basis": na_basis, "spot_price": 0,
-                         "futures_close": fc, "premium": 0, "is_indicator": True})
-            recs.append({"region": "最大基差", "basis": snap.get("max_basis", 0), "spot_price": 0,
-                         "futures_close": fc, "premium": 0, "is_indicator": True})
-            recs.append({"region": "最小基差", "basis": snap.get("min_basis", 0), "spot_price": 0,
-                         "futures_close": fc, "premium": 0, "is_indicator": True})
-            recs.append({"region": "基差平均值", "basis": snap.get("avg_basis", 0), "spot_price": 0,
-                         "futures_close": fc, "premium": 0, "is_indicator": True})
+        tmon = ct_month(main_ct)
+        same_month = [c for c in ALL_CONTRACTS if ct_month(c) == tmon]
+        avail = []
+        for c in same_month:
+            df_c, _ = load_futures(c)
+            if df_c is not None and not df_c.empty:
+                avail.append(c)
+        if len(avail) >= 2:
+            # Build basis series for 全国均价
+            series = {}
+            md_collector = defaultdict(list)
+            for c in avail:
+                fdf, _ = load_futures(c)
+                na_df = calc_national_basis(spot_dict, fdf)
+                if na_df is None or na_df.empty:
+                    continue
+                na_df["year"] = na_df["date"].dt.year
+                na_df["doy"] = na_df["date"].dt.dayofyear
+                na_df["plot_date"] = na_df.apply(
+                    lambda r: _doy_to_date(int(r["doy"]), int(r["year"])), axis=1)
+                for yr, grp in na_df.groupby("year"):
+                    grp = grp.sort_values("doy").copy()
+                    label = _make_trace_label(c, yr, "全国均价")
+                    series[label] = grp
+                    for _, row in grp.iterrows():
+                        md_collector[(row["date"].month, row["date"].day)].append(row["basis"])
 
-            fig = fig_distribution(recs, main_ct, ltd, "")
-            fig.update_layout(height=380, margin=dict(t=50, b=40, l=40, r=20))
-            img_bytes = fig.to_image(format="png", scale=1.5)
-            charts["basis_dist"] = base64.b64encode(img_bytes).decode()
+            if series:
+                # Add historical avg
+                avg_rows = [{"doy": m*100+d, "basis": int(round(np.mean(v))),
+                             "plot_date": pd.Timestamp(year=2020, month=m, day=d)}
+                            for (m, d), v in sorted(md_collector.items()) if v]
+                if avg_rows:
+                    series["历史均值"] = pd.DataFrame(avg_rows).sort_values("doy")
+
+                fig_basis = fig_calendar_comparison(series, tmon, "")
+                fig_basis.update_layout(height=400, margin=dict(t=50, b=30, l=40, r=20))
+                img_bytes = fig_basis.to_image(format="png", scale=1.5)
+                charts["basis_comparison"] = base64.b64encode(img_bytes).decode()
     except Exception:
         pass
 
-    # 2. 价差走势图（主力 vs 次主力，近60天）
+    # 2. 价差走势图（主力 vs 次主力，近90天）
     try:
         active = get_active_contracts()
         others = [c for c in active if c != main_ct]
@@ -4350,7 +4362,7 @@ def _generate_report_charts(main_ct, spot_dict, fut_df, ltd, regions, snap) -> d
                 bc = dfb.set_index("date")["close"]
                 cm = sorted(ac.index.intersection(bc.index))
                 if len(cm) > 0:
-                    recent_cm = cm[-60:]
+                    recent_cm = cm[-90:]
                     spreads_v = [float(ac[d] - bc[d]) for d in recent_cm]
                     fig_sp = go.Figure()
                     fig_sp.add_trace(go.Scatter(
@@ -4361,10 +4373,11 @@ def _generate_report_charts(main_ct, spot_dict, fut_df, ltd, regions, snap) -> d
                     ))
                     fig_sp.add_hline(y=0, line_dash="dash", line_color="gray", opacity=0.3)
                     fig_sp.update_layout(
-                        title=f"{main_ct}-{ct_b} 价差走势（近60日）",
-                        xaxis=dict(tickformat="%m-%d"), yaxis=dict(title="价差（元/吨）"),
+                        title=f"{main_ct}-{ct_b} 价差走势（近90日）",
+                        xaxis=dict(title="日期", tickformat="%m-%d"),
+                        yaxis=dict(title="价差（元/吨）"),
                         template="plotly_white", height=350,
-                        margin=dict(t=50, b=30, l=40, r=20),
+                        margin=dict(t=50, b=40, l=50, r=20),
                     )
                     img_bytes = fig_sp.to_image(format="png", scale=1.5)
                     charts["spread_trend"] = base64.b64encode(img_bytes).decode()
@@ -4403,42 +4416,134 @@ def _compute_key_spread(main_ct: str) -> str:
 
 
 def _quick_technical(fut_df, ltd) -> Tuple[str, dict]:
-    """快速技术分析：趋势 + 支撑/压力"""
+    """快速技术分析：趋势 + MACD/RSI/布林带 完整文字结论"""
     if fut_df is None or fut_df.empty:
         return "震荡", {"resistances": [], "supports": []}
     try:
         df = fut_df.sort_values("date").reset_index(drop=True)
+        # 计算技术指标
         close = df["close"].astype(float)
-        # 简单均线
+        high = df["high"].astype(float) if "high" in df.columns else close
+        low = df["low"].astype(float) if "low" in df.columns else close
+
+        n = len(close)
+        if n < 20:
+            return "数据不足(需≥20日)", {"resistances": [], "supports": []}
+
+        cur = float(close.iloc[-1])
+
+        # ── 均线趋势 ──
         ma5 = close.rolling(5).mean().iloc[-1]
         ma10 = close.rolling(10).mean().iloc[-1]
         ma20 = close.rolling(20).mean().iloc[-1]
-        cur = close.iloc[-1]
-        if pd.notna(ma5) and pd.notna(ma20):
-            if ma5 > ma20:
-                direction = "偏多"
-            elif ma5 < ma20:
-                direction = "偏空"
-            else:
-                direction = "震荡"
+        ma5_v = float(ma5) if pd.notna(ma5) else 0
+        ma10_v = float(ma10) if pd.notna(ma10) else 0
+        ma20_v = float(ma20) if pd.notna(ma20) else 0
+
+        # ── MACD ──
+        ema12 = close.ewm(span=12, adjust=False).mean()
+        ema26 = close.ewm(span=26, adjust=False).mean()
+        dif = ema12 - ema26
+        dea = dif.ewm(span=9, adjust=False).mean()
+        macd_hist = 2 * (dif - dea)
+        dif_v = float(dif.iloc[-1]); dea_v = float(dea.iloc[-1])
+        macd_v = float(macd_hist.iloc[-1])
+        dif_prev = float(dif.iloc[-2]) if n >= 2 else dif_v
+        dea_prev = float(dea.iloc[-2]) if n >= 2 else dea_v
+
+        # ── RSI14 ──
+        delta = close.diff()
+        gain = delta.clip(lower=0)
+        loss = (-delta).clip(lower=0)
+        avg_gain = gain.ewm(alpha=1/14, adjust=False).mean()
+        avg_loss = loss.ewm(alpha=1/14, adjust=False).mean()
+        rs = avg_gain / avg_loss.replace(0, np.nan)
+        rsi14_v = float((100 - (100 / (1 + rs))).iloc[-1])
+
+        # ── 布林带 ──
+        bb_mid = ma20_v
+        std20 = close.rolling(20).std().iloc[-1]
+        bb_up = bb_mid + 2 * float(std20) if pd.notna(std20) else cur * 1.05
+        bb_low = bb_mid - 2 * float(std20) if pd.notna(std20) else cur * 0.95
+        bb_width = (bb_up - bb_low) / bb_mid * 100 if bb_mid > 0 else 0
+
+        # ── 构建文字结论 ──
+        tech_lines = []
+
+        # 趋势
+        if ma5_v > ma10_v > ma20_v:
+            trend = "多头排列，趋势偏强"
+        elif ma5_v < ma10_v < ma20_v:
+            trend = "空头排列，趋势偏弱"
+        elif cur > ma20_v:
+            trend = "价格在MA20上方，短期偏多"
+        elif cur < ma20_v:
+            trend = "价格在MA20下方，短期偏空"
         else:
-            direction = "震荡"
+            trend = "均线交织，震荡格局"
+
+        # MACD
+        if dif_prev <= dea_prev and dif_v > dea_v:
+            macd_text = "金叉形成（DIF上穿DEA），看涨信号"
+        elif dif_prev >= dea_prev and dif_v < dea_v:
+            macd_text = "死叉形成（DIF下穿DEA），看跌信号"
+        elif dif_v > dea_v:
+            macd_text = f"DIF在DEA上方运行，{'红柱' if macd_v > 0 else '绿柱'}，{'动能增强' if abs(macd_v) > 0 else '动能减弱'}"
+        else:
+            macd_text = f"DIF在DEA下方运行，{'绿柱' if macd_v < 0 else '红柱'}，{'动能增强' if abs(macd_v) > 0 else '动能减弱'}"
+
+        # RSI
+        if rsi14_v > 70:
+            rsi_text = f"RSI={rsi14_v:.1f}，超买区域（>70），注意回调"
+        elif rsi14_v < 30:
+            rsi_text = f"RSI={rsi14_v:.1f}，超卖区域（<30），反弹概率增大"
+        else:
+            rsi_text = f"RSI={rsi14_v:.1f}，中性区间（30-70）"
+
+        # 布林带
+        if cur > bb_up:
+            bb_text = f"突破布林上轨（{bb_up:.0f}），超强格局，带宽{bb_width:.1f}%"
+        elif cur < bb_low:
+            bb_text = f"跌破布林下轨（{bb_low:.0f}），超弱格局，带宽{bb_width:.1f}%"
+        elif cur > bb_mid:
+            pct = (cur - bb_mid) / (bb_up - bb_mid) * 100 if bb_up > bb_mid else 50
+            bb_text = f"运行于中轨与上轨之间（{pct:.0f}%），偏强，带宽{bb_width:.1f}%"
+        else:
+            pct = (cur - bb_low) / (bb_mid - bb_low) * 100 if bb_mid > bb_low else 50
+            bb_text = f"运行于中轨与下轨之间（{pct:.0f}%），偏弱，带宽{bb_width:.1f}%"
+
+        # 总结方向
+        bull_score = 0; bear_score = 0
+        if "多头" in trend or "偏多" in trend: bull_score += 1
+        elif "空头" in trend or "偏空" in trend: bear_score += 1
+        if "金叉" in macd_text or "上方运行" in macd_text: bull_score += 1
+        elif "死叉" in macd_text or "下方运行" in macd_text: bear_score += 1
+        if rsi14_v < 30: bull_score += 1
+        elif rsi14_v > 70: bear_score += 1
+        if cur > bb_mid: bull_score += 1
+        elif cur < bb_mid: bear_score += 1
+
+        if bull_score >= 3: direction = "偏多"
+        elif bear_score >= 3: direction = "偏空"
+        elif bull_score > bear_score: direction = "中性偏多"
+        elif bear_score > bull_score: direction = "中性偏空"
+        else: direction = "震荡"
+
+        tech_summary = f"{direction} | {trend} | {macd_text} | {rsi_text} | {bb_text}"
 
         # 支撑/压力
         recent_high = float(close.tail(20).max())
         recent_low = float(close.tail(20).min())
-        resistances = [f"{recent_high:.0f}"]
-        supports = [f"{recent_low:.0f}"]
-        if pd.notna(df["ma20"].iloc[-1]):
-            ma20v = float(df["ma20"].iloc[-1])
-            if ma20v > cur:
-                resistances.append(f"MA20={ma20v:.0f}")
-            else:
-                supports.append(f"MA20={ma20v:.0f}")
+        resistances = [f"前高{recent_high:.0f}"]
+        supports = [f"前低{recent_low:.0f}"]
+        if bb_up > cur: resistances.append(f"布林上轨{bb_up:.0f}")
+        if bb_low < cur: supports.append(f"布林下轨{bb_low:.0f}")
+        if ma20_v < cur: supports.append(f"MA20={ma20_v:.0f}")
+        else: resistances.append(f"MA20={ma20_v:.0f}")
 
-        return direction, {"resistances": resistances[:2], "supports": supports[:2]}
+        return tech_summary, {"resistances": resistances[:2], "supports": supports[:2]}
     except Exception:
-        return "震荡", {"resistances": [], "supports": []}
+        return "震荡(计算异常)", {"resistances": [], "supports": []}
 
 
 def tab_daily_report():
@@ -4482,8 +4587,10 @@ def tab_daily_report():
             key="dl_md"
         )
     with col_btn2:
-        # PDF with images
-        pdf_data = _build_reportlab_pdf(html, cn_date, chart_images)
+        # PDF with images using weasyprint (more reliable than reportlab for HTML+images)
+        pdf_data = _build_weasyprint_pdf(html, cn_date)
+        if pdf_data is None:
+            pdf_data = _build_reportlab_pdf(html, cn_date, chart_images)
         if pdf_data:
             st.download_button(
                 label="📄 下载 PDF",
@@ -4504,45 +4611,107 @@ def tab_daily_report():
                 help="PDF库不可用，提供HTML格式（浏览器打开后可打印为PDF）"
             )
     with col_btn3:
-        # 下载日报为图片
-        img_data = _render_report_as_image(html)
-        if img_data:
+        # 下载整个日报为PNG图片（使用plotly图表合成）
+        png_data = _compose_report_image(chart_images, cn_date, main_ct)
+        if png_data:
             st.download_button(
                 label="🖼️ 下载图片",
-                data=img_data,
+                data=png_data,
                 file_name=f"生猪期货日报_{cn_date.replace('年','').replace('月','').replace('日','')}.png",
                 mime="image/png",
                 use_container_width=True,
                 key="dl_img"
             )
+        else:
+            st.download_button(
+                label="🖼️ 下载图片",
+                data=html.encode("utf-8"),
+                file_name=f"生猪期货日报_{cn_date.replace('年','').replace('月','').replace('日','')}.html",
+                mime="text/html",
+                use_container_width=True,
+                key="dl_img_fb",
+                help="图片生成库不可用，提供HTML格式"
+            )
 
-    # ── 渲染 HTML 日报 ──
-    st.markdown(html, unsafe_allow_html=True)
+    # ── 渲染 HTML 日报（使用 components.html 避免 sanitizer 破坏样式）──
+    st.components.v1.html(html, height=2200, scrolling=True)
 
     # ── 底部分隔 ──
     st.markdown("---")
 
 
-def _render_report_as_image(html: str) -> Optional[bytes]:
-    """将日报HTML渲染为PNG图片"""
-    try:
-        import imgkit
-        img_bytes = imgkit.from_string(html, False, options={
-            'format': 'png', 'width': 900, 'quality': 95,
-            'encoding': 'UTF-8'
-        })
-        return img_bytes
-    except ImportError:
-        pass
-    # Fallback: try with weasyprint then convert
+def _build_weasyprint_pdf(html: str, cn_date: str) -> Optional[bytes]:
+    """使用 weasyprint 生成 PDF，失败返回 None"""
     try:
         from weasyprint import HTML
-        import io
-        pdf_buf = io.BytesIO()
-        HTML(string=html).write_pdf(pdf_buf)
-        # Can't easily convert PDF to PNG without extra deps
-        return None
+        buf = BytesIO()
+        HTML(string=html).write_pdf(buf)
+        return buf.getvalue()
     except ImportError:
+        pass
+    except Exception:
+        pass
+    return None
+
+
+def _compose_report_image(chart_images: dict, cn_date: str, main_ct: str) -> Optional[bytes]:
+    """将图表合成为一张日报图片，使用PIL"""
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+        import base64
+        images_to_stack = []
+        # Title bar
+        title_img = Image.new('RGB', (1200, 80), color=(26, 26, 46))
+        draw = ImageDraw.Draw(title_img)
+        # Try to use a Chinese font
+        font_paths = [
+            'C:/Windows/Fonts/simhei.ttf',
+            'C:/Windows/Fonts/msyh.ttf',
+            'C:/Windows/Fonts/simsun.ttc',
+        ]
+        font_title = None
+        for fp in font_paths:
+            try:
+                font_title = ImageFont.truetype(fp, 28)
+                break
+            except Exception:
+                continue
+        if font_title is None:
+            font_title = ImageFont.load_default()
+        draw.text((20, 20), f"生猪期货每日分析报告  {cn_date}  主力:{main_ct}",
+                  fill=(255, 255, 255), font=font_title)
+        images_to_stack.append(title_img)
+
+        # Add charts
+        for key in ["basis_comparison", "spread_trend"]:
+            b64 = chart_images.get(key)
+            if b64:
+                img_bytes = base64.b64decode(b64)
+                img = Image.open(BytesIO(img_bytes))
+                # Resize to fit width
+                if img.width > 1200:
+                    ratio = 1200 / img.width
+                    img = img.resize((1200, int(img.height * ratio)), Image.LANCZOS)
+                images_to_stack.append(img)
+
+        if len(images_to_stack) <= 1:
+            return None
+
+        # Stack vertically
+        total_height = sum(im.height for im in images_to_stack) + 10 * (len(images_to_stack) - 1)
+        combined = Image.new('RGB', (1200, total_height + 20), color=(245, 246, 250))
+        y_offset = 10
+        for im in images_to_stack:
+            x_offset = (1200 - im.width) // 2
+            combined.paste(im, (x_offset, y_offset))
+            y_offset += im.height + 10
+
+        buf = BytesIO()
+        combined.save(buf, format='PNG', optimize=True)
+        return buf.getvalue()
+    except ImportError:
+        pass
+    except Exception:
         pass
     return None
 
