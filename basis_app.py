@@ -4,13 +4,14 @@
 生猪期货分析平台 (Streamlit)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 无侧边栏设计——所有控件位于各 Tab 内部。
-Tab 1 — 当日基差分布（柱状图 + 四指标卡片）
-Tab 2 — 单合约基差走势（区域色板 + 汇总指标固定色）
-Tab 3 — 合约基差比较（同比 / 交易日对齐，颜色按合约年份）
-Tab 4 — 合约价差比较（月份选择，颜色按合约年份）
-Tab 5 — 持仓与成交分析（双轴图 + 前20期货公司多空持仓）
-Tab 6 — 季节性持仓对比（同月份合约跨年成交量/持仓量/净持仓）
-Tab 7 — 技术分析（K线图 + MA/布林带 + MACD/RSI/KDJ + 文字结论）
+Tab 1 — 每日期货分析日报（新增：HTML 日报 + PDF/Markdown 下载）
+Tab 2 — 当日基差分布（柱状图 + 四指标卡片）
+Tab 3 — 单合约基差走势（区域色板 + 汇总指标固定色）
+Tab 4 — 合约基差比较（同比 / 交易日对齐，颜色按合约年份，含现货+期货走势图）
+Tab 5 — 合约价差比较（月份选择，颜色按合约年份）
+Tab 6 — 持仓与成交分析（双轴图 + 前20期货公司多空持仓）
+Tab 7 — 季节性持仓对比（同月份合约跨年成交量/持仓量/净持仓）
+Tab 8 — 技术分析（K线图 + MA/布林带 + MACD/RSI/KDJ + 文字结论）
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 核心设计原则：
   • 颜色始终按 **合约年份** 固定，不按数据实际发生的交易年份
@@ -33,9 +34,35 @@ from pathlib import Path
 from collections import defaultdict
 from typing import Dict, List, Tuple, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from io import BytesIO, StringIO
 import warnings
 
 warnings.filterwarnings("ignore")
+
+# ── PDF 导出支持 ──
+try:
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.colors import HexColor
+    from reportlab.lib.units import mm
+    from reportlab.platypus import (SimpleDocTemplate, Paragraph, Spacer, Table,
+                                     TableStyle)
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+    from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+    HAS_REPORTLAB = True
+    # 注册中文字体
+    try:
+        pdfmetrics.registerFont(TTFont('SimHei', 'C:/Windows/Fonts/simhei.ttf'))
+        CN_FONT = 'SimHei'
+    except Exception:
+        try:
+            pdfmetrics.registerFont(UnicodeCIDFont('STSong-Light'))
+            CN_FONT = 'STSong-Light'
+        except Exception:
+            CN_FONT = 'Helvetica'
+except ImportError:
+    HAS_REPORTLAB = False
 
 # ══════════════════════════════════════════════════════════════
 st.set_page_config(
@@ -1755,6 +1782,16 @@ def _tab3_calendar(contracts, spot_dict, ref_regions, sel_items, data_date, acti
             st.plotly_chart(fig_sf, use_container_width=True)
         else:
             st.caption(f"⚠️ 无法加载 {_clicked_ct} 的现货/期货数据")
+    else:
+        # ★ 默认显示主力合约的现货+期货走势图
+        default_ct = contracts[0] if contracts else get_main_contract()
+        st.markdown(f"---")
+        st.markdown(f"### 📈 {default_ct} 现货与期货价格走势（点击上方合约线可切换）")
+        fig_sf = _make_spot_futures_chart(default_ct, spot_dict)
+        if fig_sf.data:
+            st.plotly_chart(fig_sf, use_container_width=True)
+        else:
+            st.caption(f"⚠️ 无法加载 {default_ct} 的现货/期货数据")
 
     # ── 自动结论（仅针对用户选择的合约）──
     result = _gen_tab3_conclusion_calendar(series, tmon, sel_items, contracts)
@@ -3636,6 +3673,525 @@ def tab7():
 
 
 # ══════════════════════════════════════════════════════════════
+# Tab 1：每日期货分析日报
+# ══════════════════════════════════════════════════════════════
+
+def _build_daily_report_html(main_ct: str, fut_df, spot_dict, ltd, prev_td,
+                              snap, holdings_df, key_spread_info,
+                              trend_direction, sr_lines_info) -> str:
+    """构建日报 HTML 内容"""
+    cn_date = _cn(ltd)
+    cn_prev = _cn(prev_td) if prev_td else "前一交易日"
+
+    # 当日行情
+    if fut_df is not None and not fut_df.empty:
+        row_today = fut_df[fut_df["date"] == ltd]
+        row_prev = fut_df[fut_df["date"] == prev_td] if prev_td else None
+        row_t = row_today.iloc[-1] if not row_today.empty else None
+        if row_t is not None:
+            close_v = float(row_t["close"])
+            high_v = float(row_t["high"]) if pd.notna(row_t.get("high")) else close_v
+            low_v = float(row_t["low"]) if pd.notna(row_t.get("low")) else close_v
+            vol_v = int(row_t["volume"]) if pd.notna(row_t.get("volume")) else 0
+            oi_col = "open_interest" if "open_interest" in row_t.index else ("hold" if "hold" in row_t.index else None)
+            oi_v = int(row_t[oi_col]) if oi_col and pd.notna(row_t.get(oi_col)) else 0
+            prev_close = float(row_prev["close"].iloc[-1]) if row_prev is not None and not row_prev.empty else close_v
+            chg = close_v - prev_close
+            chg_pct = chg / prev_close * 100 if prev_close != 0 else 0
+        else:
+            close_v, high_v, low_v, vol_v, oi_v, chg, chg_pct = 0, 0, 0, 0, 0, 0, 0
+    else:
+        close_v, high_v, low_v, vol_v, oi_v, chg, chg_pct = 0, 0, 0, 0, 0, 0, 0
+
+    chg_color = "#E74C3C" if chg >= 0 else "#27AE60"
+    chg_sign = "+" if chg >= 0 else ""
+
+    # 基差
+    na_basis = snap.get("national_avg", 0) if snap else 0
+    max_region = snap.get("max_region", "—") if snap else "—"
+    max_basis = snap.get("max_basis", 0) if snap else 0
+    min_region = snap.get("min_region", "—") if snap else "—"
+    min_basis = snap.get("min_basis", 0) if snap else 0
+
+    # 基差判断
+    basis_judge = "中性"
+    if na_basis > 500:
+        basis_judge = "偏高"
+    elif na_basis < -500:
+        basis_judge = "偏低"
+
+    # 价差
+    spread_text = key_spread_info if key_spread_info else "暂无价差数据"
+
+    # 持仓
+    net_pos_text = "—"
+    net_judge = "中性"
+    pos_chg_text = "—"
+    if holdings_df is not None and not holdings_df.empty:
+        total_long = int(holdings_df["long"].sum())
+        total_short = int(holdings_df["short"].sum())
+        net_pos = total_long - total_short
+        net_pos_text = f"{net_pos:+,}手"
+        if net_pos > 5000:
+            net_judge = "偏多"
+        elif net_pos < -5000:
+            net_judge = "偏空"
+
+    # 技术
+    if trend_direction:
+        tech_summary = trend_direction
+    else:
+        tech_summary = "震荡"
+
+    # 支撑压力
+    res_str = "、".join(sr_lines_info.get("resistances", ["暂无"]))
+    sup_str = "、".join(sr_lines_info.get("supports", ["暂无"]))
+
+    # 一句话总结
+    bull_score = 0
+    bear_score = 0
+    if chg > 0: bull_score += 1
+    elif chg < 0: bear_score += 1
+    if na_basis > 300: bull_score += 1
+    elif na_basis < -300: bear_score += 1
+    if net_judge == "偏多": bull_score += 1
+    elif net_judge == "偏空": bear_score += 1
+    if tech_summary in ("多头", "偏多"): bull_score += 1
+    elif tech_summary in ("空头", "偏空"): bear_score += 1
+
+    if bull_score > bear_score:
+        overall = "🐂 市场整体偏多，可关注回调机会"
+    elif bear_score > bull_score:
+        overall = "🐻 市场整体偏空，建议观望为主"
+    else:
+        overall = "⚖️ 市场多空交织，短期方向不明，建议观望"
+
+    # ── 构建 HTML ──
+    html = f"""
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><title>生猪期货每日分析报告</title>
+<style>
+body {{ font-family: 'Microsoft YaHei', 'SimHei', sans-serif; background: #f5f6fa; padding: 20px; color: #333; }}
+.report {{ max-width: 900px; margin: 0 auto; }}
+.header {{ background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); color: #fff; padding: 24px 30px; border-radius: 12px 12px 0 0; }}
+.header h1 {{ font-size: 1.6rem; margin: 0 0 4px 0; }}
+.header .sub {{ font-size: 0.85rem; opacity: 0.75; }}
+.card {{ background: #fff; border-radius: 8px; padding: 18px 22px; margin: 12px 0; box-shadow: 0 1px 4px rgba(0,0,0,0.06); }}
+.card h2 {{ font-size: 1.1rem; margin: 0 0 10px 0; padding-bottom: 8px; border-bottom: 2px solid #eee; }}
+.card h2 .icon {{ margin-right: 6px; }}
+.grid2 {{ display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }}
+.kv {{ display: flex; justify-content: space-between; padding: 4px 0; border-bottom: 1px dotted #eee; }}
+.kv .k {{ color: #888; }}
+.kv .v {{ font-weight: 600; }}
+.up {{ color: #E74C3C; }}
+.down {{ color: #27AE60; }}
+.tag {{ display: inline-block; padding: 2px 10px; border-radius: 4px; font-size: 0.85rem; font-weight: 600; }}
+.tag-bull {{ background: #fde8e8; color: #E74C3C; }}
+.tag-bear {{ background: #e8f5e9; color: #27AE60; }}
+.tag-neutral {{ background: #e8eaf6; color: #5c6bc0; }}
+.conclusion {{ background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: #fff; padding: 16px 22px; border-radius: 8px; margin: 12px 0; font-size: 1.05rem; text-align: center; }}
+.source {{ text-align: center; color: #aaa; font-size: 0.78rem; margin-top: 16px; }}
+</style></head>
+<body><div class="report">
+
+<div class="header">
+<h1>🐷 生猪期货每日分析报告</h1>
+<div class="sub">报告日期：{cn_date} ｜ 主力合约：{main_ct} ｜ 数据来源：涌益咨询 & 大商所</div>
+</div>
+
+<!-- 1. 市场概况 -->
+<div class="card">
+<h2><span class="icon">📊</span>市场概况 — {main_ct}</h2>
+<div class="grid2">
+<div class="kv"><span class="k">收盘价</span><span class="v">{close_v:.0f} 元/吨</span></div>
+<div class="kv"><span class="k">涨跌幅</span><span class="v {chg_color.replace('#','')}">{chg_sign}{chg:.0f} ({chg_sign}{chg_pct:.2f}%)</span></div>
+<div class="kv"><span class="k">最高价</span><span class="v">{high_v:.0f} 元/吨</span></div>
+<div class="kv"><span class="k">最低价</span><span class="v">{low_v:.0f} 元/吨</span></div>
+<div class="kv"><span class="k">成交量</span><span class="v">{vol_v:,} 手</span></div>
+<div class="kv"><span class="k">持仓量</span><span class="v">{oi_v:,} 手</span></div>
+</div>
+<p style="margin-top:10px;font-size:0.92rem;color:#666;">
+📝 {main_ct} 当日收于 <b>{close_v:.0f}</b> 元/吨，较前日（{cn_prev}）<b class="{'up' if chg>=0 else 'down'}">{chg_sign}{chg:.0f} ({chg_sign}{chg_pct:.2f}%)</b>，成交量{vol_v:,}手。
+</p>
+</div>
+
+<!-- 2. 基差分析 -->
+<div class="card">
+<h2><span class="icon">📐</span>基差分析</h2>
+<p>
+全国均价基差 <b>{na_basis:+,}元/吨</b>，处于历史同期<span class="tag tag-{'bull' if basis_judge=='偏高' else ('bear' if basis_judge=='偏低' else 'neutral')}">{basis_judge}</span>水平。<br>
+基差最大区域：<b>{max_region}</b>（{max_basis:+,}元/吨）｜ 最小区域：<b>{min_region}</b>（{min_basis:+,}元/吨）。
+</p>
+</div>
+
+<!-- 3. 价差分析 -->
+<div class="card">
+<h2><span class="icon">💰</span>价差分析</h2>
+<p>{spread_text}</p>
+</div>
+
+<!-- 4. 持仓分析 -->
+<div class="card">
+<h2><span class="icon">🏢</span>持仓分析</h2>
+<p>
+前20多单合计：<b>{int(holdings_df['long'].sum()):,}</b>手 ｜ 空单合计：<b>{int(holdings_df['short'].sum()):,}</b>手 ｜ 净持仓：<b>{net_pos_text}</b><br>
+净持仓判断：<span class="tag tag-{'bull' if net_judge=='偏多' else ('bear' if net_judge=='偏空' else 'neutral')}">{net_judge}</span>
+</p>
+</div>
+
+<!-- 5. 技术分析 -->
+<div class="card">
+<h2><span class="icon">📉</span>技术分析</h2>
+<p>
+趋势判断：<span class="tag tag-{'bull' if tech_summary in ('多头','偏多') else ('bear' if tech_summary in ('空头','偏空') else 'neutral')}">{tech_summary}</span><br>
+压力位：{res_str} ｜ 支撑位：{sup_str}
+</p>
+</div>
+
+<!-- 6. 综合结论 -->
+<div class="conclusion">{overall}</div>
+
+<div class="source">⚠️ 免责声明：本报告仅供参考，不构成任何投资建议。投资有风险，入市需谨慎。<br>数据来源：涌益咨询现货 ｜ 大连商品交易所期货数据</div>
+
+</div></body></html>"""
+    return html
+
+
+def _build_daily_report_md(main_ct, fut_df, spot_dict, ltd, prev_td,
+                            snap, holdings_df, key_spread_info,
+                            trend_direction, sr_lines_info) -> str:
+    """构建日报 Markdown 内容"""
+    cn_date = _cn(ltd)
+    cn_prev = _cn(prev_td) if prev_td else "前一交易日"
+
+    row_today = fut_df[fut_df["date"] == ltd]
+    row_prev = fut_df[fut_df["date"] == prev_td] if prev_td else None
+    if not row_today.empty:
+        row_t = row_today.iloc[-1]
+        close_v = float(row_t["close"])
+        high_v = float(row_t.get("high", close_v))
+        low_v = float(row_t.get("low", close_v))
+        vol_v = int(row_t.get("volume", 0))
+        oi_col = "open_interest" if "open_interest" in fut_df.columns else ("hold" if "hold" in fut_df.columns else None)
+        oi_v = int(row_t[oi_col]) if oi_col and pd.notna(row_t.get(oi_col)) else 0
+        prev_close = float(row_prev["close"].iloc[-1]) if row_prev is not None and not row_prev.empty else close_v
+        chg = close_v - prev_close
+        chg_pct = chg / prev_close * 100 if prev_close != 0 else 0
+    else:
+        close_v, high_v, low_v, vol_v, oi_v, chg, chg_pct = 0, 0, 0, 0, 0, 0, 0
+
+    na_basis = snap.get("national_avg", 0) if snap else 0
+    max_region = snap.get("max_region", "—") if snap else "—"
+    max_basis = snap.get("max_basis", 0) if snap else 0
+    min_region = snap.get("min_region", "—") if snap else "—"
+    min_basis = snap.get("min_basis", 0) if snap else 0
+    total_long = int(holdings_df["long"].sum()) if holdings_df is not None and not holdings_df.empty else 0
+    total_short = int(holdings_df["short"].sum()) if holdings_df is not None and not holdings_df.empty else 0
+    net_pos = total_long - total_short
+
+    res_str = "、".join(sr_lines_info.get("resistances", ["暂无"]))
+    sup_str = "、".join(sr_lines_info.get("supports", ["暂无"]))
+
+    md = f"""# 🐷 生猪期货每日分析报告
+
+**报告日期：{cn_date}** ｜ 主力合约：{main_ct}
+
+> 数据来源：涌益咨询现货数据 ｜ 大连商品交易所期货数据
+
+---
+
+## 📊 一、市场概况 — {main_ct}
+
+| 指标 | 数值 |
+|------|------|
+| 收盘价 | {close_v:.0f} 元/吨 |
+| 涨跌 | {chg:+.0f} ({chg_pct:+.2f}%) |
+| 最高价 | {high_v:.0f} 元/吨 |
+| 最低价 | {low_v:.0f} 元/吨 |
+| 成交量 | {vol_v:,} 手 |
+| 持仓量 | {oi_v:,} 手 |
+
+📝 {main_ct} 当日收于 **{close_v:.0f}** 元/吨，较{cn_prev} **{chg:+.0f}**（{chg_pct:+.2f}%）。
+
+## 📐 二、基差分析
+
+- 全国均价基差：**{na_basis:+,}元/吨**
+- 基差最大区域：**{max_region}**（{max_basis:+,}元/吨）
+- 基差最小区域：**{min_region}**（{min_basis:+,}元/吨）
+
+## 💰 三、价差分析
+
+{key_spread_info if key_spread_info else "暂无价差数据"}
+
+## 🏢 四、持仓分析
+
+- 前20多单合计：**{total_long:,}**手
+- 前20空单合计：**{total_short:,}**手
+- 净持仓：**{net_pos:+,}**手
+
+## 📉 五、技术分析
+
+- 趋势判断：**{trend_direction or '震荡'}**
+- 压力位：{res_str}
+- 支撑位：{sup_str}
+
+## 🎯 六、综合结论
+
+> 以上各维度综合判断，当前市场建议关注后续走势。
+
+---
+
+⚠️ **免责声明**：本报告仅供参考，不构成任何投资建议。投资有风险，入市需谨慎。
+"""
+    return md
+
+
+def _build_reportlab_pdf(html_content: str, cn_date: str) -> Optional[bytes]:
+    """使用 reportlab 生成 PDF，失败返回 None"""
+    if not HAS_REPORTLAB:
+        return None
+    try:
+        buf = BytesIO()
+        doc = SimpleDocTemplate(buf, pagesize=A4,
+            leftMargin=20*mm, rightMargin=20*mm, topMargin=15*mm, bottomMargin=15*mm)
+        styles = getSampleStyleSheet()
+
+        title_style = ParagraphStyle('CNTitle', parent=styles['Title'],
+            fontName=CN_FONT, fontSize=18, spaceAfter=10, textColor=HexColor('#1a1a2e'))
+        h2_style = ParagraphStyle('CNH2', parent=styles['Heading2'],
+            fontName=CN_FONT, fontSize=13, spaceBefore=12, spaceAfter=6,
+            textColor=HexColor('#34495e'))
+        body_style = ParagraphStyle('CNBody', parent=styles['Normal'],
+            fontName=CN_FONT, fontSize=10, leading=16, textColor=HexColor('#333333'))
+        small_style = ParagraphStyle('CNSmall', parent=styles['Normal'],
+            fontName=CN_FONT, fontSize=8, textColor=HexColor('#999999'))
+
+        story = []
+        story.append(Paragraph("生猪期货每日分析报告", title_style))
+        story.append(Paragraph(f"报告日期：{cn_date}", small_style))
+        story.append(Spacer(1, 12))
+
+        # Parse simple HTML sections to paragraphs
+        sections = [
+            ("市场概况", "..." ),  # simplified
+        ]
+
+        # Simple approach: extract text from HTML
+        import re
+        # Remove HTML tags for each card
+        cards = re.findall(r'<div class="card">(.*?)</div>', html_content, re.DOTALL)
+        for card_html in cards:
+            # Get h2 title
+            h2_match = re.search(r'<h2>(.*?)</h2>', card_html, re.DOTALL)
+            if h2_match:
+                title = re.sub(r'<.*?>', '', h2_match.group(1)).strip()
+                story.append(Paragraph(title, h2_style))
+            # Get content
+            content = re.sub(r'<h2>.*?</h2>', '', card_html, flags=re.DOTALL)
+            text = re.sub(r'<.*?>', ' ', content).strip()
+            text = re.sub(r'\s+', ' ', text)
+            for line in text.split('。'):
+                line = line.strip()
+                if line:
+                    story.append(Paragraph(line + '。', body_style))
+            story.append(Spacer(1, 6))
+
+        # Conclusion
+        concl_match = re.search(r'<div class="conclusion">(.*?)</div>', html_content, re.DOTALL)
+        if concl_match:
+            concl_text = re.sub(r'<.*?>', '', concl_match.group(1)).strip()
+            concl_style = ParagraphStyle('CNConcl', parent=body_style,
+                fontName=CN_FONT, fontSize=11, textColor=HexColor('#ffffff'),
+                backColor=HexColor('#667eea'), alignment=1)
+            story.append(Spacer(1, 10))
+            story.append(Paragraph(concl_text, concl_style))
+
+        story.append(Spacer(1, 20))
+        story.append(Paragraph("免责声明：本报告仅供参考，不构成任何投资建议。", small_style))
+
+        doc.build(story)
+        return buf.getvalue()
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def _compute_daily_report_cache(main_ct: str, spot_hash: int) -> dict:
+    """缓存日报计算，避免重复加载"""
+    spot_dict, _ = load_spot(str(SPOT_PATH))
+    fut_df, _ = load_futures(main_ct)
+    ltd = get_latest_trade_date()
+    if ltd is None:
+        return {"error": "无交易数据"}
+    if fut_df is None or fut_df.empty:
+        return {"error": "期货数据不可用"}
+
+    fds = sorted(fut_df["date"].unique())
+    if ltd not in [d.date() if hasattr(d, 'date') else d for d in fds]:
+        fds_dates = [d.date() if hasattr(d, 'date') else d for d in fds]
+        nearby = [d for d in fds_dates if d <= ltd.date()]
+        if nearby:
+            ltd = pd.Timestamp(nearby[-1])
+
+    td_idx = list(fds).index(ltd) if ltd in list(fds) else -1
+    prev_td = fds[td_idx - 1] if td_idx > 0 else None
+
+    # 基差快照
+    regions = get_regions(main_ct)
+    snap = compute_snapshot(main_ct, spot_dict, fut_df, ltd, regions)
+
+    # 持仓数据
+    holdings_df = _get_holdings(main_ct, ltd)
+
+    # 价差 (主力月 vs 次主力月)
+    spread_info = _compute_key_spread(main_ct)
+
+    # 技术分析
+    trend_dir, sr_info = _quick_technical(fut_df, ltd)
+
+    # 构建HTML和MD
+    html = _build_daily_report_html(main_ct, fut_df, spot_dict, ltd, prev_td,
+                                     snap, holdings_df, spread_info, trend_dir, sr_info)
+    md = _build_daily_report_md(main_ct, fut_df, spot_dict, ltd, prev_td,
+                                 snap, holdings_df, spread_info, trend_dir, sr_info)
+
+    return {"html": html, "md": md, "error": None, "ltd": ltd, "cn_date": _cn(ltd)}
+
+
+def _compute_key_spread(main_ct: str) -> str:
+    """计算主力合约与次主力合约的价差"""
+    active = get_active_contracts()
+    if len(active) < 2:
+        return "暂无足够合约计算价差"
+    try:
+        ct_a = main_ct
+        others = [c for c in active if c != ct_a]
+        if not others:
+            return "暂无其他上市合约"
+        ct_b = others[0]  # 次主力
+        dfa, _ = load_futures(ct_a)
+        dfb, _ = load_futures(ct_b)
+        if dfa is None or dfa.empty or dfb is None or dfb.empty:
+            return "价差数据不足"
+        ac = dfa.set_index("date")["close"]
+        bc = dfb.set_index("date")["close"]
+        cm = ac.index.intersection(bc.index)
+        if len(cm) == 0:
+            return "无共同交易日"
+        latest_spread = float(ac[cm[-1]] - bc[cm[-1]])
+        hist_spread = (ac[cm] - bc[cm]).mean()
+        label = "偏高" if latest_spread > hist_spread + 200 else ("偏低" if latest_spread < hist_spread - 200 else "中性")
+        return f"{main_ct}-{ct_b} 价差 <b>{latest_spread:+,.0f}元/吨</b>，较历史均值（{hist_spread:+,.0f}）{label}"
+    except Exception:
+        return "价差计算失败"
+
+
+def _quick_technical(fut_df, ltd) -> Tuple[str, dict]:
+    """快速技术分析：趋势 + 支撑/压力"""
+    if fut_df is None or fut_df.empty:
+        return "震荡", {"resistances": [], "supports": []}
+    try:
+        df = fut_df.sort_values("date").reset_index(drop=True)
+        close = df["close"].astype(float)
+        # 简单均线
+        ma5 = close.rolling(5).mean().iloc[-1]
+        ma10 = close.rolling(10).mean().iloc[-1]
+        ma20 = close.rolling(20).mean().iloc[-1]
+        cur = close.iloc[-1]
+        if pd.notna(ma5) and pd.notna(ma20):
+            if ma5 > ma20:
+                direction = "偏多"
+            elif ma5 < ma20:
+                direction = "偏空"
+            else:
+                direction = "震荡"
+        else:
+            direction = "震荡"
+
+        # 支撑/压力
+        recent_high = float(close.tail(20).max())
+        recent_low = float(close.tail(20).min())
+        resistances = [f"{recent_high:.0f}"]
+        supports = [f"{recent_low:.0f}"]
+        if pd.notna(df["ma20"].iloc[-1]):
+            ma20v = float(df["ma20"].iloc[-1])
+            if ma20v > cur:
+                resistances.append(f"MA20={ma20v:.0f}")
+            else:
+                supports.append(f"MA20={ma20v:.0f}")
+
+        return direction, {"resistances": resistances[:2], "supports": supports[:2]}
+    except Exception:
+        return "震荡", {"resistances": [], "supports": []}
+
+
+def tab_daily_report():
+    """Tab 1: 每日期货分析日报"""
+    st.subheader("📋 每日期货分析日报")
+
+    main_ct = get_main_contract()
+    spot_dict, _ = load_spot(str(SPOT_PATH))
+    spot_hash = _spot_hash(spot_dict)
+
+    # 使用缓存
+    with st.spinner("🔄 正在生成日报…"):
+        cache = _compute_daily_report_cache(main_ct, spot_hash)
+
+    if cache.get("error"):
+        st.error(f"❌ {cache['error']}")
+        return
+
+    html = cache["html"]
+    md = cache["md"]
+    cn_date = cache.get("cn_date", "")
+
+    # ── 下载按钮 ──
+    col_title, col_btn1, col_btn2 = st.columns([4, 1, 1])
+    with col_title:
+        st.caption(f"📅 报告日期：{cn_date} ｜ 主力合约：{main_ct}")
+    with col_btn1:
+        # Markdown download
+        st.download_button(
+            label="📄 下载 Markdown",
+            data=md.encode("utf-8"),
+            file_name=f"生猪期货日报_{cn_date.replace('年','').replace('月','').replace('日','')}.md",
+            mime="text/markdown",
+            use_container_width=True,
+            key="dl_md"
+        )
+    with col_btn2:
+        # PDF download - try reportlab
+        pdf_data = _build_reportlab_pdf(html, cn_date)
+        if pdf_data:
+            st.download_button(
+                label="📄 下载 PDF",
+                data=pdf_data,
+                file_name=f"生猪期货日报_{cn_date.replace('年','').replace('月','').replace('日','')}.pdf",
+                mime="application/pdf",
+                use_container_width=True,
+                key="dl_pdf"
+            )
+        else:
+            # Fallback: download HTML (user can print to PDF)
+            st.download_button(
+                label="📄 下载 HTML",
+                data=html.encode("utf-8"),
+                file_name=f"生猪期货日报_{cn_date.replace('年','').replace('月','').replace('日','')}.html",
+                mime="text/html",
+                use_container_width=True,
+                key="dl_html",
+                help="reportlab 未安装，提供 HTML 格式（可在浏览器中打开后打印为 PDF）"
+            )
+
+    # ── 渲染 HTML 日报 ──
+    st.markdown(html, unsafe_allow_html=True)
+
+    # ── 底部分隔 ──
+    st.markdown("---")
+
+
+# ══════════════════════════════════════════════════════════════
 # 主入口
 # ══════════════════════════════════════════════════════════════
 def main():
@@ -3763,20 +4319,26 @@ def main():
                 sync_futures(ct, force_full=False)
         st.session_state["_last_auto_sync_date"] = _today_str
 
-    # ── 七个 Tab ──
-    t1, t2, t3, t4, t5, t6, t7 = st.tabs([
-        "📊 当日基差分布", "📈 单合约基差走势", "🔄 合约基差比较",
-        "📉 合约价差比较", "📊 持仓与成交分析",
-        "📅 季节性持仓对比", "📉 技术分析",
+    # ── 八个 Tab ──
+    t1, t2, t3, t4, t5, t6, t7, t8 = st.tabs([
+        "📋 每日期货分析日报",     # Tab 1 (新增)
+        "📊 当日基差分布",         # Tab 2 (原 Tab 1)
+        "📈 单合约基差走势",       # Tab 3 (原 Tab 2)
+        "🔄 合约基差比较",         # Tab 4 (原 Tab 3)
+        "📉 合约价差比较",         # Tab 5 (原 Tab 4)
+        "📊 持仓与成交分析",       # Tab 6 (原 Tab 5)
+        "📅 季节性持仓对比",       # Tab 7 (原 Tab 6)
+        "📉 技术分析",             # Tab 8 (原 Tab 7)
     ])
 
-    with t1: tab1()
-    with t2: tab2()
-    with t3: tab3()
-    with t4: tab4()
-    with t5: tab5()
-    with t6: tab6()
-    with t7: tab7()
+    with t1: tab_daily_report()
+    with t2: tab1()
+    with t3: tab2()
+    with t4: tab3()
+    with t5: tab4()
+    with t6: tab5()
+    with t7: tab6()
+    with t8: tab7()
 
     # ── 页面底部信息 ──
     st.markdown("---")
