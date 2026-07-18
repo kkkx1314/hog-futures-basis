@@ -2825,7 +2825,7 @@ def _fetch_exact_holdings(ct: str, date_str: str, use_fallback: bool = True) -> 
 
 
 # ══════════════════════════════════════════════════════════════
-# 前20净持仓 聚合缓存（本地文件，快速加载）
+# 前20净持仓 聚合缓存 — 与期货价格数据完全一致的缓存逻辑
 # ══════════════════════════════════════════════════════════════
 
 def _net_agg_path(ct: str) -> Path:
@@ -2853,12 +2853,11 @@ def _migrate_existing_to_aggregated(ct: str) -> int:
     返回迁移的日期数。已存在聚合文件则跳过。"""
     agg_path = _net_agg_path(ct)
     if agg_path.exists():
-        return 0  # 已迁移
+        return 0
 
-    # 用 glob 只扫描该合约的 date-CSV 文件（避免遍历整个目录）
     rows = []
     for f in HOLDINGS_DIR.glob(f"{ct}_????????.csv"):
-        date_str = f.stem[len(ct)+1:]  # 提取 YYYYMMDD
+        date_str = f.stem[len(ct)+1:]
         if len(date_str) != 8:
             continue
         try:
@@ -2878,56 +2877,89 @@ def _migrate_existing_to_aggregated(ct: str) -> int:
     return 0
 
 
-def _update_net_latest(ct: str) -> int:
-    """更新净持仓数据 — 与 sync_futures 逻辑完全一致。
-    - 本地无聚合文件 → 全量下载该合约所有历史交易日（从上市日到最新日）
-    - 本地有聚合文件 → 增量下载最新缺失的交易日（不限制数量）
-    - 只写入真实 API 数据，无采样、无近似、无 max_attempts 限制"""
+def _download_net_single(ct: str, date_str: str) -> Optional[int]:
+    """拉取单日净持仓：前20多单合计 - 前20空单合计。失败返回 None。"""
+    h = _fetch_exact_holdings(ct, date_str, use_fallback=False)
+    if h is not None and not h.empty:
+        return int(h["long"].sum() - h["short"].sum())
+    return None
+
+
+def sync_net_holdings(ct: str, force_full: bool = False) -> Tuple[bool, str]:
+    """同步单个合约的净持仓数据（与 sync_futures 逻辑完全一致）。
+
+    - force_full=True: 获取该合约全部交易日列表，逐日拉取持仓数据
+    - force_full=False: 只拉取最新缺失的交易日
+    返回 (成功与否, 状态信息)
+    """
     cp = _csv_path(ct)
     if not cp.exists():
-        return 0
+        return False, "❌ 无期货 CSV"
+
     try:
         fut_df = pd.read_csv(cp, usecols=["date"])
         if fut_df.empty:
-            return 0
+            return False, "❌ 期货数据为空"
         fut_df["date"] = pd.to_datetime(fut_df["date"])
-    except Exception:
-        return 0
+    except Exception as e:
+        return False, f"❌ 读取期货CSV失败：{e}"
 
-    agg_df = _load_aggregated_net(ct)
-    is_first_sync = (agg_df is None or agg_df.empty)
-    all_trading_dates = sorted(fut_df["date"].unique())
-    cached_dates = set(agg_df["date"].dt.strftime("%Y%m%d")) if not is_first_sync else set()
-
-    # ── 增量模式：已是最新则秒过 ──
-    if not is_first_sync:
-        latest_trade_date = all_trading_dates[-1] if all_trading_dates else None
-        if latest_trade_date and agg_df["date"].max() >= latest_trade_date:
-            return 0  # 已是最新
-
-    # ── 收集所有待下载日期（无数量限制）──
-    pending_dates = []
-    for dt in all_trading_dates:
-        date_str = dt.strftime("%Y%m%d")
-        if date_str not in cached_dates:
-            pending_dates.append(date_str)
-
-    if not pending_dates:
-        return 0
-
-    fetched = 0
     agg_path = _net_agg_path(ct)
+    today = datetime.now()
 
-    def _fetch_one(ds: str):
-        h = _fetch_exact_holdings(ct, ds, use_fallback=False)
-        if h is not None and not h.empty:
-            return ds, int(h["long"].sum() - h["short"].sum())
-        return ds, None
+    # ── 增量更新（本地有聚合文件 且 不强制全量）──
+    if agg_path.exists() and not force_full:
+        try:
+            agg_df = pd.read_csv(agg_path)
+            agg_df["date"] = pd.to_datetime(agg_df["date"])
+            cached_set = set(agg_df["date"].dt.strftime("%Y%m%d"))
+            all_dates = sorted(fut_df["date"].unique())
+            pending = [d.strftime("%Y%m%d") for d in all_dates
+                       if d.strftime("%Y%m%d") not in cached_set]
 
-    if is_first_sync:
-        # 首次全量：并行下载所有交易日（5 线程）
+            if not pending:
+                return True, "📁 已是最新"
+
+            fetched = 0
+            for ds in pending:
+                net = _download_net_single(ct, ds)
+                if net is not None:
+                    new_row = pd.DataFrame([{"date": pd.to_datetime(ds), "net_position": net}])
+                    agg_df = agg_df[agg_df["date"] != pd.to_datetime(ds)]
+                    agg_df = pd.concat([agg_df, new_row], ignore_index=True)
+                    fetched += 1
+
+            if fetched > 0:
+                agg_df = agg_df.sort_values("date").reset_index(drop=True)
+                agg_df.to_csv(agg_path, index=False)
+            return True, f"🔄 增量 +{fetched}条" if fetched else "📁 无新数据"
+        except Exception as e:
+            return False, f"❌ 增量失败：{e}"
+
+    # ── 全量下载 ──
+    try:
+        # 尝试迁移旧 CSV
+        _migrate_existing_to_aggregated(ct)
+        agg_df = _load_aggregated_net(ct)
+        cached_set = set()
+        if agg_df is not None and not agg_df.empty:
+            cached_set = set(agg_df["date"].dt.strftime("%Y%m%d"))
+
+        all_dates = sorted(fut_df["date"].unique())
+        pending = [d.strftime("%Y%m%d") for d in all_dates
+                   if d.strftime("%Y%m%d") not in cached_set]
+
+        if not pending:
+            return True, "📁 已是最新"
+
+        fetched = 0
+        # 全量模式：并行下载（5 线程）
+        def _fetch_one(ds):
+            net = _download_net_single(ct, ds)
+            return ds, net
+
         with ThreadPoolExecutor(max_workers=5) as executor:
-            future_map = {executor.submit(_fetch_one, ds): ds for ds in pending_dates}
+            future_map = {executor.submit(_fetch_one, ds): ds for ds in pending}
             for future in as_completed(future_map):
                 ds, net = future.result()
                 if net is not None:
@@ -2938,61 +2970,75 @@ def _update_net_latest(ct: str) -> int:
                     else:
                         agg_df = new_row
                     fetched += 1
-                cached_dates.add(ds)
-    else:
-        # 增量模式：串行拉取缺失交易日（通常只有几天）
-        for ds in pending_dates:
-            holdings = _fetch_exact_holdings(ct, ds, use_fallback=False)
-            if holdings is not None and not holdings.empty:
-                net = int(holdings["long"].sum() - holdings["short"].sum())
-                new_row = pd.DataFrame([{"date": pd.to_datetime(ds), "net_position": net}])
-                if agg_df is not None and not agg_df.empty:
-                    agg_df = agg_df[agg_df["date"] != pd.to_datetime(ds)]
-                    agg_df = pd.concat([agg_df, new_row], ignore_index=True)
-                else:
-                    agg_df = new_row
-                fetched += 1
-            cached_dates.add(ds)
 
-    # 写入聚合文件
-    if agg_df is not None and not agg_df.empty:
-        agg_df = agg_df.sort_values("date").reset_index(drop=True)
-        agg_df.to_csv(agg_path, index=False)
+        if agg_df is not None and not agg_df.empty:
+            agg_df = agg_df.sort_values("date").reset_index(drop=True)
+            agg_df.to_csv(agg_path, index=False)
+            # 清除缓存
+            _build_seasonal_net_positions.clear()
+        return True, f"🌐 全量 {fetched}条/{len(pending)}天"
+    except Exception as e:
+        return False, f"❌ 下载失败：{e}"
 
-    return fetched
+
+def sync_all_net_holdings(max_workers: int = 4, progress_callback=None) -> Dict[str, str]:
+    """预下载 ALL_CONTRACTS 中所有合约的净持仓完整历史数据（并行）。
+    与 sync_all_contracts 逻辑完全一致。
+
+    max_workers: 并行下载线程数（净持仓 API 较慢，建议 3-4）
+    progress_callback: 可选，签名 (current, total, contract, status) -> None
+    返回 {合约: 状态信息}
+    """
+    missing = [c for c in ALL_CONTRACTS if not _net_agg_path(c).exists()
+               or _load_aggregated_net(c) is None]
+
+    if not missing:
+        return {}
+
+    results = {}
+    total = len(missing)
+
+    def _download_one(ct):
+        ok, msg = sync_net_holdings(ct, force_full=True)
+        return ct, ok, msg
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_map = {executor.submit(_download_one, ct): ct for ct in missing}
+        completed = 0
+        for future in as_completed(future_map):
+            ct, ok, msg = future.result()
+            results[ct] = msg
+            completed += 1
+            if progress_callback:
+                progress_callback(completed, total, ct, msg)
+
+    return results
 
 
 def _ensure_net_cache(ct: str) -> Optional[pd.DataFrame]:
-    """确保合约的聚合净持仓缓存存在且最新 — 与 load_futures 逻辑完全一致。
-    1. 本地有聚合文件 → 直接读取 + 增量追加缺失交易日
-    2. 本地无聚合文件 → 迁移旧 CSV → 全量下载所有交易日
-    返回完整的聚合 DataFrame。"""
+    """读取净持仓缓存（与 load_futures 逻辑完全一致）。
+    本地有聚合文件 → 直接读取返回。
+    本地无聚合文件 → 惰性同步（仅首次触发，之后秒读）。
+    """
     agg_path = _net_agg_path(ct)
 
-    # ── 本地有聚合文件 → 先读，再增量 ──
+    # ── 本地有数据 → 直接读 ──
     if agg_path.exists():
-        try:
-            agg_df = pd.read_csv(agg_path)
-            if not agg_df.empty and "date" in agg_df.columns and "net_position" in agg_df.columns:
-                agg_df["date"] = pd.to_datetime(agg_df["date"])
-                # 增量追加最新缺失的交易日
-                _update_net_latest(ct)
-                # 重新读取（可能已追加新数据）
-                return _load_aggregated_net(ct)
-        except Exception:
-            pass
+        agg_df = _load_aggregated_net(ct)
+        if agg_df is not None and not agg_df.empty:
+            return agg_df
 
-    # ── 本地无聚合文件 → 迁移 + 全量下载 ──
+    # ── 尝试迁移旧 CSV ──
     _migrate_existing_to_aggregated(ct)
     agg_df = _load_aggregated_net(ct)
     if agg_df is not None and not agg_df.empty:
-        # 迁移成功 → 增量追加
-        _update_net_latest(ct)
-        return _load_aggregated_net(ct)
+        return agg_df
 
-    # 无任何本地数据 → 全量下载
-    _update_net_latest(ct)
-    return _load_aggregated_net(ct)
+    # ── 惰性同步（与 load_futures 首次下载行为一致）──
+    ok, msg = sync_net_holdings(ct, force_full=True)
+    if ok:
+        return _load_aggregated_net(ct)
+    return None
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -3626,23 +3672,22 @@ def main():
 
     # ── 启动时后台下载所有合约信息（仅首次）──
     # Step 1: 下载所有缺失的期货合约数据（并行）
-    # Step 2: 下载所有缺失的净持仓聚合数据
-    # 完成后，所有 Tab 的季节性对比均可秒开，不会跳过任何历史同期合约
+    # Step 2: 下载所有缺失的净持仓聚合数据（并行）
     if "_startup_all_synced" not in st.session_state:
         st.session_state["_startup_all_synced"] = False
 
     if not st.session_state["_startup_all_synced"]:
-        # 统计缺失项
         missing_futures = [c for c in ALL_CONTRACTS if not _csv_path(c).exists()]
         all_with_futures_now = [c for c in ALL_CONTRACTS if _csv_path(c).exists()]
-        missing_net = [c for c in all_with_futures_now if not _net_agg_path(c).exists()]
+        missing_net = [c for c in all_with_futures_now if not _net_agg_path(c).exists()
+                       or _load_aggregated_net(c) is None]
 
         total_tasks = len(missing_futures) + len(missing_net)
         if total_tasks > 0:
             placeholder = st.empty()
             with placeholder.container():
                 st.info(
-                    f"📡 首次启动：正在后台下载所有历史合约数据，确保季节性对比不遗漏任何合约…\n\n"
+                    f"📡 首次启动：正在后台下载所有历史合约数据…\n\n"
                     f"📦 缺失期货数据：**{len(missing_futures)}** 个合约 ｜ "
                     f"📦 缺失净持仓数据：**{len(missing_net)}** 个合约 ｜ "
                     f"🔢 共 **{total_tasks}** 项任务"
@@ -3658,65 +3703,54 @@ def main():
                     def _fut_progress(current, total, ct, msg):
                         nonlocal completed
                         completed = current
-                        progress_bar.progress(
-                            completed / total_tasks,
-                            text=f"📈 期货 {completed}/{total} — {ct}: {msg}"
-                        )
-                        status_text.text(
-                            f"⏳ 期货下载中… {completed}/{len(missing_futures)} — {ct}: {msg}"
-                        )
+                        progress_bar.progress(completed / total_tasks,
+                            text=f"📈 期货 {completed}/{total} — {ct}: {msg}")
+                        status_text.text(f"⏳ 期货下载中… {completed}/{len(missing_futures)} — {ct}: {msg}")
 
-                    sync_all_contracts(
-                        max_workers=_sync_parallel_workers,
-                        progress_callback=_fut_progress,
-                    )
+                    sync_all_contracts(max_workers=_sync_parallel_workers,
+                                      progress_callback=_fut_progress)
                     completed = len(missing_futures)
                     progress_bar.progress(completed / total_tasks)
                     status_text.text(f"✅ 期货数据下载完成！{len(missing_futures)} 个合约已缓存。")
 
-                # ── Step 2: 重新扫描有期货数据的合约，下载缺失的净持仓 ──
+                # ── Step 2: 并行下载所有缺失的净持仓 ──
                 all_with_futures_now = [c for c in ALL_CONTRACTS if _csv_path(c).exists()]
-                missing_net = [c for c in all_with_futures_now if not _net_agg_path(c).exists()]
-                # ★ 重新计算总数（Step 1 可能新增了合约，导致 missing_net 变化）
+                missing_net = [c for c in all_with_futures_now if not _net_agg_path(c).exists()
+                               or _load_aggregated_net(c) is None]
                 total_tasks = len(missing_futures) + len(missing_net)
                 if total_tasks > 0:
                     progress_bar.progress(completed / total_tasks)
                 if missing_net:
-                    status_text.text(f"⏳ 正在下载 {len(missing_net)} 个合约的前20净持仓数据…")
-                    for i, c in enumerate(missing_net):
-                        progress_bar.progress(
-                            (completed + i + 1) / total_tasks,
-                            text=f"📊 净持仓 {i+1}/{len(missing_net)} — {c}"
-                        )
-                        status_text.text(
-                            f"⏳ {i+1}/{len(missing_net)} 正在下载 {c} 全量历史净持仓…"
-                        )
-                        _ensure_net_cache(c)
-                    completed += len(missing_net)
+                    status_text.text(f"⏳ 正在并行下载 {len(missing_net)} 个合约的净持仓数据（4 线程）…")
+
+                    def _net_progress(current, total, ct, msg):
+                        nonlocal completed
+                        completed = len(missing_futures) + current
+                        progress_bar.progress(min(completed / total_tasks, 1.0),
+                            text=f"📊 净持仓 {current}/{total} — {ct}: {msg}")
+                        status_text.text(f"⏳ 净持仓下载中… {current}/{len(missing_net)} — {ct}: {msg}")
+
+                    sync_all_net_holdings(max_workers=4, progress_callback=_net_progress)
+                    completed = total_tasks
                     progress_bar.progress(1.0)
                     _build_seasonal_net_positions.clear()
 
                 status_text.text(
-                    f"✅ 全部完成！期货 {len(missing_futures)} 个 + 净持仓 {len(missing_net)} 个合约数据已就绪，"
-                    f"季节性对比将覆盖所有历史同期合约。"
+                    f"✅ 全部完成！期货 {len(missing_futures)} 个 + 净持仓 {len(missing_net)} 个合约数据已就绪。"
                 )
             placeholder.empty()
         st.session_state["_startup_all_synced"] = True
 
-    # ── 自动增量同步：每 30 分钟拉取最新交易数据 ──
+    # ── 自动增量同步：每 30 分钟拉取最新数据 ──
     if "_last_auto_sync" not in st.session_state:
-        st.session_state["_last_auto_sync"] = datetime.now() - timedelta(hours=1)  # 首次强制同步
+        st.session_state["_last_auto_sync"] = datetime.now() - timedelta(hours=1)
 
     _mins_since_sync = (datetime.now() - st.session_state["_last_auto_sync"]).total_seconds() / 60
     if _mins_since_sync >= 30:
-        # 后台静默增量更新活跃合约（不清缓存，仅追加新数据）
         with st.spinner("📡 自动同步最新行情…"):
             for ct in get_active_contracts():
                 sync_futures(ct, force_full=False)
-            # 同时更新净持仓
-            for ct in get_active_contracts():
-                if _csv_path(ct).exists():
-                    _update_net_latest(ct)
+                sync_net_holdings(ct, force_full=False)
         st.session_state["_last_auto_sync"] = datetime.now()
 
     # ── 七个 Tab ──
@@ -3756,17 +3790,14 @@ def main():
     with c1:
         if st.button("🔄 刷新数据", use_container_width=True, key="main_refresh"):
             st.cache_data.clear()
-            # 重置启动标记，下次启动时重新检查缺失数据
             st.session_state["_startup_all_synced"] = False
             with st.spinner("🔄 正在同步最新数据（含所有历史合约）…"):
-                # ★ 同步所有合约（活跃 + 历史），确保季节性对比不遗漏
                 sync_active_contracts()
                 sync_all_contracts(max_workers=_sync_parallel_workers)
-                # 同时更新净持仓聚合文件
+                # 增量更新所有合约的净持仓
                 for ct in ALL_CONTRACTS:
                     if _csv_path(ct).exists():
-                        _migrate_existing_to_aggregated(ct)
-                        _update_net_latest(ct)
+                        sync_net_holdings(ct, force_full=False)
                 _build_seasonal_net_positions.clear()
             st.rerun()
     with c2:
