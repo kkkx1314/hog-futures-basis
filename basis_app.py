@@ -3801,11 +3801,11 @@ def main():
         if st.button("🔄 刷新数据", use_container_width=True, key="main_refresh"):
             st.cache_data.clear()
             st.session_state["_startup_all_synced"] = False
-            with st.spinner("🔄 正在同步最新数据（含所有历史合约）…"):
-                sync_active_contracts()
-                sync_all_contracts(max_workers=_sync_parallel_workers)
-                # 增量更新所有合约的净持仓
-                for ct in ALL_CONTRACTS:
+            st.session_state["_last_auto_sync_date"] = datetime.now().strftime("%Y%m%d")
+            with st.spinner("🔄 正在更新活跃合约最新数据…"):
+                # 只增量更新活跃合约（已是最新时秒过，<1秒）
+                for ct in get_active_contracts():
+                    sync_futures(ct, force_full=False)
                     if _csv_path(ct).exists():
                         sync_net_holdings(ct, force_full=False)
                 _build_seasonal_net_positions.clear()
