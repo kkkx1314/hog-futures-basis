@@ -3781,58 +3781,56 @@ def tab7():
 
 def _analyze_basis_historical(main_ct, spot_dict, fut_df, ltd, regions, snap) -> dict:
     """分析基差各指标的历史分位水平。
-    返回 {indicator: {current, hist_avg, hist_pct, label, hist_count}}"""
+    使用与 Tab4 完全一致的计算方法：calc_national_basis / get_summary_series。
+    历史同期 = 所有同月历史合约在同一(月, 日)的值取平均。"""
     result = {}
     if fut_df is None or fut_df.empty:
         return result
 
-    fc = float(fut_df[fut_df["date"] == ltd]["close"].iloc[0])
     target_m, target_d = ltd.month, ltd.day
-
-    # 构建历史基差序列：对每个指标，收集所有年份同月同日的数据
-    indicators = {
-        "全国均价基差": {"current": snap.get("national_avg", 0)},
-        "最大基差": {"current": snap.get("max_basis", 0), "region": snap.get("max_region", "")},
-        "最小基差": {"current": snap.get("min_basis", 0), "region": snap.get("min_region", "")},
-        "基差均值": {"current": snap.get("avg_basis", 0)},
-    }
-
-    # 收集所有同月合约的历史基差数据
     tmon = ct_month(main_ct)
     same_month_cts = [c for c in ALL_CONTRACTS if ct_month(c) == tmon]
-    for indicator, info in indicators.items():
+
+    indicators = {
+        "全国均价基差": {"current": snap.get("national_avg", 0), "fn": "national"},
+        "最大基差": {"current": snap.get("max_basis", 0), "fn": "max"},
+        "最小基差": {"current": snap.get("min_basis", 0), "fn": "min"},
+        "基差均值": {"current": snap.get("avg_basis", 0), "fn": "avg"},
+    }
+
+    for ind_name, info in indicators.items():
         hist_vals = []
+        fn_type = info["fn"]
+
         for c in same_month_cts:
             if c == main_ct:
-                continue  # 跳过自己
+                continue
             fdf, _ = load_futures(c)
             if fdf is None or fdf.empty:
                 continue
-            row = fdf[fdf["date"].dt.month == target_m]
-            row = row[row["date"].dt.day == target_d]
-            if row.empty:
-                continue
-            fc_hist = float(row["close"].iloc[0])
-            # 计算该合约该日的基差指标
+
+            # ★ 使用与 Tab4 _build_calendar_series_cached 完全一致的函数
             try:
                 c_regions = get_regions(c)
-                c_snap = compute_snapshot(c, spot_dict, fdf, row["date"].iloc[0], c_regions)
-                if c_snap:
-                    if indicator == "全国均价基差":
-                        hist_vals.append(c_snap.get("national_avg", 0))
-                    elif indicator == "最大基差":
-                        hist_vals.append(c_snap.get("max_basis", 0))
-                    elif indicator == "最小基差":
-                        hist_vals.append(c_snap.get("min_basis", 0))
-                    elif indicator == "基差均值":
-                        hist_vals.append(c_snap.get("avg_basis", 0))
+                if fn_type == "national":
+                    na_df = calc_national_basis(spot_dict, fdf)
+                    if na_df is not None and not na_df.empty:
+                        row = na_df[(na_df["date"].dt.month == target_m) & (na_df["date"].dt.day == target_d)]
+                        if not row.empty:
+                            hist_vals.append(int(row["basis"].iloc[-1]))
+                else:
+                    _, max_df, min_df, avg_df = get_summary_series(c, spot_dict, fdf, c_regions)
+                    target_df = {"max": max_df, "min": min_df, "avg": avg_df}.get(fn_type)
+                    if target_df is not None and not target_df.empty:
+                        row = target_df[(target_df["date"].dt.month == target_m) & (target_df["date"].dt.day == target_d)]
+                        if not row.empty:
+                            hist_vals.append(int(row["basis"].iloc[-1]))
             except Exception:
                 continue
 
         cur = info["current"]
         if hist_vals and len(hist_vals) >= 1:
             hist_avg = int(np.mean(hist_vals))
-            # 计算当前值在历史中的分位
             sorted_vals = sorted(hist_vals)
             rank = sum(1 for v in sorted_vals if v < cur)
             pct = rank / len(sorted_vals) * 100
@@ -3844,20 +3842,14 @@ def _analyze_basis_historical(main_ct, spot_dict, fut_df, ltd, regions, snap) ->
             else:
                 level = "历史均值附近"
 
-            result[indicator] = {
-                "current": cur,
-                "hist_avg": hist_avg,
-                "hist_count": len(hist_vals),
-                "pct": pct,
-                "level": level,
+            result[ind_name] = {
+                "current": cur, "hist_avg": hist_avg,
+                "hist_count": len(hist_vals), "pct": pct, "level": level,
             }
         else:
-            result[indicator] = {
-                "current": cur,
-                "hist_avg": None,
-                "hist_count": 0,
-                "pct": None,
-                "level": "暂无历史数据",
+            result[ind_name] = {
+                "current": cur, "hist_avg": None,
+                "hist_count": 0, "pct": None, "level": "暂无历史数据",
             }
 
     return result
@@ -4310,7 +4302,7 @@ def _build_reportlab_pdf(html_content: str, cn_date: str, chart_images: dict = N
 
 
 # ★ 修改日报逻辑后递增此版本号，使旧缓存自动失效
-_DAILY_REPORT_VERSION = 6
+_DAILY_REPORT_VERSION = 7
 
 @st.cache_data(ttl=120, show_spinner=False)
 def _compute_daily_report_cache(main_ct: str, spot_hash: int, _version: int = 0) -> dict:
