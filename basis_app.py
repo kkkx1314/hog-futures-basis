@@ -3780,16 +3780,29 @@ def tab7():
 # ══════════════════════════════════════════════════════════════
 
 def _analyze_basis_historical(main_ct, spot_dict, fut_df, ltd, regions, snap) -> dict:
-    """分析基差各指标的历史分位水平。
-    使用与 Tab4 完全一致的计算方法：calc_national_basis / get_summary_series。
-    历史同期 = 所有同月历史合约在同一(月, 日)的值取平均。"""
+    """基差各指标的历史同期对比。
+    与 Tab4 完全一致：calc_national_basis / get_summary_series。
+    历史同期 = 所有同月历史合约在同一(月, 日)的值。"""
     result = {}
     if fut_df is None or fut_df.empty:
         return result
 
     target_m, target_d = ltd.month, ltd.day
     tmon = ct_month(main_ct)
-    same_month_cts = [c for c in ALL_CONTRACTS if ct_month(c) == tmon]
+    # ★ 所有同月合约（不设上限）
+    same_month_cts = [c for c in ALL_CONTRACTS if ct_month(c) == tmon and c != main_ct]
+
+    def _get_row_at_md_flex(df, m, d):
+        """在df中找指定月/日行，精确匹配失败则±1天兜底"""
+        if df is None or df.empty: return None
+        row = df[(df["date"].dt.month == m) & (df["date"].dt.day == d)]
+        if not row.empty: return row
+        # ±1天兜底
+        for offset in [1, -1, 2, -2]:
+            shifted = pd.Timestamp(year=2020, month=m, day=d) + pd.Timedelta(days=offset)
+            row = df[(df["date"].dt.month == shifted.month) & (df["date"].dt.day == shifted.day)]
+            if not row.empty: return row
+        return None
 
     indicators = {
         "全国均价基差": {"current": snap.get("national_avg", 0), "fn": "national"},
@@ -3803,54 +3816,40 @@ def _analyze_basis_historical(main_ct, spot_dict, fut_df, ltd, regions, snap) ->
         fn_type = info["fn"]
 
         for c in same_month_cts:
-            if c == main_ct:
-                continue
             fdf, _ = load_futures(c)
-            if fdf is None or fdf.empty:
-                continue
-
-            # ★ 使用与 Tab4 _build_calendar_series_cached 完全一致的函数
+            if fdf is None or fdf.empty: continue
             try:
                 c_regions = get_regions(c)
                 if fn_type == "national":
                     na_df = calc_national_basis(spot_dict, fdf)
-                    if na_df is not None and not na_df.empty:
-                        row = na_df[(na_df["date"].dt.month == target_m) & (na_df["date"].dt.day == target_d)]
-                        if not row.empty:
-                            hist_vals.append(int(row["basis"].iloc[-1]))
+                    row = _get_row_at_md_flex(na_df, target_m, target_d)
+                    if row is not None: hist_vals.append(int(row["basis"].iloc[-1]))
                 else:
                     _, max_df, min_df, avg_df = get_summary_series(c, spot_dict, fdf, c_regions)
                     target_df = {"max": max_df, "min": min_df, "avg": avg_df}.get(fn_type)
-                    if target_df is not None and not target_df.empty:
-                        row = target_df[(target_df["date"].dt.month == target_m) & (target_df["date"].dt.day == target_d)]
-                        if not row.empty:
-                            hist_vals.append(int(row["basis"].iloc[-1]))
+                    row = _get_row_at_md_flex(target_df, target_m, target_d)
+                    if row is not None: hist_vals.append(int(row["basis"].iloc[-1]))
             except Exception:
                 continue
 
         cur = info["current"]
-        if hist_vals and len(hist_vals) >= 1:
+        if hist_vals:
             hist_avg = int(np.mean(hist_vals))
             sorted_vals = sorted(hist_vals)
             rank = sum(1 for v in sorted_vals if v < cur)
             pct = rank / len(sorted_vals) * 100
 
+            # ★ 判断：当前处于历史同期什么位置
             if pct >= 80:
-                level = "历史偏高水平"
+                level = f"处于历史同期偏高水平（超过{pct:.0f}%的同期值）"
             elif pct <= 20:
-                level = "历史偏低水平"
+                level = f"处于历史同期偏低水平（仅高于{pct:.0f}%的同期值）"
             else:
-                level = "历史均值附近"
+                level = f"处于历史同期均值附近（分位{pct:.0f}%）"
 
-            result[ind_name] = {
-                "current": cur, "hist_avg": hist_avg,
-                "hist_count": len(hist_vals), "pct": pct, "level": level,
-            }
+            result[ind_name] = {"current": cur, "hist_avg": hist_avg, "pct": pct, "level": level}
         else:
-            result[ind_name] = {
-                "current": cur, "hist_avg": None,
-                "hist_count": 0, "pct": None, "level": "暂无历史数据",
-            }
+            result[ind_name] = {"current": cur, "hist_avg": None, "pct": None, "level": "暂无历史同期数据"}
 
     return result
 
@@ -3866,69 +3865,43 @@ def _build_basis_analysis_html(snap, basis_enhanced, na_basis, max_region, max_b
 
     # 全国均价基差
     na = be.get("全国均价基差", {})
-    if na:
+    if na and na.get("hist_avg") is not None:
         na_cur = na.get("current", 0)
-        na_hist = na.get("hist_avg")
+        na_hist = na.get("hist_avg", 0)
         na_level = na.get("level", "")
-        na_pct = na.get("pct")
-        na_cnt = na.get("hist_count", 0)
-        if na_hist is not None and na_cnt >= 1:
-            tag_cls = "bull" if (na_pct and na_pct >= 80) else ("bear" if (na_pct and na_pct <= 20) else "neutral")
-            parts.append(f"全国均价基差 <b>{na_cur:+,}元/吨</b>，"
-                       f"历史同期均值 {na_hist:+,}元/吨（{na_cnt}年），"
-                       f"处于<span class=\"tag tag-{tag_cls}\">{na_level}</span>（分位{na_pct:.0f}%）")
-        else:
-            parts.append(f"全国均价基差 <b>{na_cur:+,}元/吨</b>（{na_level}）")
+        na_pct = na.get("pct", 50)
+        tag_cls = "bull" if na_pct >= 80 else ("bear" if na_pct <= 20 else "neutral")
+        parts.append(f"全国均价基差 <b>{na_cur:+,}元/吨</b>，"
+                   f"历史同期均值 {na_hist:+,}元/吨，{na_level}")
 
-    # 最大基差（与全国均价基差同一格式：含历史同期均值+分位）
+    # 最大基差
     mx = be.get("最大基差", {})
-    if mx:
+    if mx and mx.get("hist_avg") is not None:
         mx_region = snap.get("max_region", "") if snap else ""
         mx_cur = mx.get("current", 0)
-        mx_hist = mx.get("hist_avg")
+        mx_hist = mx.get("hist_avg", 0)
         mx_level = mx.get("level", "")
-        mx_pct = mx.get("pct")
-        mx_cnt = mx.get("hist_count", 0)
-        if mx_hist is not None and mx_cnt >= 1:
-            tag_cls = "bull" if (mx_pct and mx_pct >= 80) else ("bear" if (mx_pct and mx_pct <= 20) else "neutral")
-            parts.append(f"最大基差（{mx_region}）<b>{mx_cur:+,}元/吨</b>，"
-                       f"历史同期均值 {mx_hist:+,}元/吨（{mx_cnt}年），"
-                       f"处于<span class=\"tag tag-{tag_cls}\">{mx_level}</span>（分位{mx_pct:.0f}%）")
-        else:
-            parts.append(f"最大基差（{mx_region}）<b>{mx_cur:+,}元/吨</b>（{mx_level}）")
+        parts.append(f"最大基差（{mx_region}）<b>{mx_cur:+,}元/吨</b>，"
+                   f"历史同期均值 {mx_hist:+,}元/吨，{mx_level}")
 
-    # 最小基差（与全国均价基差同一格式：含历史同期均值+分位）
+    # 最小基差
     mn = be.get("最小基差", {})
-    if mn:
+    if mn and mn.get("hist_avg") is not None:
         mn_region = snap.get("min_region", "") if snap else ""
         mn_cur = mn.get("current", 0)
-        mn_hist = mn.get("hist_avg")
+        mn_hist = mn.get("hist_avg", 0)
         mn_level = mn.get("level", "")
-        mn_pct = mn.get("pct")
-        mn_cnt = mn.get("hist_count", 0)
-        if mn_hist is not None and mn_cnt >= 1:
-            tag_cls = "bull" if (mn_pct and mn_pct >= 80) else ("bear" if (mn_pct and mn_pct <= 20) else "neutral")
-            parts.append(f"最小基差（{mn_region}）<b>{mn_cur:+,}元/吨</b>，"
-                       f"历史同期均值 {mn_hist:+,}元/吨（{mn_cnt}年），"
-                       f"处于<span class=\"tag tag-{tag_cls}\">{mn_level}</span>（分位{mn_pct:.0f}%）")
-        else:
-            parts.append(f"最小基差（{mn_region}）<b>{mn_cur:+,}元/吨</b>（{mn_level}）")
+        parts.append(f"最小基差（{mn_region}）<b>{mn_cur:+,}元/吨</b>，"
+                   f"历史同期均值 {mn_hist:+,}元/吨，{mn_level}")
 
     # 基差均值
     avg = be.get("基差均值", {})
-    if avg:
+    if avg and avg.get("hist_avg") is not None:
         avg_cur = avg.get("current", 0)
+        avg_hist = avg.get("hist_avg", 0)
         avg_level = avg.get("level", "")
-        avg_pct = avg.get("pct")
-        avg_hist = avg.get("hist_avg")
-        avg_cnt = avg.get("hist_count", 0)
-        if avg_hist is not None and avg_cnt >= 1:
-            tag_cls = "bull" if (avg_pct and avg_pct >= 80) else ("bear" if (avg_pct and avg_pct <= 20) else "neutral")
-            parts.append(f"基差均值 <b>{avg_cur:+,}元/吨</b>，"
-                       f"历史同期均值 {avg_hist:+,}元/吨（{avg_cnt}年），"
-                       f"处于<span class=\"tag tag-{tag_cls}\">{avg_level}</span>（分位{avg_pct:.0f}%）")
-        else:
-            parts.append(f"基差均值 <b>{avg_cur:+,}元/吨</b>（{avg_level}）")
+        parts.append(f"基差均值 <b>{avg_cur:+,}元/吨</b>，"
+                   f"历史同期均值 {avg_hist:+,}元/吨，{avg_level}")
 
     return "<br>".join(f"• {p}" for p in parts) if parts else "基差数据暂不可用"
 
@@ -4003,77 +3976,56 @@ def _analyze_vol_oi_momentum(fut_df, ltd, main_ct="") -> dict:
 
 
 def _review_historical_oi_pattern(main_ct, ltd, cur_oi) -> str:
-    """复盘历史同期持仓量趋势：同月合约在每年同期的OI走势"""
+    """复盘历史持仓量：一般什么时间开始减仓"""
     try:
         tmon = ct_month(main_ct)
         same_month_cts = [c for c in ALL_CONTRACTS if ct_month(c) == tmon and c != main_ct]
         if not same_month_cts:
             return "暂无历史合约数据"
 
-        target_m, target_d = ltd.month, ltd.day
-        peak_months = []
-        current_vs_peak = []
-
+        decline_starts = []  # 记录每个历史合约持仓开始下滑的时间点
         for c in same_month_cts:
             fdf, _ = load_futures(c)
-            if fdf is None or fdf.empty:
-                continue
+            if fdf is None or fdf.empty: continue
             oi_col = "open_interest" if "open_interest" in fdf.columns else ("hold" if "hold" in fdf.columns else None)
-            if oi_col is None:
-                continue
+            if oi_col is None: continue
             oi_series = fdf[oi_col].astype(float)
             dates = pd.to_datetime(fdf["date"])
+            if len(oi_series) < 30: continue
 
-            # 找该合约的OI峰值月份
+            # 找OI峰值位置
             peak_idx = int(oi_series.idxmax())
-            peak_month = dates.iloc[peak_idx].month
-            peak_months.append(peak_month)
+            peak_date = dates.iloc[peak_idx]
+            peak_val = float(oi_series.iloc[peak_idx])
 
-            # 找该合约在target_m/target_d附近的OI值
-            same_day = dates[(dates.dt.month == target_m) & (dates.dt.day == target_d)]
-            if not same_day.empty:
-                idx = same_day.index[0]
-                same_day_oi = float(oi_series.iloc[fdf.index.get_loc(idx)] if idx in fdf.index else oi_series.iloc[-1])
-                peak_oi = float(oi_series.iloc[peak_idx])
-                current_vs_peak.append((same_day_oi, peak_oi, c))
+            # 从峰值往后找首次跌破90%峰值的日期（减仓开始信号）
+            after_peak = oi_series.iloc[peak_idx:]
+            after_dates = dates.iloc[peak_idx:]
+            decline_idx = None
+            for j in range(len(after_peak)):
+                if float(after_peak.iloc[j]) < peak_val * 0.90:
+                    decline_idx = j
+                    break
+            if decline_idx is not None and decline_idx > 0:
+                decline_date = after_dates.iloc[decline_idx]
+                decline_starts.append((peak_date, decline_date, int(decline_date.month * 100 + decline_date.day)))
 
-        if not peak_months:
-            return "暂无历史数据"
+        if not decline_starts:
+            return "暂无足够历史数据判断减仓时间"
 
-        # 最常见的峰值月份
-        from collections import Counter
-        peak_counter = Counter(peak_months)
-        most_common_peak = peak_counter.most_common(1)[0][0]
-        peak_month_cn = f"{most_common_peak}月"
+        # 典型的减仓开始时间（中位数）
+        from statistics import median
+        decline_md = sorted(ds[2] for ds in decline_starts)
+        median_md = int(median(decline_md))
+        median_month = median_md // 100
+        median_day = median_md % 100
 
-        # 检查当前合约是否已过典型峰值月
-        current_month = target_m
-        if current_month > most_common_peak:
-            phase = f"当前已过历史典型持仓峰值月（{peak_month_cn}），"
-        elif current_month == most_common_peak:
-            phase = f"当前正处于历史典型持仓峰值月（{peak_month_cn}），"
-        else:
-            phase = f"距离历史典型持仓峰值月（{peak_month_cn}）还有{most_common_peak - current_month}个月，"
+        # 最早的减仓和最晚的减仓
+        earliest = decline_starts[0]
+        latest = decline_starts[-1]
 
-        # 历史上同期的OI vs 峰值
-        if current_vs_peak:
-            ratios = [s / p for s, p, _ in current_vs_peak if p > 0]
-            avg_ratio = np.mean(ratios) if ratios else 1.0
-            if avg_ratio < 0.7:
-                phase += f"历史同期OI平均仅为峰值的{avg_ratio*100:.0f}%，属季节性低位"
-            elif avg_ratio > 0.9:
-                phase += f"历史同期OI平均为峰值的{avg_ratio*100:.0f}%，仍在高位运行"
-            else:
-                phase += f"历史同期OI平均为峰值的{avg_ratio*100:.0f}%"
-        else:
-            phase += "暂无同期对比数据"
-
-        # 汇总
-        n_contracts = len(set(c for _, _, c in current_vs_peak))
-        if n_contracts >= 1:
-            phase += f"（基于{n_contracts}个历史合约）"
-
-        return phase
+        return (f"历史同月合约通常在<b>{median_month}月{median_day}日</b>前后开始减仓"
+                f"（最早{earliest[1].month}月{earliest[1].day}日，最晚{latest[1].month}月{latest[1].day}日）")
     except Exception:
         return "历史复盘数据不足"
 
@@ -4820,25 +4772,22 @@ def _compute_key_spread(main_ct: str, ltd=None) -> str:
 
         if len(same_day_vals) >= 1:
             hist_avg = float(np.mean(same_day_vals))
-            hist_label = f"历史同期（{len(same_day_vals)}年）均值"
+            sorted_v = sorted(same_day_vals)
+            rank = sum(1 for v in sorted_v if v < latest_spread)
+            pct = rank / len(sorted_v) * 100
+            if pct >= 80:
+                pos = f"处于历史同期偏高水平（超过{pct:.0f}%的同期值）"
+            elif pct <= 20:
+                pos = f"处于历史同期偏低水平（仅高于{pct:.0f}%的同期值）"
+            else:
+                pos = f"处于历史同期均值附近（分位{pct:.0f}%）"
         else:
-            # 无历史数据，仅显示当前值
-            cn_dt = _cn(pd.Timestamp(latest_dt))
-            return (f"{ct_a}-{ct_b} 价差 <b>{latest_spread:+,.0f}元/吨</b>（{cn_dt}），"
-                    f"暂无同月同日历史数据可供对比")
-
-        diff = latest_spread - hist_avg
-        if diff > 300:
-            label = "偏高"
-        elif diff < -300:
-            label = "偏低"
-        else:
-            label = "中性"
+            return (f"{ct_a}-{ct_b} 价差 <b>{latest_spread:+,.0f}元/吨</b>（{_cn(pd.Timestamp(latest_dt))}），"
+                    f"暂无同月同日历史数据")
 
         cn_dt = _cn(pd.Timestamp(latest_dt))
         return (f"{ct_a}-{ct_b} 价差 <b>{latest_spread:+,.0f}元/吨</b>（{cn_dt}），"
-                f"{hist_label} <b>{hist_avg:+,.0f}元/吨</b>，"
-                f"偏离{abs(diff):.0f}元/吨，当前<span class=\"tag tag-{'bull' if diff > 300 else ('bear' if diff < -300 else 'neutral')}\">{label}</span>")
+                f"历史同期均值 <b>{hist_avg:+,.0f}元/吨</b>，{pos}")
     except Exception as e:
         return f"价差计算异常: {e}"
 
