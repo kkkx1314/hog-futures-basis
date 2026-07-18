@@ -4046,11 +4046,11 @@ def _build_daily_report_html(main_ct: str, fut_df, spot_dict, ltd, prev_td,
     elif tech_summary in ("空头", "偏空"): bear_score += 1
 
     if bull_score > bear_score:
-        overall = "🐂 市场整体偏多，可关注回调机会"
+        overall = "🐂 市场整体偏多"
     elif bear_score > bull_score:
-        overall = "🐻 市场整体偏空，建议观望为主"
+        overall = "🐻 市场整体偏空"
     else:
-        overall = "⚖️ 市场多空交织，短期方向不明，建议观望"
+        overall = "⚖️ 市场多空交织，短期方向不明"
 
     # ── 持仓量与成交量分析 HTML ──
     vo = vol_oi_analysis or {}
