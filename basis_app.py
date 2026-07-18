@@ -4898,9 +4898,7 @@ def tab_daily_report():
     with col_title:
         st.caption(f"📅 报告日期：{cn_date} ｜ 主力合约：{main_ct}")
     with col_btn1:
-        pdf_data = _build_weasyprint_pdf(html, cn_date)
-        if pdf_data is None:
-            pdf_data = _build_reportlab_pdf(html, cn_date, chart_images)
+        pdf_data = _build_reportlab_pdf(html, cn_date, chart_images)
         if pdf_data:
             st.download_button("📄 下载 PDF", data=pdf_data,
                 file_name=f"生猪期货日报_{cn_date.replace('年','').replace('月','').replace('日','')}.pdf",
