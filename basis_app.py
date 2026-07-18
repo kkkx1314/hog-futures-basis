@@ -3820,10 +3820,12 @@ def _build_daily_report_html(main_ct: str, fut_df, spot_dict, ltd, prev_td,
     # 价差
     spread_text = key_spread_info if key_spread_info else "暂无价差数据"
 
-    # 持仓（使用分析结果）
+    # 持仓（使用分析结果，明确标注数据日期）
     ha = holdings_analysis or {}
     if ha.get("available"):
+        data_date_note = f"（数据日期：{ha.get('data_date', '')}）" if ha.get('data_date') else ""
         pos_section = f"""
+        <p style="font-size:0.85rem;color:#888;margin-bottom:4px;">📡 数据日期：<b>{ha.get('data_date', '')}</b></p>
         <div class="grid2">
         <div class="kv"><span class="k">前20多单合计</span><span class="v">{ha['total_long']:,} 手</span></div>
         <div class="kv"><span class="k">前20空单合计</span><span class="v">{ha['total_short']:,} 手</span></div>
@@ -3835,7 +3837,7 @@ def _build_daily_report_html(main_ct: str, fut_df, spot_dict, ltd, prev_td,
         📌 综合：<b>{ha['overall_judge']}</b>
         </p>"""
     else:
-        pos_section = "<p>⚠️ 前20持仓数据缺失（当日大商所数据尚未发布）</p>"
+        pos_section = f"<p>⚠️ 前20持仓数据未更新（{ha.get('data_date', '')}：当日大商所持仓排名尚未发布，通常T+1更新）</p>"
 
     # 技术
     tech_summary = trend_direction if trend_direction else "震荡"
@@ -4149,48 +4151,40 @@ def _build_reportlab_pdf(html_content: str, cn_date: str, chart_images: dict = N
         return None
 
 
-@st.cache_data(ttl=600, show_spinner=False)
+@st.cache_data(ttl=300, show_spinner=False)
 def _compute_daily_report_cache(main_ct: str, spot_hash: int) -> dict:
-    """缓存日报计算，避免重复加载。返回所有日报所需数据。"""
+    """缓存日报计算。期货数据用最新交易日，持仓数据用API实际返回日期。"""
     spot_dict, _ = load_spot(str(SPOT_PATH))
     fut_df, _ = load_futures(main_ct)
-    ltd = get_latest_trade_date()
-    if ltd is None:
-        return {"error": "无交易数据"}
     if fut_df is None or fut_df.empty:
         return {"error": "期货数据不可用"}
 
+    # ── 期货最新交易日 ──
     fds = sorted(fut_df["date"].unique())
-    # Normalize ltd
-    ltd_ts = pd.Timestamp(ltd) if not isinstance(ltd, pd.Timestamp) else ltd
-    if ltd_ts not in list(fds):
-        fds_dates = [d.date() if hasattr(d, 'date') else d for d in fds]
-        target_date = ltd_ts.date() if hasattr(ltd_ts, 'date') else ltd_ts
-        nearby = [d for d in fds_dates if d <= target_date]
-        if nearby:
-            ltd_ts = pd.Timestamp(nearby[-1])
-
-    td_idx = list(fds).index(ltd_ts) if ltd_ts in list(fds) else -1
+    ltd_ts = pd.Timestamp(fds[-1])  # 直接用期货数据的最后一天
+    td_idx = len(fds) - 1
     prev_td = fds[td_idx - 1] if td_idx > 0 else None
 
-    # 基差快照
+    # ── 基差快照（使用期货数据日期）──
     regions = get_regions(main_ct)
     snap = compute_snapshot(main_ct, spot_dict, fut_df, ltd_ts, regions)
 
-    # 持仓数据（真实akshare数据）
-    holdings_df = _get_holdings(main_ct, ltd_ts)
-    holdings_analysis = _analyze_holdings_for_report(holdings_df, main_ct, ltd_ts)
+    # ── 持仓数据（真实的akshare数据，记录实际数据日期）──
+    holdings_df, holdings_actual_date, holdings_source = _get_holdings(
+        main_ct, ltd_ts, return_meta=True)
+    holdings_analysis = _analyze_holdings_for_report(
+        holdings_df, main_ct, ltd_ts, holdings_actual_date)
 
-    # 价差
-    spread_info = _compute_key_spread(main_ct)
+    # ── 价差（使用期货数据日期）──
+    spread_info = _compute_key_spread(main_ct, ltd_ts)
 
-    # 技术分析
+    # ── 技术分析（使用期货数据）──
     trend_dir, sr_info = _quick_technical(fut_df, ltd_ts)
 
-    # 生成图表并编码为base64
-    chart_images = _generate_report_charts(main_ct, spot_dict, fut_df, ltd_ts, regions, snap)
+    # ── 生成图表 ──
+    chart_images = _generate_report_charts(main_ct, spot_dict, ltd_ts)
 
-    # 构建HTML和MD
+    # ── 构建HTML和MD ──
     html = _build_daily_report_html(main_ct, fut_df, spot_dict, ltd_ts, prev_td,
                                      snap, holdings_analysis, spread_info,
                                      trend_dir, sr_info, chart_images)
@@ -4198,20 +4192,24 @@ def _compute_daily_report_cache(main_ct: str, spot_hash: int) -> dict:
                                  snap, holdings_analysis, spread_info,
                                  trend_dir, sr_info)
 
-    return {"html": html, "md": md, "error": None, "ltd": ltd_ts, "cn_date": _cn(ltd_ts),
+    return {"html": html, "md": md, "error": None,
+            "ltd": ltd_ts, "cn_date": _cn(ltd_ts),
+            "holdings_date": holdings_actual_date,
             "chart_images": chart_images}
 
 
-def _analyze_holdings_for_report(holdings_df, main_ct, ltd):
-    """分析持仓数据，提取正指/反指动向。数据必须来自真实API。"""
+def _analyze_holdings_for_report(holdings_df, main_ct, ltd, holdings_actual_date=None):
+    """分析持仓数据。数据必须来自真实API，缺失时标注'数据未更新'。"""
     if holdings_df is None or holdings_df.empty:
+        date_str = str(holdings_actual_date)[:8] if holdings_actual_date else _cn(ltd)
         return {
             "available": False,
+            "data_date": date_str,
             "total_long": 0, "total_short": 0, "net_pos": 0,
-            "net_judge": "数据缺失",
-            "zhengzhi_summary": "数据缺失",
-            "fanzhi_summary": "数据缺失",
-            "overall_judge": "数据缺失",
+            "net_judge": "数据未更新",
+            "zhengzhi_summary": "数据未更新（当日大商所持仓排名尚未发布，通常T+1更新）",
+            "fanzhi_summary": "数据未更新",
+            "overall_judge": "数据未更新",
         }
 
     total_long = int(holdings_df["long"].sum())
@@ -4224,6 +4222,16 @@ def _analyze_holdings_for_report(holdings_df, main_ct, ltd):
         net_judge = "偏空"
     else:
         net_judge = "中性"
+
+    # 数据日期
+    if holdings_actual_date:
+        try:
+            data_dt = pd.to_datetime(holdings_actual_date, format="%Y%m%d")
+            data_date_str = _cn(data_dt)
+        except Exception:
+            data_date_str = str(holdings_actual_date)
+    else:
+        data_date_str = _cn(ltd)
 
     # 正指分析
     zhengzhi_parts = []
@@ -4296,11 +4304,12 @@ def _analyze_holdings_for_report(holdings_df, main_ct, ltd):
         "net_judge": net_judge,
         "zhengzhi_summary": f"正指{zz_dir}（{zz_market}）：{'；'.join(zhengzhi_parts) if zhengzhi_parts else '无正指席位数据'}",
         "fanzhi_summary": f"反指{fz_dir}（{fz_market}）：{'；'.join(fanzhi_parts) if fanzhi_parts else '无反指席位数据'}",
-        "overall_judge": f"正指{zz_dir}，反指{fz_dir}，{overall}",
+        "data_date": data_date_str,
+        "overall_judge": f"持仓日期：{data_date_str}｜正指{zz_dir}，反指{fz_dir}，{overall}",
     }
 
 
-def _generate_report_charts(main_ct, spot_dict, fut_df, ltd, regions, snap) -> dict:
+def _generate_report_charts(main_ct, spot_dict, ltd) -> dict:
     """生成日报所需图表，返回 {name: base64_png}"""
     import base64
     charts = {}
@@ -4387,32 +4396,40 @@ def _generate_report_charts(main_ct, spot_dict, fut_df, ltd, regions, snap) -> d
     return charts
 
 
-def _compute_key_spread(main_ct: str) -> str:
-    """计算主力合约与次主力合约的价差"""
+def _compute_key_spread(main_ct: str, ltd=None) -> str:
+    """计算主力合约与次主力合约的价差（使用指定交易日数据）"""
     active = get_active_contracts()
     if len(active) < 2:
         return "暂无足够合约计算价差"
     try:
         ct_a = main_ct
-        others = [c for c in active if c != ct_a]
+        others = [c for c in active if ct_month(c) != ct_month(main_ct)]
+        if not others:
+            others = [c for c in active if c != ct_a]
         if not others:
             return "暂无其他上市合约"
-        ct_b = others[0]  # 次主力
+        ct_b = others[0]
         dfa, _ = load_futures(ct_a)
         dfb, _ = load_futures(ct_b)
         if dfa is None or dfa.empty or dfb is None or dfb.empty:
-            return "价差数据不足"
+            return f"{ct_a}-{ct_b} 价差数据不足"
         ac = dfa.set_index("date")["close"]
         bc = dfb.set_index("date")["close"]
-        cm = ac.index.intersection(bc.index)
+        cm = sorted(ac.index.intersection(bc.index))
         if len(cm) == 0:
-            return "无共同交易日"
-        latest_spread = float(ac[cm[-1]] - bc[cm[-1]])
-        hist_spread = (ac[cm] - bc[cm]).mean()
-        label = "偏高" if latest_spread > hist_spread + 200 else ("偏低" if latest_spread < hist_spread - 200 else "中性")
-        return f"{main_ct}-{ct_b} 价差 <b>{latest_spread:+,.0f}元/吨</b>，较历史均值（{hist_spread:+,.0f}）{label}"
-    except Exception:
-        return "价差计算失败"
+            return f"{ct_a}-{ct_b} 无共同交易日"
+        # 使用指定日期或最新共同日期
+        if ltd and ltd in ac.index and ltd in bc.index:
+            latest_dt = ltd
+        else:
+            latest_dt = cm[-1]
+        latest_spread = float(ac[latest_dt] - bc[latest_dt])
+        hist_spread = float((ac[cm] - bc[cm]).mean())
+        diff = latest_spread - hist_spread
+        label = "偏高" if diff > 200 else ("偏低" if diff < -200 else "中性")
+        return f"{ct_a}-{ct_b} 价差 <b>{latest_spread:+,.0f}元/吨</b>（{_cn(pd.Timestamp(latest_dt))}），历史均值 {hist_spread:+,.0f}元/吨，当前{label}"
+    except Exception as e:
+        return f"价差计算异常: {e}"
 
 
 def _quick_technical(fut_df, ltd) -> Tuple[str, dict]:
