@@ -4087,26 +4087,34 @@ def _build_daily_report_html(main_ct: str, fut_df, spot_dict, ltd, prev_td,
 <html lang="zh-CN">
 <head><meta charset="utf-8"><title>生猪期货每日分析报告</title>
 <style>
-body {{ font-family: 'Microsoft YaHei', 'SimHei', sans-serif; background: #f0f2f5; padding: 16px; color: #2c3e50; }}
+* {{ box-sizing: border-box; }}
+body {{ font-family: 'Microsoft YaHei', 'SimHei', sans-serif; background: #eef0f4; padding: 14px; color: #2c3e50; }}
 .report {{ max-width: 900px; margin: 0 auto; }}
-.header {{ background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); color: #fff; padding: 20px 28px; border-radius: 10px 10px 0 0; }}
+.header {{ background: linear-gradient(135deg, #0f0c29 0%, #1a1a3e 50%, #24243e 100%); color: #fff; padding: 22px 30px; border-radius: 12px 12px 0 0; }}
 .header h1 {{ font-size: 1.5rem; margin: 0 0 4px 0; letter-spacing: 2px; }}
-.header .sub {{ font-size: 0.82rem; opacity: 0.8; line-height: 1.6; }}
-.card {{ background: #fff; border-radius: 8px; padding: 16px 20px; margin: 10px 0; box-shadow: 0 1px 3px rgba(0,0,0,0.05); border-left: 3px solid #e0e0e0; }}
-.card h2 {{ font-size: 1.05rem; margin: 0 0 8px 0; padding-bottom: 6px; border-bottom: 1px solid #f0f0f0; color: #34495e; }}
+.header .sub {{ font-size: 0.8rem; opacity: 0.78; line-height: 1.6; }}
+.card {{ background: #fff; border-radius: 10px; padding: 16px 22px; margin: 10px 0; box-shadow: 0 2px 6px rgba(0,0,0,0.04); border-left: 4px solid #ddd; }}
+.card h2 {{ font-size: 1.02rem; margin: 0 0 8px 0; padding-bottom: 6px; border-bottom: 1px solid #f2f2f2; color: #2c3e50; }}
 .card h2 .icon {{ margin-right: 5px; }}
-.grid2 {{ display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }}
+.card:nth-of-type(1) {{ border-left-color: #3498DB; background: linear-gradient(135deg, #ffffff 0%, #f8fbff 100%); }}
+.card:nth-of-type(2) {{ border-left-color: #E74C3C; background: linear-gradient(135deg, #ffffff 0%, #fffaf8 100%); }}
+.card:nth-of-type(3) {{ border-left-color: #F39C12; background: linear-gradient(135deg, #ffffff 0%, #fffdf5 100%); }}
+.card:nth-of-type(4) {{ border-left-color: #27AE60; background: linear-gradient(135deg, #ffffff 0%, #f8fdf9 100%); }}
+.card:nth-of-type(5) {{ border-left-color: #8E44AD; background: linear-gradient(135deg, #ffffff 0%, #fdf8ff 100%); }}
+.card:nth-of-type(6) {{ border-left-color: #1ABC9C; background: linear-gradient(135deg, #ffffff 0%, #f8fdfb 100%); }}
+.grid2 {{ display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }}
 .kv {{ display: flex; justify-content: space-between; padding: 3px 0; border-bottom: 1px dotted #f0f0f0; }}
-.kv .k {{ color: #999; font-size: 0.9rem; }}
-.kv .v {{ font-weight: 600; }}
+.kv .k {{ color: #999; font-size: 0.88rem; }}
+.kv .v {{ font-weight: 600; font-size: 0.93rem; }}
 .up {{ color: #E74C3C; }}
 .down {{ color: #27AE60; }}
-.tag {{ display: inline-block; padding: 1px 8px; border-radius: 3px; font-size: 0.82rem; font-weight: 600; }}
-.tag-bull {{ background: #fde8e8; color: #E74C3C; }}
-.tag-bear {{ background: #e8f5e9; color: #27AE60; }}
-.tag-neutral {{ background: #e8eaf6; color: #5c6bc0; }}
-.conclusion {{ background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: #fff; padding: 14px 20px; border-radius: 8px; margin: 12px 0; font-size: 1rem; text-align: center; }}
-.source {{ text-align: center; color: #bbb; font-size: 0.75rem; margin-top: 14px; }}
+.tag {{ display: inline-block; padding: 1px 8px; border-radius: 3px; font-size: 0.8rem; font-weight: 600; }}
+.tag-bull {{ background: #ffeaea; color: #c0392b; }}
+.tag-bear {{ background: #e8f8e8; color: #1e8449; }}
+.tag-neutral {{ background: #eef0fa; color: #4a5494; }}
+.highlight {{ background: #fff9c4; padding: 1px 6px; border-radius: 3px; font-weight: 700; }}
+.conclusion {{ background: linear-gradient(135deg, #4158D0 0%, #C850C0 50%, #FFCC70 100%); color: #fff; padding: 14px 22px; border-radius: 10px; margin: 12px 0; font-size: 1.02rem; text-align: center; font-weight: 600; letter-spacing: 1px; }}
+.source {{ text-align: center; color: #bbb; font-size: 0.73rem; margin-top: 14px; }}
 </style></head>
 <body><div class="report">
 
@@ -4368,7 +4376,7 @@ def _build_reportlab_pdf(html_content: str, cn_date: str, chart_images: dict = N
 
 
 # ★ 修改日报逻辑后递增此版本号，使旧缓存自动失效
-_DAILY_REPORT_VERSION = 11
+_DAILY_REPORT_VERSION = 12
 
 @st.cache_data(ttl=120, show_spinner=False)
 def _compute_daily_report_cache(main_ct: str, spot_hash: int, _version: int = 0) -> dict:
@@ -4958,129 +4966,72 @@ def _build_weasyprint_pdf(html: str, cn_date: str) -> Optional[bytes]:
 
 
 def _compose_report_image(chart_images: dict, cn_date: str, main_ct: str) -> Optional[bytes]:
-    """将日报图表生成为一张PNG图片。
-    方案1: 直接用plotly subplots组合所有图表（最可靠）
-    方案2: PIL拼接已有的chart_images PNG"""
+    """生成日报PNG图片：直接用已有chart_images的base64数据拼接。"""
     import base64
-    from plotly.subplots import make_subplots
-
-    # ── 方案1: 用plotly直接生成组合图 ──
-    try:
-        figs_to_combine = []
-        titles = []
-
-        # 重建基差季节图
-        tmon = ct_month(main_ct)
-        same_month = [c for c in ALL_CONTRACTS if ct_month(c) == tmon]
-        avail = [c for c in same_month if load_futures(c)[0] is not None and not load_futures(c)[0].empty]
-        if len(avail) >= 2:
-            spot_dict, _ = load_spot(str(SPOT_PATH))
-            series = {}
-            md_collector = defaultdict(list)
-            for c in avail:
-                fdf, _ = load_futures(c)
-                na_df = calc_national_basis(spot_dict, fdf)
-                if na_df is None or na_df.empty:
-                    continue
-                na_df["year"] = na_df["date"].dt.year
-                na_df["doy"] = na_df["date"].dt.dayofyear
-                na_df["plot_date"] = na_df.apply(lambda r: _doy_to_date(int(r["doy"]), int(r["year"])), axis=1)
-                for yr, grp in na_df.groupby("year"):
-                    grp = grp.sort_values("doy").copy()
-                    series[_make_trace_label(c, yr, "全国均价")] = grp
-                    for _, row in grp.iterrows():
-                        md_collector[(row["date"].month, row["date"].day)].append(row["basis"])
-            if series:
-                avg_rows = [{"doy": m*100+d, "basis": int(round(np.mean(v))),
-                             "plot_date": pd.Timestamp(year=2020, month=m, day=d)}
-                            for (m, d), v in sorted(md_collector.items()) if v]
-                if avg_rows:
-                    series["历史均值"] = pd.DataFrame(avg_rows).sort_values("doy")
-                figs_to_combine.append(fig_calendar_comparison(series, tmon, ""))
-                titles.append(f"基差季节对比")
-
-        # 重建价差图
-        active = get_active_contracts()
-        others = [c for c in active if c != main_ct]
-        if others:
-            ct_b = others[0]
-            dfa, _ = load_futures(main_ct)
-            dfb, _ = load_futures(ct_b)
-            if dfa is not None and dfb is not None:
-                ac = dfa.set_index("date")["close"]
-                bc = dfb.set_index("date")["close"]
-                cm = sorted(ac.index.intersection(bc.index))
-                if len(cm) > 0:
-                    fig_sp = go.Figure()
-                    fig_sp.add_trace(go.Scatter(
-                        x=cm[-90:], y=[float(ac[d] - bc[d]) for d in cm[-90:]],
-                        mode="lines", name=f"{main_ct}-{ct_b}",
-                        line=dict(color="#E74C3C", width=2)))
-                    fig_sp.add_hline(y=0, line_dash="dash", line_color="gray", opacity=0.3)
-                    fig_sp.update_layout(
-                        title=f"{main_ct}-{ct_b} 价差走势（近90日）",
-                        xaxis=dict(tickformat="%m-%d"), yaxis=dict(title="价差"),
-                        template="plotly_white", height=350, margin=dict(t=50, b=40, l=50, r=20))
-                    figs_to_combine.append(fig_sp)
-                    titles.append("价差走势")
-
-        if figs_to_combine:
-            # 组合为垂直subplots
-            n = len(figs_to_combine)
-            combined_fig = make_subplots(rows=n, cols=1, subplot_titles=titles,
-                                          vertical_spacing=0.08)
-            for i, fig in enumerate(figs_to_combine):
-                for trace in fig.data:
-                    combined_fig.add_trace(trace, row=i+1, col=1)
-            combined_fig.update_layout(
-                title=dict(text=f"生猪期货每日分析报告  {cn_date}  主力:{main_ct}",
-                          font=dict(size=18, color='#1a1a2e')),
-                height=400 * n, template="plotly_white",
-                margin=dict(t=60, b=30, l=50, r=30))
-            img_bytes = combined_fig.to_image(format="png", scale=1.2, width=1100)
-            return img_bytes
-    except Exception:
-        pass
-
-    # ── 方案2: PIL拼接已有chart_images ──
     try:
         from PIL import Image, ImageDraw, ImageFont
+    except ImportError:
+        return None
+
+    try:
         images_to_stack = []
-        title_img = Image.new('RGB', (1200, 60), color=(26, 26, 46))
+
+        # 标题栏
+        title_img = Image.new('RGB', (1200, 55), color=(26, 26, 46))
         draw = ImageDraw.Draw(title_img)
+        # Linux字体路径兜底
+        font_paths = [
+            '/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc',
+            '/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc',
+            '/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc',
+            'C:/Windows/Fonts/simhei.ttf',
+            'C:/Windows/Fonts/msyh.ttf',
+        ]
         font_title = None
-        for fp in ['C:/Windows/Fonts/simhei.ttf', 'C:/Windows/Fonts/msyh.ttf']:
+        for fp in font_paths:
             try:
-                font_title = ImageFont.truetype(fp, 24)
+                font_title = ImageFont.truetype(fp, 22)
                 break
             except Exception:
                 continue
-        if font_title:
-            draw.text((15, 15), f"生猪期货每日分析报告  {cn_date}  主力:{main_ct}",
-                      fill=(255, 255, 255), font=font_title)
+        if font_title is None:
+            font_title = ImageFont.load_default()
+        draw.text((15, 12), f"生猪期货每日分析报告  {cn_date}  主力:{main_ct}",
+                  fill=(255, 255, 255), font=font_title)
         images_to_stack.append(title_img)
+
+        # 拼接chart_images中的图表
         for key in ["basis_comparison", "spread_trend"]:
             b64 = chart_images.get(key)
             if b64:
-                img_bytes = base64.b64decode(b64)
-                img = Image.open(BytesIO(img_bytes))
-                if img.width > 1200:
-                    img = img.resize((1200, int(img.height * 1200 / img.width)), Image.LANCZOS)
-                images_to_stack.append(img)
-        if len(images_to_stack) > 1:
-            total_h = sum(im.height for im in images_to_stack) + 5 * (len(images_to_stack) - 1)
-            combined = Image.new('RGB', (1200, total_h + 10), color=(245, 246, 250))
-            y = 5
-            for im in images_to_stack:
-                combined.paste(im, ((1200 - im.width) // 2, y))
-                y += im.height + 5
-            buf = BytesIO()
-            combined.save(buf, format='PNG')
-            return buf.getvalue()
-    except Exception:
-        pass
+                try:
+                    img_bytes = base64.b64decode(b64)
+                    img = Image.open(BytesIO(img_bytes))
+                    if img.width > 1200:
+                        ratio = 1200 / img.width
+                        img = img.resize((1200, int(img.height * ratio)), Image.LANCZOS)
+                    images_to_stack.append(img)
+                except Exception:
+                    continue
 
-    return None
+        if len(images_to_stack) <= 1:
+            return None
+
+        # 垂直拼接
+        gap = 4
+        total_h = sum(im.height for im in images_to_stack) + gap * (len(images_to_stack) - 1) + 8
+        combined = Image.new('RGB', (1200, total_h), color=(240, 242, 245))
+        y = 0
+        for im in images_to_stack:
+            x = (1200 - im.width) // 2
+            combined.paste(im, (x, y))
+            y += im.height + gap
+
+        buf = BytesIO()
+        combined.save(buf, format='PNG')
+        return buf.getvalue()
+    except Exception:
+        return None
 
 
 # ══════════════════════════════════════════════════════════════
