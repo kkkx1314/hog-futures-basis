@@ -3933,11 +3933,12 @@ def _build_basis_analysis_html(snap, basis_enhanced, na_basis, max_region, max_b
     return "<br>".join(f"• {p}" for p in parts) if parts else "基差数据暂不可用"
 
 
-def _analyze_vol_oi_momentum(fut_df, ltd) -> dict:
-    """分析成交量和持仓量的动能情况（无需历史同期对比）"""
+def _analyze_vol_oi_momentum(fut_df, ltd, main_ct="") -> dict:
+    """分析成交量和持仓量的动能情况，含历史同期趋势复盘"""
     if fut_df is None or fut_df.empty:
         return {"available": False, "vol_text": "数据不足", "oi_text": "数据不足",
-                "oi_decline": "数据不足", "vol_trend": "数据不足"}
+                "oi_decline": "数据不足", "vol_trend": "数据不足",
+                "oi_hist_review": "数据不足"}
     try:
         df = fut_df.sort_values("date").reset_index(drop=True)
         close = df["close"].astype(float)
@@ -3945,14 +3946,15 @@ def _analyze_vol_oi_momentum(fut_df, ltd) -> dict:
         oi_col = "open_interest" if "open_interest" in df.columns else ("hold" if "hold" in df.columns else None)
         if oi_col is None:
             return {"available": False, "vol_text": "数据不足", "oi_text": "数据不足",
-                    "oi_decline": "数据不足", "vol_trend": "数据不足"}
+                    "oi_decline": "数据不足", "vol_trend": "数据不足",
+                    "oi_hist_review": "数据不足"}
         oi = df[oi_col].astype(float)
 
         cur_vol = float(vol.iloc[-1])
         cur_oi = float(oi.iloc[-1])
         cur_close = float(close.iloc[-1])
 
-        # 成交量：5日/20日均量对比
+        # ── 成交量 ──
         vol_5 = float(vol.tail(5).mean())
         vol_20 = float(vol.tail(20).mean()) if len(vol) >= 20 else vol_5
         if vol_5 > vol_20 * 1.2:
@@ -3961,45 +3963,119 @@ def _analyze_vol_oi_momentum(fut_df, ltd) -> dict:
             vol_trend = "缩量（5日均量<20日均量20%）"
         else:
             vol_trend = "量能平稳"
-
-        # 成交量与价格配合
         close_5_ago = float(close.iloc[-6]) if len(close) >= 6 else cur_close
         price_dir = "上涨" if cur_close > close_5_ago else ("下跌" if cur_close < close_5_ago else "持平")
         vol_text = f"成交量 {cur_vol:,.0f}手，{vol_trend}，近5日价格{price_dir}"
 
-        # 持仓量：5日/20日变化
+        # ── 持仓量当前 ──
         oi_5_ago = float(oi.iloc[-6]) if len(oi) >= 6 else cur_oi
         oi_20_ago = float(oi.iloc[-21]) if len(oi) >= 21 else oi_5_ago
         oi_chg_5 = (cur_oi - oi_5_ago) / oi_5_ago * 100 if oi_5_ago > 0 else 0
         oi_chg_20 = (cur_oi - oi_20_ago) / oi_20_ago * 100 if oi_20_ago > 0 else 0
+        if oi_chg_5 > 3: oi_trend = "增仓明显"
+        elif oi_chg_5 < -3: oi_trend = "减仓明显"
+        else: oi_trend = "持仓平稳"
+        oi_text = f"持仓量 {cur_oi:,.0f}手，近5日{oi_trend}（{oi_chg_5:+.1f}%），近20日{oi_chg_20:+.1f}%"
 
-        if oi_chg_5 > 3:
-            oi_trend = "增仓明显"
-        elif oi_chg_5 < -3:
-            oi_trend = "减仓明显"
-        else:
-            oi_trend = "持仓平稳"
-
-        oi_text = f"持仓量 {cur_oi:,.0f}手，近5日{oi_trend}（{oi_chg_5:+.1f}%），近20日变化{oi_chg_20:+.1f}%"
-
-        # 持仓量何时开始下滑：找OI峰值日期
+        # ── 持仓峰值回顾 ──
         oi_peak_idx = int(oi.idxmax())
         oi_peak_date = df["date"].iloc[oi_peak_idx]
         oi_peak_val = float(oi.iloc[oi_peak_idx])
-        days_since_peak = (ltd - oi_peak_date).days if hasattr(ltd, 'date') else (pd.Timestamp(ltd) - oi_peak_date).days
-
+        days_since_peak = (pd.Timestamp(ltd) - oi_peak_date).days
         if days_since_peak > 5 and cur_oi < oi_peak_val * 0.95:
-            oi_decline = f"持仓量自{_cn(oi_peak_date)}见顶（{oi_peak_val:,.0f}手）后持续下滑，已回落{(1-cur_oi/oi_peak_val)*100:.1f}%（{days_since_peak}天）"
+            oi_decline = f"持仓量自{_cn(oi_peak_date)}见顶（{oi_peak_val:,.0f}手）后下滑，回落{(1-cur_oi/oi_peak_val)*100:.1f}%（{days_since_peak}天）"
         elif days_since_peak <= 5:
-            oi_decline = f"持仓量处于近期高位（峰值{_cn(oi_peak_date)}，{oi_peak_val:,.0f}手），尚无下滑迹象"
+            oi_decline = f"持仓量处于近期高位（峰值{_cn(oi_peak_date)}，{oi_peak_val:,.0f}手），尚无下滑"
         else:
             oi_decline = f"持仓量较峰值{_cn(oi_peak_date)}（{oi_peak_val:,.0f}手）回落{(1-cur_oi/oi_peak_val)*100:.1f}%"
 
+        # ── 历史同期持仓量趋势复盘 ──
+        oi_hist_review = _review_historical_oi_pattern(main_ct, ltd, cur_oi)
+
         return {"available": True, "vol_text": vol_text, "oi_text": oi_text,
-                "oi_decline": oi_decline, "vol_trend": vol_trend, "cur_vol": cur_vol, "cur_oi": cur_oi}
+                "oi_decline": oi_decline, "vol_trend": vol_trend,
+                "cur_vol": cur_vol, "cur_oi": cur_oi,
+                "oi_hist_review": oi_hist_review}
     except Exception:
         return {"available": False, "vol_text": "计算异常", "oi_text": "计算异常",
-                "oi_decline": "计算异常", "vol_trend": "计算异常"}
+                "oi_decline": "计算异常", "vol_trend": "计算异常",
+                "oi_hist_review": "计算异常"}
+
+
+def _review_historical_oi_pattern(main_ct, ltd, cur_oi) -> str:
+    """复盘历史同期持仓量趋势：同月合约在每年同期的OI走势"""
+    try:
+        tmon = ct_month(main_ct)
+        same_month_cts = [c for c in ALL_CONTRACTS if ct_month(c) == tmon and c != main_ct]
+        if not same_month_cts:
+            return "暂无历史合约数据"
+
+        target_m, target_d = ltd.month, ltd.day
+        peak_months = []
+        current_vs_peak = []
+
+        for c in same_month_cts:
+            fdf, _ = load_futures(c)
+            if fdf is None or fdf.empty:
+                continue
+            oi_col = "open_interest" if "open_interest" in fdf.columns else ("hold" if "hold" in fdf.columns else None)
+            if oi_col is None:
+                continue
+            oi_series = fdf[oi_col].astype(float)
+            dates = pd.to_datetime(fdf["date"])
+
+            # 找该合约的OI峰值月份
+            peak_idx = int(oi_series.idxmax())
+            peak_month = dates.iloc[peak_idx].month
+            peak_months.append(peak_month)
+
+            # 找该合约在target_m/target_d附近的OI值
+            same_day = dates[(dates.dt.month == target_m) & (dates.dt.day == target_d)]
+            if not same_day.empty:
+                idx = same_day.index[0]
+                same_day_oi = float(oi_series.iloc[fdf.index.get_loc(idx)] if idx in fdf.index else oi_series.iloc[-1])
+                peak_oi = float(oi_series.iloc[peak_idx])
+                current_vs_peak.append((same_day_oi, peak_oi, c))
+
+        if not peak_months:
+            return "暂无历史数据"
+
+        # 最常见的峰值月份
+        from collections import Counter
+        peak_counter = Counter(peak_months)
+        most_common_peak = peak_counter.most_common(1)[0][0]
+        peak_month_cn = f"{most_common_peak}月"
+
+        # 检查当前合约是否已过典型峰值月
+        current_month = target_m
+        if current_month > most_common_peak:
+            phase = f"当前已过历史典型持仓峰值月（{peak_month_cn}），"
+        elif current_month == most_common_peak:
+            phase = f"当前正处于历史典型持仓峰值月（{peak_month_cn}），"
+        else:
+            phase = f"距离历史典型持仓峰值月（{peak_month_cn}）还有{most_common_peak - current_month}个月，"
+
+        # 历史上同期的OI vs 峰值
+        if current_vs_peak:
+            ratios = [s / p for s, p, _ in current_vs_peak if p > 0]
+            avg_ratio = np.mean(ratios) if ratios else 1.0
+            if avg_ratio < 0.7:
+                phase += f"历史同期OI平均仅为峰值的{avg_ratio*100:.0f}%，属季节性低位"
+            elif avg_ratio > 0.9:
+                phase += f"历史同期OI平均为峰值的{avg_ratio*100:.0f}%，仍在高位运行"
+            else:
+                phase += f"历史同期OI平均为峰值的{avg_ratio*100:.0f}%"
+        else:
+            phase += "暂无同期对比数据"
+
+        # 汇总
+        n_contracts = len(set(c for _, _, c in current_vs_peak))
+        if n_contracts >= 1:
+            phase += f"（基于{n_contracts}个历史合约）"
+
+        return phase
+    except Exception:
+        return "历史复盘数据不足"
 
 
 def _build_daily_report_html(main_ct: str, fut_df, spot_dict, ltd, prev_td,
@@ -4050,10 +4126,15 @@ def _build_daily_report_html(main_ct: str, fut_df, spot_dict, ltd, prev_td,
 
     # 持仓（使用分析结果，明确标注数据日期）
     ha = holdings_analysis or {}
+    # 持仓日期统一为中文格式
+    ha_date_cn = ha.get('data_date', '')
+    if ha_date_cn and len(ha_date_cn) == 8 and ha_date_cn.isdigit():
+        try:
+            ha_date_cn = _cn(pd.Timestamp(datetime.strptime(ha_date_cn, "%Y%m%d")))
+        except Exception:
+            pass
     if ha.get("available"):
-        data_date_note = f"（数据日期：{ha.get('data_date', '')}）" if ha.get('data_date') else ""
         pos_section = f"""
-        <p style="font-size:0.85rem;color:#888;margin-bottom:4px;">📡 数据日期：<b>{ha.get('data_date', '')}</b></p>
         <div class="grid2">
         <div class="kv"><span class="k">前20多单合计</span><span class="v">{ha['total_long']:,} 手</span></div>
         <div class="kv"><span class="k">前20空单合计</span><span class="v">{ha['total_short']:,} 手</span></div>
@@ -4065,7 +4146,7 @@ def _build_daily_report_html(main_ct: str, fut_df, spot_dict, ltd, prev_td,
         📌 综合：<b>{ha['overall_judge']}</b>
         </p>"""
     else:
-        pos_section = f"<p>⚠️ 前20持仓数据未更新（{ha.get('data_date', '')}：当日大商所持仓排名尚未发布，通常T+1更新）</p>"
+        pos_section = f"<p>⚠️ 前20持仓数据未更新（当日大商所持仓排名尚未发布，通常T+1更新）</p>"
 
     # 技术
     tech_summary = trend_direction if trend_direction else "震荡"
@@ -4097,7 +4178,8 @@ def _build_daily_report_html(main_ct: str, fut_df, spot_dict, ltd, prev_td,
         <p style="font-size:0.92rem;line-height:1.8;">
         • 成交量：{vo.get('vol_text', '—')}<br>
         • 持仓量：{vo.get('oi_text', '—')}<br>
-        • 持仓量趋势：{vo.get('oi_decline', '—')}
+        • 持仓峰值：{vo.get('oi_decline', '—')}<br>
+        • 历史复盘：{vo.get('oi_hist_review', '—')}
         </p>"""
     else:
         vol_oi_html = "<p>⚠️ 成交量/持仓量数据不足</p>"
@@ -4196,7 +4278,7 @@ body {{ font-family: 'Microsoft YaHei', 'SimHei', sans-serif; background: #f5f6f
 
 <!-- 5. 前20净持仓分析 -->
 <div class="card">
-<h2><span class="icon">🏢</span>前20净持仓分析（{ha.get('data_date', '—') if ha else '—'}）</h2>
+<h2><span class="icon">🏢</span>前20净持仓分析（{ha_date_cn if ha_date_cn else '—'}）</h2>
 {pos_section}
 </div>
 
@@ -4406,7 +4488,7 @@ def _build_reportlab_pdf(html_content: str, cn_date: str, chart_images: dict = N
 
 
 # ★ 修改日报逻辑后递增此版本号，使旧缓存自动失效
-_DAILY_REPORT_VERSION = 8
+_DAILY_REPORT_VERSION = 9
 
 @st.cache_data(ttl=120, show_spinner=False)
 def _compute_daily_report_cache(main_ct: str, spot_hash: int, _version: int = 0) -> dict:
@@ -4455,7 +4537,7 @@ def _compute_daily_report_cache(main_ct: str, spot_hash: int, _version: int = 0)
     spread_info = _compute_key_spread(main_ct, ltd_ts)
 
     # ── 成交量/持仓量动能分析 ──
-    vol_oi_analysis = _analyze_vol_oi_momentum(fut_df, ltd_ts)
+    vol_oi_analysis = _analyze_vol_oi_momentum(fut_df, ltd_ts, main_ct)
 
     # ── 技术分析（使用期货数据）──
     trend_dir, sr_info = _quick_technical(fut_df, ltd_ts)
