@@ -3880,25 +3880,39 @@ def _build_basis_analysis_html(snap, basis_enhanced, na_basis, max_region, max_b
         else:
             parts.append(f"全国均价基差 <b>{na_cur:+,}元/吨</b>（{na_level}）")
 
-    # 最大基差
+    # 最大基差（与全国均价基差同一格式：含历史同期均值+分位）
     mx = be.get("最大基差", {})
     if mx:
         mx_region = snap.get("max_region", "") if snap else ""
         mx_cur = mx.get("current", 0)
+        mx_hist = mx.get("hist_avg")
         mx_level = mx.get("level", "")
         mx_pct = mx.get("pct")
-        pct_str = f"，分位{mx_pct:.0f}%" if mx_pct is not None else ""
-        parts.append(f"最大基差：<b>{mx_region} {mx_cur:+,}元/吨</b>（{mx_level}{pct_str}）")
+        mx_cnt = mx.get("hist_count", 0)
+        if mx_hist is not None and mx_cnt >= 1:
+            tag_cls = "bull" if (mx_pct and mx_pct >= 80) else ("bear" if (mx_pct and mx_pct <= 20) else "neutral")
+            parts.append(f"最大基差（{mx_region}）<b>{mx_cur:+,}元/吨</b>，"
+                       f"历史同期均值 {mx_hist:+,}元/吨（{mx_cnt}年），"
+                       f"处于<span class=\"tag tag-{tag_cls}\">{mx_level}</span>（分位{mx_pct:.0f}%）")
+        else:
+            parts.append(f"最大基差（{mx_region}）<b>{mx_cur:+,}元/吨</b>（{mx_level}）")
 
-    # 最小基差
+    # 最小基差（与全国均价基差同一格式：含历史同期均值+分位）
     mn = be.get("最小基差", {})
     if mn:
         mn_region = snap.get("min_region", "") if snap else ""
         mn_cur = mn.get("current", 0)
+        mn_hist = mn.get("hist_avg")
         mn_level = mn.get("level", "")
         mn_pct = mn.get("pct")
-        pct_str = f"，分位{mn_pct:.0f}%" if mn_pct is not None else ""
-        parts.append(f"最小基差：<b>{mn_region} {mn_cur:+,}元/吨</b>（{mn_level}{pct_str}）")
+        mn_cnt = mn.get("hist_count", 0)
+        if mn_hist is not None and mn_cnt >= 1:
+            tag_cls = "bull" if (mn_pct and mn_pct >= 80) else ("bear" if (mn_pct and mn_pct <= 20) else "neutral")
+            parts.append(f"最小基差（{mn_region}）<b>{mn_cur:+,}元/吨</b>，"
+                       f"历史同期均值 {mn_hist:+,}元/吨（{mn_cnt}年），"
+                       f"处于<span class=\"tag tag-{tag_cls}\">{mn_level}</span>（分位{mn_pct:.0f}%）")
+        else:
+            parts.append(f"最小基差（{mn_region}）<b>{mn_cur:+,}元/吨</b>（{mn_level}）")
 
     # 基差均值
     avg = be.get("基差均值", {})
@@ -3909,18 +3923,89 @@ def _build_basis_analysis_html(snap, basis_enhanced, na_basis, max_region, max_b
         avg_hist = avg.get("hist_avg")
         avg_cnt = avg.get("hist_count", 0)
         if avg_hist is not None and avg_cnt >= 1:
-            pct_str = f"，分位{avg_pct:.0f}%" if avg_pct is not None else ""
-            parts.append(f"基差均值 <b>{avg_cur:+,}元/吨</b>，历史同期均值 {avg_hist:+,}元/吨（{avg_cnt}年）{pct_str}")
+            tag_cls = "bull" if (avg_pct and avg_pct >= 80) else ("bear" if (avg_pct and avg_pct <= 20) else "neutral")
+            parts.append(f"基差均值 <b>{avg_cur:+,}元/吨</b>，"
+                       f"历史同期均值 {avg_hist:+,}元/吨（{avg_cnt}年），"
+                       f"处于<span class=\"tag tag-{tag_cls}\">{avg_level}</span>（分位{avg_pct:.0f}%）")
         else:
             parts.append(f"基差均值 <b>{avg_cur:+,}元/吨</b>（{avg_level}）")
 
     return "<br>".join(f"• {p}" for p in parts) if parts else "基差数据暂不可用"
 
 
+def _analyze_vol_oi_momentum(fut_df, ltd) -> dict:
+    """分析成交量和持仓量的动能情况（无需历史同期对比）"""
+    if fut_df is None or fut_df.empty:
+        return {"available": False, "vol_text": "数据不足", "oi_text": "数据不足",
+                "oi_decline": "数据不足", "vol_trend": "数据不足"}
+    try:
+        df = fut_df.sort_values("date").reset_index(drop=True)
+        close = df["close"].astype(float)
+        vol = df["volume"].astype(float)
+        oi_col = "open_interest" if "open_interest" in df.columns else ("hold" if "hold" in df.columns else None)
+        if oi_col is None:
+            return {"available": False, "vol_text": "数据不足", "oi_text": "数据不足",
+                    "oi_decline": "数据不足", "vol_trend": "数据不足"}
+        oi = df[oi_col].astype(float)
+
+        cur_vol = float(vol.iloc[-1])
+        cur_oi = float(oi.iloc[-1])
+        cur_close = float(close.iloc[-1])
+
+        # 成交量：5日/20日均量对比
+        vol_5 = float(vol.tail(5).mean())
+        vol_20 = float(vol.tail(20).mean()) if len(vol) >= 20 else vol_5
+        if vol_5 > vol_20 * 1.2:
+            vol_trend = "放量（5日均量>20日均量20%）"
+        elif vol_5 < vol_20 * 0.8:
+            vol_trend = "缩量（5日均量<20日均量20%）"
+        else:
+            vol_trend = "量能平稳"
+
+        # 成交量与价格配合
+        close_5_ago = float(close.iloc[-6]) if len(close) >= 6 else cur_close
+        price_dir = "上涨" if cur_close > close_5_ago else ("下跌" if cur_close < close_5_ago else "持平")
+        vol_text = f"成交量 {cur_vol:,.0f}手，{vol_trend}，近5日价格{price_dir}"
+
+        # 持仓量：5日/20日变化
+        oi_5_ago = float(oi.iloc[-6]) if len(oi) >= 6 else cur_oi
+        oi_20_ago = float(oi.iloc[-21]) if len(oi) >= 21 else oi_5_ago
+        oi_chg_5 = (cur_oi - oi_5_ago) / oi_5_ago * 100 if oi_5_ago > 0 else 0
+        oi_chg_20 = (cur_oi - oi_20_ago) / oi_20_ago * 100 if oi_20_ago > 0 else 0
+
+        if oi_chg_5 > 3:
+            oi_trend = "增仓明显"
+        elif oi_chg_5 < -3:
+            oi_trend = "减仓明显"
+        else:
+            oi_trend = "持仓平稳"
+
+        oi_text = f"持仓量 {cur_oi:,.0f}手，近5日{oi_trend}（{oi_chg_5:+.1f}%），近20日变化{oi_chg_20:+.1f}%"
+
+        # 持仓量何时开始下滑：找OI峰值日期
+        oi_peak_idx = int(oi.idxmax())
+        oi_peak_date = df["date"].iloc[oi_peak_idx]
+        oi_peak_val = float(oi.iloc[oi_peak_idx])
+        days_since_peak = (ltd - oi_peak_date).days if hasattr(ltd, 'date') else (pd.Timestamp(ltd) - oi_peak_date).days
+
+        if days_since_peak > 5 and cur_oi < oi_peak_val * 0.95:
+            oi_decline = f"持仓量自{_cn(oi_peak_date)}见顶（{oi_peak_val:,.0f}手）后持续下滑，已回落{(1-cur_oi/oi_peak_val)*100:.1f}%（{days_since_peak}天）"
+        elif days_since_peak <= 5:
+            oi_decline = f"持仓量处于近期高位（峰值{_cn(oi_peak_date)}，{oi_peak_val:,.0f}手），尚无下滑迹象"
+        else:
+            oi_decline = f"持仓量较峰值{_cn(oi_peak_date)}（{oi_peak_val:,.0f}手）回落{(1-cur_oi/oi_peak_val)*100:.1f}%"
+
+        return {"available": True, "vol_text": vol_text, "oi_text": oi_text,
+                "oi_decline": oi_decline, "vol_trend": vol_trend, "cur_vol": cur_vol, "cur_oi": cur_oi}
+    except Exception:
+        return {"available": False, "vol_text": "计算异常", "oi_text": "计算异常",
+                "oi_decline": "计算异常", "vol_trend": "计算异常"}
+
+
 def _build_daily_report_html(main_ct: str, fut_df, spot_dict, ltd, prev_td,
                               snap, holdings_analysis, key_spread_info,
                               trend_direction, sr_lines_info, chart_images=None,
-                              basis_enhanced=None) -> str:
+                              basis_enhanced=None, vol_oi_analysis=None) -> str:
     """构建日报 HTML 内容"""
     cn_date = _cn(ltd)
     cn_prev = _cn(prev_td) if prev_td else "前一交易日"
@@ -4005,6 +4090,18 @@ def _build_daily_report_html(main_ct: str, fut_df, spot_dict, ltd, prev_td,
     else:
         overall = "⚖️ 市场多空交织，短期方向不明，建议观望"
 
+    # ── 持仓量与成交量分析 HTML ──
+    vo = vol_oi_analysis or {}
+    if vo.get("available"):
+        vol_oi_html = f"""
+        <p style="font-size:0.92rem;line-height:1.8;">
+        • 成交量：{vo.get('vol_text', '—')}<br>
+        • 持仓量：{vo.get('oi_text', '—')}<br>
+        • 持仓量趋势：{vo.get('oi_decline', '—')}
+        </p>"""
+    else:
+        vol_oi_html = "<p>⚠️ 成交量/持仓量数据不足</p>"
+
     # 图表嵌入
     chart_html = ""
     if chart_images:
@@ -4087,19 +4184,25 @@ body {{ font-family: 'Microsoft YaHei', 'SimHei', sans-serif; background: #f5f6f
 
 <!-- 3. 价差分析 -->
 <div class="card">
-<h2><span class="icon">💰</span>价差分析</h2>
+<h2><span class="icon">💰</span>价差分析（{cn_date}）</h2>
 <p>{spread_text}</p>
 </div>
 
-<!-- 4. 前20净持仓分析 -->
+<!-- 4. 持仓量与成交量分析 -->
+<div class="card">
+<h2><span class="icon">📊</span>持仓量与成交量分析（{cn_date}）</h2>
+{vol_oi_html}
+</div>
+
+<!-- 5. 前20净持仓分析 -->
 <div class="card">
 <h2><span class="icon">🏢</span>前20净持仓分析（{ha.get('data_date', '—') if ha else '—'}）</h2>
 {pos_section}
 </div>
 
-<!-- 5. 技术分析 -->
+<!-- 6. 技术分析 -->
 <div class="card">
-<h2><span class="icon">📉</span>技术分析</h2>
+<h2><span class="icon">📉</span>技术分析（{cn_date}）</h2>
 <p style="font-size:0.92rem;line-height:1.8;">
 {tech_summary.replace(' | ', '<br>• ')}
 </p>
@@ -4111,7 +4214,7 @@ body {{ font-family: 'Microsoft YaHei', 'SimHei', sans-serif; background: #f5f6f
 <!-- 图表 -->
 {chart_html}
 
-<!-- 6. 综合结论 -->
+<!-- 7. 综合结论 -->
 <div class="conclusion">{overall}</div>
 
 <div class="source">⚠️ 免责声明：本报告仅供参考，不构成任何投资建议。投资有风险，入市需谨慎。<br>数据来源：涌益咨询现货 ｜ 大连商品交易所期货数据 ｜ 前20持仓数据来自大商所/新浪财经</div>
@@ -4122,7 +4225,8 @@ body {{ font-family: 'Microsoft YaHei', 'SimHei', sans-serif; background: #f5f6f
 
 def _build_daily_report_md(main_ct, fut_df, spot_dict, ltd, prev_td,
                             snap, holdings_analysis, key_spread_info,
-                            trend_direction, sr_lines_info, basis_enhanced=None) -> str:
+                            trend_direction, sr_lines_info, basis_enhanced=None,
+                            vol_oi_analysis=None) -> str:
     """构建日报 Markdown 内容"""
     cn_date = _cn(ltd)
     cn_prev = _cn(prev_td) if prev_td else "前一交易日"
@@ -4302,7 +4406,7 @@ def _build_reportlab_pdf(html_content: str, cn_date: str, chart_images: dict = N
 
 
 # ★ 修改日报逻辑后递增此版本号，使旧缓存自动失效
-_DAILY_REPORT_VERSION = 7
+_DAILY_REPORT_VERSION = 8
 
 @st.cache_data(ttl=120, show_spinner=False)
 def _compute_daily_report_cache(main_ct: str, spot_hash: int, _version: int = 0) -> dict:
@@ -4350,6 +4454,9 @@ def _compute_daily_report_cache(main_ct: str, spot_hash: int, _version: int = 0)
     # ── 价差（使用期货数据日期）──
     spread_info = _compute_key_spread(main_ct, ltd_ts)
 
+    # ── 成交量/持仓量动能分析 ──
+    vol_oi_analysis = _analyze_vol_oi_momentum(fut_df, ltd_ts)
+
     # ── 技术分析（使用期货数据）──
     trend_dir, sr_info = _quick_technical(fut_df, ltd_ts)
 
@@ -4359,10 +4466,11 @@ def _compute_daily_report_cache(main_ct: str, spot_hash: int, _version: int = 0)
     # ── 构建HTML和MD ──
     html = _build_daily_report_html(main_ct, fut_df, spot_dict, ltd_ts, prev_td,
                                      snap, holdings_analysis, spread_info,
-                                     trend_dir, sr_info, chart_images, basis_enhanced)
+                                     trend_dir, sr_info, chart_images, basis_enhanced,
+                                     vol_oi_analysis)
     md = _build_daily_report_md(main_ct, fut_df, spot_dict, ltd_ts, prev_td,
                                  snap, holdings_analysis, spread_info,
-                                 trend_dir, sr_info, basis_enhanced)
+                                 trend_dir, sr_info, basis_enhanced, vol_oi_analysis)
 
     return {"html": html, "md": md, "error": None,
             "ltd": ltd_ts, "cn_date": _cn(ltd_ts),
