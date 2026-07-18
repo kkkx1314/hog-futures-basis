@@ -46,7 +46,7 @@ try:
     from reportlab.lib.colors import HexColor
     from reportlab.lib.units import mm
     from reportlab.platypus import (SimpleDocTemplate, Paragraph, Spacer, Table,
-                                     TableStyle)
+                                     TableStyle, Image as RLImage)
     from reportlab.pdfbase import pdfmetrics
     from reportlab.pdfbase.ttfonts import TTFont
     from reportlab.pdfbase.cidfonts import UnicodeCIDFont
@@ -4290,86 +4290,151 @@ def _build_daily_report_md(main_ct, fut_df, spot_dict, ltd, prev_td,
 
 
 def _build_reportlab_pdf(html_content: str, cn_date: str, chart_images: dict = None) -> Optional[bytes]:
-    """使用 reportlab 生成 PDF（含嵌入图片），失败返回 None"""
+    """生成美化PDF：嵌入图表PNG + 彩色标题/卡片"""
     if not HAS_REPORTLAB:
         return None
     try:
-        import re
-        from reportlab.platypus import Image as RLImage
-        import base64
-        import tempfile
-        import os
+        import re, base64, tempfile, os
 
         buf = BytesIO()
         doc = SimpleDocTemplate(buf, pagesize=A4,
-            leftMargin=20*mm, rightMargin=20*mm, topMargin=15*mm, bottomMargin=15*mm)
+            leftMargin=15*mm, rightMargin=15*mm, topMargin=10*mm, bottomMargin=10*mm)
         styles = getSampleStyleSheet()
 
-        title_style = ParagraphStyle('CNTitle', parent=styles['Title'],
-            fontName=CN_FONT, fontSize=18, spaceAfter=10, textColor=HexColor('#1a1a2e'))
-        h2_style = ParagraphStyle('CNH2', parent=styles['Heading2'],
-            fontName=CN_FONT, fontSize=13, spaceBefore=12, spaceAfter=6,
-            textColor=HexColor('#34495e'))
-        body_style = ParagraphStyle('CNBody', parent=styles['Normal'],
-            fontName=CN_FONT, fontSize=10, leading=16, textColor=HexColor('#333333'))
-        small_style = ParagraphStyle('CNSmall', parent=styles['Normal'],
-            fontName=CN_FONT, fontSize=8, textColor=HexColor('#999999'))
+        # ── 自定义样式 ──
+        title_st = ParagraphStyle('RptTitle', fontName=CN_FONT, fontSize=16, leading=22,
+            textColor=HexColor('#ffffff'), alignment=1, spaceAfter=6)
+        subtitle_st = ParagraphStyle('RptSub', fontName=CN_FONT, fontSize=9, leading=14,
+            textColor=HexColor('#cccccc'), alignment=1)
+        h2_st = ParagraphStyle('RptH2', fontName=CN_FONT, fontSize=11, leading=16,
+            textColor=HexColor('#2c3e50'), spaceBefore=8, spaceAfter=4)
+        body_st = ParagraphStyle('RptBody', fontName=CN_FONT, fontSize=8.5, leading=13,
+            textColor=HexColor('#333333'))
+        tag_bull = ParagraphStyle('TagBull', fontName=CN_FONT, fontSize=8,
+            textColor=HexColor('#c0392b'), backColor=HexColor('#ffeaea'))
+        tag_bear = ParagraphStyle('TagBear', fontName=CN_FONT, fontSize=8,
+            textColor=HexColor('#1e8449'), backColor=HexColor('#e8f8e8'))
+        tag_neutral = ParagraphStyle('TagNeu', fontName=CN_FONT, fontSize=8,
+            textColor=HexColor('#4a5494'), backColor=HexColor('#eef0fa'))
+        footer_st = ParagraphStyle('Footer', fontName=CN_FONT, fontSize=7,
+            textColor=HexColor('#bbbbbb'), alignment=1)
 
         story = []
-        story.append(Paragraph("生猪期货每日分析报告", title_style))
-        story.append(Paragraph(f"报告日期：{cn_date}", small_style))
-        story.append(Spacer(1, 12))
 
-        # Extract cards from HTML
-        cards = re.findall(r'<div class="card">(.*?)</div>', html_content, re.DOTALL)
+        # ── 标题区（深色背景） ──
+        title_table = Table([
+            [Paragraph("生猪期货每日分析报告", title_st)],
+            [Paragraph(f"报告日期：{cn_date}", subtitle_st)],
+        ], colWidths=[doc.width])
+        title_table.setStyle(TableStyle([
+            ('BACKGROUND', (0,0), (-1,-1), HexColor('#1a1a2e')),
+            ('ALIGN', (0,0), (-1,-1), 'CENTER'),
+            ('TOPPADDING', (0,0), (-1,-1), 8),
+            ('BOTTOMPADDING', (0,0), (-1,-1), 8),
+            ('ROUNDEDCORNERS', [5,5,5,5]),
+        ]))
+        story.append(title_table)
+        story.append(Spacer(1, 8))
+
+        # ── 解析HTML卡片，保留格式 ──
+        cards_html = re.findall(r'<div class="card">(.*?)</div>', html_content, re.DOTALL)
         tmp_files = []
-        for card_html in cards:
-            h2_match = re.search(r'<h2>(.*?)</h2>', card_html, re.DOTALL)
-            if h2_match:
-                title = re.sub(r'<.*?>', '', h2_match.group(1)).strip()
-                story.append(Paragraph(title, h2_style))
-            content = re.sub(r'<h2>.*?</h2>', '', card_html, flags=re.DOTALL)
-            # Check for embedded images
-            img_match = re.search(r'<img src="data:image/png;base64,([^"]+)"', content)
+        card_colors = [HexColor('#3498DB'), HexColor('#E74C3C'), HexColor('#F39C12'),
+                       HexColor('#27AE60'), HexColor('#8E44AD'), HexColor('#1ABC9C')]
+
+        for ci, card_html in enumerate(cards_html):
+            h2_m = re.search(r'<h2>(.*?)</h2>', card_html, re.DOTALL)
+            section_title = re.sub(r'<.*?>', '', h2_m.group(1)).strip() if h2_m else ""
+            color = card_colors[ci % len(card_colors)]
+
+            # 卡片背景表格
+            card_data = []
+            # 标题行
+            card_data.append([Paragraph(f'<font color="{color}">▌</font> {section_title}', h2_st)])
+
+            # 内容：提取文本保留<b>标签
+            body_html = re.sub(r'<h2>.*?</h2>', '', card_html, flags=re.DOTALL)
+            # 处理img标签
+            img_match = re.search(r'<img src="data:image/png;base64,([^"]+)"', body_html)
             if img_match:
-                img_data = base64.b64decode(img_match.group(1))
-                tmpf = tempfile.NamedTemporaryFile(suffix='.png', delete=False)
-                tmpf.write(img_data)
-                tmpf.close()
-                tmp_files.append(tmpf.name)
-                img = RLImage(tmpf.name, width=450, height=200)
-                story.append(img)
-                text = re.sub(r'<img[^>]+>', '', content)
-            else:
-                text = content
-            text = re.sub(r'<.*?>', ' ', text).strip()
-            text = re.sub(r'\s+', ' ', text)
-            for line in text.split('。'):
-                line = line.strip()
-                if line:
-                    story.append(Paragraph(line + '。', body_style))
+                try:
+                    img_data = base64.b64decode(img_match.group(1))
+                    tmpf = tempfile.NamedTemporaryFile(suffix='.png', delete=False)
+                    tmpf.write(img_data); tmpf.close()
+                    tmp_files.append(tmpf.name)
+                    rl_img = RLImage(tmpf.name, width=doc.width*0.85, height=doc.width*0.4)
+                    card_data.append([rl_img])
+                except Exception:
+                    pass
+                body_html = re.sub(r'<img[^>]+>', '', body_html)
+
+            # 文本行：保留加粗标签
+            text = re.sub(r'<div class="grid2">.*?</div>', '', body_html, flags=re.DOTALL)
+            text = re.sub(r'<p[^>]*>', '', text); text = text.replace('</p>', '<br/>')
+            text = re.sub(r'<br\s*/?>', '\n', text)
+            text = re.sub(r'<span[^>]*>', '', text); text = text.replace('</span>', '')
+            # 保留<b>标签给reportlab
+            text = text.strip()
+            if text:
+                for line in text.split('\n'):
+                    line = line.strip()
+                    if line:
+                        card_data.append([Paragraph(line, body_st)])
+
+            card_table = Table(card_data, colWidths=[doc.width])
+            card_table.setStyle(TableStyle([
+                ('BACKGROUND', (0,0), (-1,-1), HexColor('#ffffff')),
+                ('LEFTPADDING', (0,0), (-1,-1), 8),
+                ('RIGHTPADDING', (0,0), (-1,-1), 8),
+                ('TOPPADDING', (0,0), (-1,-1), 4),
+                ('BOTTOMPADDING', (0,0), (-1,-1), 4),
+                ('LINEBELOW', (0,0), (-1,0), 0.5, HexColor('#e0e0e0')),
+                ('BOX', (0,0), (-1,-1), 0.5, HexColor('#e8e8e8')),
+                ('LEFTPADDING', (0,0), (0,0), 2),
+                ('LINEBEFORE', (0,0), (0,-1), 3, color),
+            ]))
+            story.append(card_table)
             story.append(Spacer(1, 6))
 
-        # Conclusion
-        concl_match = re.search(r'<div class="conclusion">(.*?)</div>', html_content, re.DOTALL)
-        if concl_match:
-            concl_text = re.sub(r'<.*?>', '', concl_match.group(1)).strip()
-            concl_style = ParagraphStyle('CNConcl', parent=body_style,
-                fontName=CN_FONT, fontSize=11, textColor=HexColor('#ffffff'),
-                backColor=HexColor('#667eea'), alignment=1)
-            story.append(Spacer(1, 10))
-            story.append(Paragraph(concl_text, concl_style))
+        # ── 嵌入图表 ──
+        if chart_images:
+            for key in ["basis_comparison", "spread_trend"]:
+                b64 = chart_images.get(key)
+                if b64:
+                    try:
+                        img_data = base64.b64decode(b64)
+                        tmpf = tempfile.NamedTemporaryFile(suffix='.png', delete=False)
+                        tmpf.write(img_data); tmpf.close()
+                        tmp_files.append(tmpf.name)
+                        rl_img = RLImage(tmpf.name, width=doc.width*0.9, height=doc.width*0.42)
+                        story.append(Spacer(1, 4))
+                        story.append(rl_img)
+                    except Exception:
+                        pass
 
-        story.append(Spacer(1, 20))
-        story.append(Paragraph("免责声明：本报告仅供参考，不构成任何投资建议。", small_style))
+        # ── 结论 ──
+        concl_m = re.search(r'<div class="conclusion">(.*?)</div>', html_content, re.DOTALL)
+        if concl_m:
+            concl = re.sub(r'<.*?>', '', concl_m.group(1)).strip()
+            concl_table = Table([[Paragraph(concl, ParagraphStyle('Conc', fontName=CN_FONT,
+                fontSize=10, textColor=HexColor('#ffffff'), alignment=1))]],
+                colWidths=[doc.width])
+            concl_table.setStyle(TableStyle([
+                ('BACKGROUND', (0,0), (-1,-1), HexColor('#667eea')),
+                ('ALIGN', (0,0), (-1,-1), 'CENTER'),
+                ('TOPPADDING', (0,0), (-1,-1), 8),
+                ('BOTTOMPADDING', (0,0), (-1,-1), 8),
+            ]))
+            story.append(Spacer(1, 6))
+            story.append(concl_table)
+
+        story.append(Spacer(1, 12))
+        story.append(Paragraph("免责声明：本报告仅供参考，不构成任何投资建议。", footer_st))
 
         doc.build(story)
-
-        # Cleanup temp files
         for f in tmp_files:
             try: os.unlink(f)
             except Exception: pass
-
         return buf.getvalue()
     except Exception:
         return None
