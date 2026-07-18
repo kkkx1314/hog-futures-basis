@@ -3907,7 +3907,12 @@ body {{ font-family: 'Microsoft YaHei', 'SimHei', sans-serif; background: #f5f6f
 
 <div class="header">
 <h1>🐷 生猪期货每日分析报告</h1>
-<div class="sub">报告日期：{cn_date} ｜ 主力合约：{main_ct} ｜ 数据来源：涌益咨询 & 大商所</div>
+<div class="sub">报告日期：{cn_date} ｜ 主力合约：{main_ct}</div>
+<div class="sub" style="font-size:0.75rem;margin-top:4px;">
+期货数据截止：{_cn(fut_df['date'].max()) if fut_df is not None else '—'} ｜
+持仓数据截止：{ha.get('data_date', '—') if ha else '—'} ｜
+数据来源：涌益咨询现货 & 大商所期货 & akshare持仓排名
+</div>
 </div>
 
 <!-- 1. 市场概况 -->
@@ -4352,8 +4357,8 @@ def _generate_report_charts(main_ct, spot_dict, ltd) -> dict:
                     series["历史均值"] = pd.DataFrame(avg_rows).sort_values("doy")
 
                 fig_basis = fig_calendar_comparison(series, tmon, "")
-                fig_basis.update_layout(height=400, margin=dict(t=50, b=30, l=40, r=20))
-                img_bytes = fig_basis.to_image(format="png", scale=1.5)
+                fig_basis.update_layout(height=380, margin=dict(t=40, b=30, l=40, r=20))
+                img_bytes = fig_basis.to_image(format="png", scale=1.0, width=900)
                 charts["basis_comparison"] = base64.b64encode(img_bytes).decode()
     except Exception:
         pass
@@ -4388,7 +4393,7 @@ def _generate_report_charts(main_ct, spot_dict, ltd) -> dict:
                         template="plotly_white", height=350,
                         margin=dict(t=50, b=40, l=50, r=20),
                     )
-                    img_bytes = fig_sp.to_image(format="png", scale=1.5)
+                    img_bytes = fig_sp.to_image(format="png", scale=1.0, width=900)
                     charts["spread_trend"] = base64.b64encode(img_bytes).decode()
     except Exception:
         pass
