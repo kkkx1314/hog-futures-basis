@@ -4376,7 +4376,7 @@ def _build_reportlab_pdf(html_content: str, cn_date: str, chart_images: dict = N
 
 
 # ★ 修改日报逻辑后递增此版本号，使旧缓存自动失效
-_DAILY_REPORT_VERSION = 12
+_DAILY_REPORT_VERSION = 13
 
 @st.cache_data(ttl=120, show_spinner=False)
 def _compute_daily_report_cache(main_ct: str, spot_hash: int, _version: int = 0) -> dict:
@@ -4898,45 +4898,30 @@ def tab_daily_report():
     with col_title:
         st.caption(f"📅 报告日期：{cn_date} ｜ 主力合约：{main_ct}")
     with col_btn1:
-        # PDF with images using weasyprint (more reliable than reportlab for HTML+images)
         pdf_data = _build_weasyprint_pdf(html, cn_date)
         if pdf_data is None:
             pdf_data = _build_reportlab_pdf(html, cn_date, chart_images)
         if pdf_data:
-            st.download_button(
-                label="📄 下载 PDF",
-                data=pdf_data,
+            st.download_button("📄 下载 PDF", data=pdf_data,
                 file_name=f"生猪期货日报_{cn_date.replace('年','').replace('月','').replace('日','')}.pdf",
-                mime="application/pdf",
-                use_container_width=True,
-                key="dl_pdf"
-            )
+                mime="application/pdf", use_container_width=True, key="dl_pdf")
         else:
-            st.download_button(
-                label="📄 下载 HTML",
-                data=html.encode("utf-8"),
+            st.download_button("📄 下载 HTML", data=html.encode("utf-8"),
                 file_name=f"生猪期货日报_{cn_date.replace('年','').replace('月','').replace('日','')}.html",
-                mime="text/html",
-                use_container_width=True,
-                key="dl_html",
-                help="PDF库不可用，提供HTML格式（浏览器打开后可打印为PDF）"
-            )
+                mime="text/html", use_container_width=True, key="dl_html",
+                help="PDF库不可用，浏览器打开HTML后可打印为PDF")
+
     with col_btn2:
         png_data = _compose_report_image(chart_images, cn_date, main_ct)
+        if png_data is None and chart_images:
+            # PIL失败时用kaleido直接导出图表
+            png_data = _export_first_chart_png(chart_images)
         if png_data:
-            st.download_button(
-                label="🖼️ 下载图片",
-                data=png_data,
+            st.download_button("🖼️ 下载图片", data=png_data,
                 file_name=f"生猪期货日报_{cn_date.replace('年','').replace('月','').replace('日','')}.png",
-                mime="image/png",
-                use_container_width=True,
-                key="dl_img"
-            )
+                mime="image/png", use_container_width=True, key="dl_img")
         else:
-            # 兜底：直接导出HTML
-            st.download_button(
-                label="🖼️ 下载 HTML",
-                data=html.encode("utf-8"),
+            st.download_button("🖼️ 下载 HTML", data=html.encode("utf-8"),
                 file_name=f"生猪期货日报_{cn_date.replace('年','').replace('月','').replace('日','')}.html",
                 mime="text/html",
                 use_container_width=True,
@@ -4960,6 +4945,19 @@ def _build_weasyprint_pdf(html: str, cn_date: str) -> Optional[bytes]:
         return buf.getvalue()
     except ImportError:
         pass
+    except Exception:
+        pass
+    return None
+
+
+def _export_first_chart_png(chart_images: dict) -> Optional[bytes]:
+    """PIL不可用时，直接用kaleido导出chart_images中的第一张图为PNG"""
+    import base64
+    try:
+        for key in ["basis_comparison", "spread_trend"]:
+            b64 = chart_images.get(key)
+            if b64:
+                return base64.b64decode(b64)
     except Exception:
         pass
     return None
