@@ -3741,17 +3741,16 @@ def main():
             placeholder.empty()
         st.session_state["_startup_all_synced"] = True
 
-    # ── 自动增量同步：每 30 分钟拉取最新数据 ──
-    if "_last_auto_sync" not in st.session_state:
-        st.session_state["_last_auto_sync"] = datetime.now() - timedelta(hours=1)
+    # ── 自动增量同步：每天下午 4 点后拉取一次最新期货数据（已是最新时秒过）──
+    if "_last_auto_sync_date" not in st.session_state:
+        st.session_state["_last_auto_sync_date"] = None
 
-    _mins_since_sync = (datetime.now() - st.session_state["_last_auto_sync"]).total_seconds() / 60
-    if _mins_since_sync >= 30:
-        with st.spinner("📡 自动同步最新行情…"):
-            for ct in get_active_contracts():
-                sync_futures(ct, force_full=False)
-                sync_net_holdings(ct, force_full=False)
-        st.session_state["_last_auto_sync"] = datetime.now()
+    _now = datetime.now()
+    _today_str = _now.strftime("%Y%m%d")
+    if st.session_state["_last_auto_sync_date"] != _today_str and _now.hour >= 16:
+        for ct in get_active_contracts():
+            sync_futures(ct, force_full=False)  # 已是最新时秒过（<0.1s）
+        st.session_state["_last_auto_sync_date"] = _today_str
 
     # ── 七个 Tab ──
     t1, t2, t3, t4, t5, t6, t7 = st.tabs([
