@@ -3828,15 +3828,15 @@ def _analyze_basis_historical(main_ct, spot_dict, fut_df, ltd, regions, snap) ->
             else:
                 deviation = 0
             if deviation > 30:
-                level = f"明显高于历史同期均值（偏离+{deviation:.0f}%）"
+                level = f"<span class=\"tag tag-bull\">明显高于</span>历史同期均值（偏离+{deviation:.0f}%）"
             elif deviation > 10:
-                level = f"高于历史同期均值（偏离+{deviation:.0f}%）"
+                level = f"<span class=\"tag tag-bull\">高于</span>历史同期均值（偏离+{deviation:.0f}%）"
             elif deviation < -30:
-                level = f"明显低于历史同期均值（偏离{deviation:.0f}%）"
+                level = f"<span class=\"tag tag-bear\">明显低于</span>历史同期均值（偏离{deviation:.0f}%）"
             elif deviation < -10:
-                level = f"低于历史同期均值（偏离{deviation:.0f}%）"
+                level = f"<span class=\"tag tag-bear\">低于</span>历史同期均值（偏离{deviation:.0f}%）"
             else:
-                level = f"处于历史同期均值附近（偏离{deviation:+.0f}%）"
+                level = f"<span class=\"tag tag-neutral\">处于</span>历史同期均值附近（偏离{deviation:+.0f}%）"
             result[ind_name] = {"current": cur, "hist_avg": hist_avg, "level": level}
         else:
             result[ind_name] = {"current": cur, "hist_avg": None, "level": "暂无历史同期数据"}
@@ -4780,15 +4780,15 @@ def _compute_key_spread(main_ct: str, ltd=None):
             else:
                 dev = 0
             if dev > 30:
-                pos = f"明显高于历史同期均值（偏离+{dev:.0f}%）"
+                pos = f"<span class=\"tag tag-bull\">明显高于</span>历史同期均值（偏离+{dev:.0f}%）"
             elif dev > 10:
-                pos = f"高于历史同期均值（偏离+{dev:.0f}%）"
+                pos = f"<span class=\"tag tag-bull\">高于</span>历史同期均值（偏离+{dev:.0f}%）"
             elif dev < -30:
-                pos = f"明显低于历史同期均值（偏离{dev:.0f}%）"
+                pos = f"<span class=\"tag tag-bear\">明显低于</span>历史同期均值（偏离{dev:.0f}%）"
             elif dev < -10:
-                pos = f"低于历史同期均值（偏离{dev:.0f}%）"
+                pos = f"<span class=\"tag tag-bear\">低于</span>历史同期均值（偏离{dev:.0f}%）"
             else:
-                pos = f"处于历史同期均值附近（偏离{dev:+.0f}%）"
+                pos = f"<span class=\"tag tag-neutral\">处于</span>历史同期均值附近（偏离{dev:+.0f}%）"
         else:
             return (f"{ct_a}-{ct_b} 价差 <b>{latest_spread:+,.0f}元/吨</b>"
                     f"（{_cn(pd.Timestamp(latest_dt))}），暂无同月同日历史数据", "")
