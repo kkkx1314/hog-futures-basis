@@ -1038,6 +1038,104 @@ def _make_spot_futures_chart(ct: str, spot_dict: dict) -> go.Figure:
     return fig
 
 
+def _resolve_selected_item_for_chart(sel_items, spot_dict, ref_regions):
+    """解析用户选择的区域/指标，用于现货+期货走势图联动。
+    返回 {'type': 'region'|'indicator', 'label': str, 'title': str, 'region_name': str}"""
+    if not sel_items:
+        return {"type": "indicator", "label": "全国均价", "title": "全国均价", "region_name": "全国均价"}
+    first = sel_items[0]
+    # 检查是否为汇总指标
+    if "全国均价" in first:
+        return {"type": "indicator", "label": "全国均价", "title": "全国均价基差", "region_name": "全国均价"}
+    if "最大基差" in first:
+        return {"type": "indicator", "label": "最大基差", "title": "最大基差", "region_name": "最大基差"}
+    if "最小基差" in first:
+        return {"type": "indicator", "label": "最小基差", "title": "最小基差", "region_name": "最小基差"}
+    if "基差平均值" in first:
+        return {"type": "indicator", "label": "基差平均值", "title": "基差平均值", "region_name": "基差平均值"}
+    if "───" in first:
+        # Separator - use next item or fallback
+        for item in sel_items[1:]:
+            if "───" not in item:
+                return _resolve_selected_item_for_chart([item], spot_dict, ref_regions)
+        return {"type": "indicator", "label": "全国均价", "title": "全国均价", "region_name": "全国均价"}
+    # Check for region
+    if first in ref_regions:
+        region_name = first if first in spot_dict else "全国均价"
+        return {"type": "region", "label": first, "title": f"{first}现货", "region_name": region_name}
+    return {"type": "indicator", "label": "全国均价", "title": "全国均价", "region_name": "全国均价"}
+
+
+def _make_spot_futures_chart_with_item(ct: str, spot_dict: dict, sel_item: dict) -> go.Figure:
+    """根据用户选择的区域/指标，生成现货+期货双轴走势图。
+    sel_item 来自 _resolve_selected_item_for_chart"""
+    import pandas as pd
+
+    fut_df, _ = load_futures(ct)
+    if fut_df is None or fut_df.empty:
+        return go.Figure()
+
+    df = fut_df.sort_values("date").reset_index(drop=True)
+    fig = go.Figure()
+
+    # 期货收盘价（右轴）
+    fig.add_trace(go.Scatter(
+        x=df["date"], y=df["close"],
+        name=f"{ct} 期货收盘价", mode="lines",
+        line=dict(color="#E74C3C", width=2),
+        yaxis="y2",
+        hovertemplate="<b>%{x|%Y年%m月%d日}</b><br>期货：%{y:.0f}元/吨<extra></extra>"
+    ))
+
+    item_type = sel_item.get("type", "indicator")
+    region_name = sel_item.get("region_name", "全国均价")
+
+    if item_type == "region":
+        # 指定区域的现货价格
+        spot_df = spot_dict.get(region_name)
+        if spot_df is not None and "date" in spot_df.columns:
+            merged = df[["date", "close"]].merge(
+                spot_df[["date", "price"]], on="date", how="inner"
+            )
+            if not merged.empty:
+                fig.add_trace(go.Scatter(
+                    x=merged["date"], y=merged["price"],
+                    name=f"现货（{region_name}）", mode="lines",
+                    line=dict(color="#27AE60", width=2),
+                    yaxis="y",
+                    hovertemplate="<b>%{x|%Y年%m月%d日}</b><br>现货：%{y:.2f}元/公斤<extra></extra>"
+                ))
+    else:
+        # 汇总指标：全国均价
+        national_spot = spot_dict.get("全国均价")
+        if national_spot is not None and "date" in national_spot.columns:
+            merged = df[["date", "close"]].merge(
+                national_spot[["date", "price"]], on="date", how="inner"
+            )
+            if not merged.empty:
+                fig.add_trace(go.Scatter(
+                    x=merged["date"], y=merged["price"],
+                    name=f"现货（{sel_item.get('title', '全国均价')}）", mode="lines",
+                    line=dict(color="#27AE60", width=2),
+                    yaxis="y",
+                    hovertemplate="<b>%{x|%Y年%m月%d日}</b><br>现货：%{y:.2f}元/公斤<extra></extra>"
+                ))
+
+    fig.update_layout(
+        title=f"{ct} 现货与期货价格走势 — {sel_item.get('title', '全国均价')}",
+        xaxis=dict(title="日期", tickformat="%Y年%m月"),
+        yaxis=dict(title="现货价格（元/公斤）", side="left", showgrid=True),
+        yaxis2=dict(title="期货收盘价（元/吨）", side="right", overlaying="y", showgrid=False),
+        template="plotly_white", height=350,
+        hovermode="x unified",
+        legend=dict(orientation="h", y=1.02, x=0),
+        margin=dict(t=50, b=30, l=60, r=60),
+    )
+    fig.update_xaxes(rangeslider_visible=True)
+    fig.update_yaxes(autorange=True)
+    return fig
+
+
 def fig_delivery_comparison(series: Dict[str, pd.DataFrame], data_date: str = "") -> go.Figure:
     if not series: return go.Figure()
     fig = go.Figure()
@@ -1783,11 +1881,12 @@ def _tab3_calendar(contracts, spot_dict, ref_regions, sel_items, data_date, acti
         else:
             st.caption(f"⚠️ 无法加载 {_clicked_ct} 的现货/期货数据")
     else:
-        # ★ 默认显示主力合约的现货+期货走势图
+        # ★ 默认显示：响应 sel_items 选择的区域/指标
         default_ct = contracts[0] if contracts else get_main_contract()
+        sel_label = _resolve_selected_item_for_chart(sel_items, spot_dict, ref_regions)
         st.markdown(f"---")
-        st.markdown(f"### 📈 {default_ct} 现货与期货价格走势（点击上方合约线可切换）")
-        fig_sf = _make_spot_futures_chart(default_ct, spot_dict)
+        st.markdown(f"### 📈 {default_ct} 现货与期货价格走势 — {sel_label['title']}（点击上方合约线可切换）")
+        fig_sf = _make_spot_futures_chart_with_item(default_ct, spot_dict, sel_label)
         if fig_sf.data:
             st.plotly_chart(fig_sf, use_container_width=True)
         else:
@@ -3677,8 +3776,8 @@ def tab7():
 # ══════════════════════════════════════════════════════════════
 
 def _build_daily_report_html(main_ct: str, fut_df, spot_dict, ltd, prev_td,
-                              snap, holdings_df, key_spread_info,
-                              trend_direction, sr_lines_info) -> str:
+                              snap, holdings_analysis, key_spread_info,
+                              trend_direction, sr_lines_info, chart_images=None) -> str:
     """构建日报 HTML 内容"""
     cn_date = _cn(ltd)
     cn_prev = _cn(prev_td) if prev_td else "前一交易日"
@@ -3698,13 +3797,14 @@ def _build_daily_report_html(main_ct: str, fut_df, spot_dict, ltd, prev_td,
             prev_close = float(row_prev["close"].iloc[-1]) if row_prev is not None and not row_prev.empty else close_v
             chg = close_v - prev_close
             chg_pct = chg / prev_close * 100 if prev_close != 0 else 0
+            chg_sign = "+" if chg >= 0 else ""
         else:
-            close_v, high_v, low_v, vol_v, oi_v, chg, chg_pct = 0, 0, 0, 0, 0, 0, 0
+            close_v, high_v, low_v, vol_v, oi_v, chg, chg_pct, chg_sign = 0, 0, 0, 0, 0, 0, 0, ""
     else:
-        close_v, high_v, low_v, vol_v, oi_v, chg, chg_pct = 0, 0, 0, 0, 0, 0, 0
+        close_v, high_v, low_v, vol_v, oi_v, chg, chg_pct, chg_sign = 0, 0, 0, 0, 0, 0, 0, ""
 
     chg_color = "#E74C3C" if chg >= 0 else "#27AE60"
-    chg_sign = "+" if chg >= 0 else ""
+    chg_class = "up" if chg >= 0 else "down"
 
     # 基差
     na_basis = snap.get("national_avg", 0) if snap else 0
@@ -3713,49 +3813,43 @@ def _build_daily_report_html(main_ct: str, fut_df, spot_dict, ltd, prev_td,
     min_region = snap.get("min_region", "—") if snap else "—"
     min_basis = snap.get("min_basis", 0) if snap else 0
 
-    # 基差判断
-    basis_judge = "中性"
-    if na_basis > 500:
-        basis_judge = "偏高"
-    elif na_basis < -500:
-        basis_judge = "偏低"
+    if na_basis > 500: basis_judge = "偏高"
+    elif na_basis < -500: basis_judge = "偏低"
+    else: basis_judge = "中性"
 
     # 价差
     spread_text = key_spread_info if key_spread_info else "暂无价差数据"
 
-    # 持仓
-    net_pos_text = "—"
-    net_judge = "中性"
-    pos_chg_text = "—"
-    if holdings_df is not None and not holdings_df.empty:
-        total_long = int(holdings_df["long"].sum())
-        total_short = int(holdings_df["short"].sum())
-        net_pos = total_long - total_short
-        net_pos_text = f"{net_pos:+,}手"
-        if net_pos > 5000:
-            net_judge = "偏多"
-        elif net_pos < -5000:
-            net_judge = "偏空"
+    # 持仓（使用分析结果）
+    ha = holdings_analysis or {}
+    if ha.get("available"):
+        pos_section = f"""
+        <div class="grid2">
+        <div class="kv"><span class="k">前20多单合计</span><span class="v">{ha['total_long']:,} 手</span></div>
+        <div class="kv"><span class="k">前20空单合计</span><span class="v">{ha['total_short']:,} 手</span></div>
+        </div>
+        <p style="margin-top:8px;">
+        净持仓：<b>{ha['net_pos']:+,}</b>手 → <span class="tag tag-{'bull' if ha['net_judge']=='偏多' else ('bear' if ha['net_judge']=='偏空' else 'neutral')}">{ha['net_judge']}</span><br>
+        {ha['zhengzhi_summary']}<br>
+        {ha['fanzhi_summary']}<br>
+        📌 综合：<b>{ha['overall_judge']}</b>
+        </p>"""
+    else:
+        pos_section = "<p>⚠️ 前20持仓数据缺失（当日大商所数据尚未发布）</p>"
 
     # 技术
-    if trend_direction:
-        tech_summary = trend_direction
-    else:
-        tech_summary = "震荡"
-
-    # 支撑压力
-    res_str = "、".join(sr_lines_info.get("resistances", ["暂无"]))
-    sup_str = "、".join(sr_lines_info.get("supports", ["暂无"]))
+    tech_summary = trend_direction if trend_direction else "震荡"
+    res_str = "、".join(sr_lines_info.get("resistances", ["暂无"])) if sr_lines_info else "暂无"
+    sup_str = "、".join(sr_lines_info.get("supports", ["暂无"])) if sr_lines_info else "暂无"
 
     # 一句话总结
-    bull_score = 0
-    bear_score = 0
+    bull_score = bear_score = 0
     if chg > 0: bull_score += 1
     elif chg < 0: bear_score += 1
     if na_basis > 300: bull_score += 1
     elif na_basis < -300: bear_score += 1
-    if net_judge == "偏多": bull_score += 1
-    elif net_judge == "偏空": bear_score += 1
+    if ha.get("net_judge") == "偏多": bull_score += 1
+    elif ha.get("net_judge") == "偏空": bear_score += 1
     if tech_summary in ("多头", "偏多"): bull_score += 1
     elif tech_summary in ("空头", "偏空"): bear_score += 1
 
@@ -3765,6 +3859,20 @@ def _build_daily_report_html(main_ct: str, fut_df, spot_dict, ltd, prev_td,
         overall = "🐻 市场整体偏空，建议观望为主"
     else:
         overall = "⚖️ 市场多空交织，短期方向不明，建议观望"
+
+    # 图表嵌入
+    chart_html = ""
+    if chart_images:
+        if "basis_dist" in chart_images:
+            chart_html += f'''<div class="card">
+<h2><span class="icon">📊</span>基差分布图</h2>
+<img src="data:image/png;base64,{chart_images['basis_dist']}" style="width:100%;max-width:880px;" alt="基差分布">
+</div>'''
+        if "spread_trend" in chart_images:
+            chart_html += f'''<div class="card">
+<h2><span class="icon">📉</span>价差走势图</h2>
+<img src="data:image/png;base64,{chart_images['spread_trend']}" style="width:100%;max-width:880px;" alt="价差走势">
+</div>'''
 
     # ── 构建 HTML ──
     html = f"""
@@ -3805,14 +3913,14 @@ body {{ font-family: 'Microsoft YaHei', 'SimHei', sans-serif; background: #f5f6f
 <h2><span class="icon">📊</span>市场概况 — {main_ct}</h2>
 <div class="grid2">
 <div class="kv"><span class="k">收盘价</span><span class="v">{close_v:.0f} 元/吨</span></div>
-<div class="kv"><span class="k">涨跌幅</span><span class="v {chg_color.replace('#','')}">{chg_sign}{chg:.0f} ({chg_sign}{chg_pct:.2f}%)</span></div>
+<div class="kv"><span class="k">涨跌幅</span><span class="v {chg_class}">{chg_sign}{chg:.0f} ({chg_sign}{chg_pct:.2f}%)</span></div>
 <div class="kv"><span class="k">最高价</span><span class="v">{high_v:.0f} 元/吨</span></div>
 <div class="kv"><span class="k">最低价</span><span class="v">{low_v:.0f} 元/吨</span></div>
 <div class="kv"><span class="k">成交量</span><span class="v">{vol_v:,} 手</span></div>
 <div class="kv"><span class="k">持仓量</span><span class="v">{oi_v:,} 手</span></div>
 </div>
 <p style="margin-top:10px;font-size:0.92rem;color:#666;">
-📝 {main_ct} 当日收于 <b>{close_v:.0f}</b> 元/吨，较前日（{cn_prev}）<b class="{'up' if chg>=0 else 'down'}">{chg_sign}{chg:.0f} ({chg_sign}{chg_pct:.2f}%)</b>，成交量{vol_v:,}手。
+📝 {main_ct} 当日收于 <b>{close_v:.0f}</b> 元/吨，较前日（{cn_prev}）<b class="{chg_class}">{chg_sign}{chg:.0f} ({chg_sign}{chg_pct:.2f}%)</b>，成交量{vol_v:,}手。
 </p>
 </div>
 
@@ -3820,7 +3928,7 @@ body {{ font-family: 'Microsoft YaHei', 'SimHei', sans-serif; background: #f5f6f
 <div class="card">
 <h2><span class="icon">📐</span>基差分析</h2>
 <p>
-全国均价基差 <b>{na_basis:+,}元/吨</b>，处于历史同期<span class="tag tag-{'bull' if basis_judge=='偏高' else ('bear' if basis_judge=='偏低' else 'neutral')}">{basis_judge}</span>水平。<br>
+全国均价基差 <b>{na_basis:+,}元/吨</b>，处于<span class="tag tag-{'bull' if basis_judge=='偏高' else ('bear' if basis_judge=='偏低' else 'neutral')}">{basis_judge}</span>水平。<br>
 基差最大区域：<b>{max_region}</b>（{max_basis:+,}元/吨）｜ 最小区域：<b>{min_region}</b>（{min_basis:+,}元/吨）。
 </p>
 </div>
@@ -3831,13 +3939,10 @@ body {{ font-family: 'Microsoft YaHei', 'SimHei', sans-serif; background: #f5f6f
 <p>{spread_text}</p>
 </div>
 
-<!-- 4. 持仓分析 -->
+<!-- 4. 前20净持仓分析 -->
 <div class="card">
-<h2><span class="icon">🏢</span>持仓分析</h2>
-<p>
-前20多单合计：<b>{int(holdings_df['long'].sum()):,}</b>手 ｜ 空单合计：<b>{int(holdings_df['short'].sum()):,}</b>手 ｜ 净持仓：<b>{net_pos_text}</b><br>
-净持仓判断：<span class="tag tag-{'bull' if net_judge=='偏多' else ('bear' if net_judge=='偏空' else 'neutral')}">{net_judge}</span>
-</p>
+<h2><span class="icon">🏢</span>前20净持仓分析</h2>
+{pos_section}
 </div>
 
 <!-- 5. 技术分析 -->
@@ -3849,17 +3954,20 @@ body {{ font-family: 'Microsoft YaHei', 'SimHei', sans-serif; background: #f5f6f
 </p>
 </div>
 
+<!-- 图表 -->
+{chart_html}
+
 <!-- 6. 综合结论 -->
 <div class="conclusion">{overall}</div>
 
-<div class="source">⚠️ 免责声明：本报告仅供参考，不构成任何投资建议。投资有风险，入市需谨慎。<br>数据来源：涌益咨询现货 ｜ 大连商品交易所期货数据</div>
+<div class="source">⚠️ 免责声明：本报告仅供参考，不构成任何投资建议。投资有风险，入市需谨慎。<br>数据来源：涌益咨询现货 ｜ 大连商品交易所期货数据 ｜ 前20持仓数据来自大商所/新浪财经</div>
 
 </div></body></html>"""
     return html
 
 
 def _build_daily_report_md(main_ct, fut_df, spot_dict, ltd, prev_td,
-                            snap, holdings_df, key_spread_info,
+                            snap, holdings_analysis, key_spread_info,
                             trend_direction, sr_lines_info) -> str:
     """构建日报 Markdown 内容"""
     cn_date = _cn(ltd)
@@ -3886,12 +3994,20 @@ def _build_daily_report_md(main_ct, fut_df, spot_dict, ltd, prev_td,
     max_basis = snap.get("max_basis", 0) if snap else 0
     min_region = snap.get("min_region", "—") if snap else "—"
     min_basis = snap.get("min_basis", 0) if snap else 0
-    total_long = int(holdings_df["long"].sum()) if holdings_df is not None and not holdings_df.empty else 0
-    total_short = int(holdings_df["short"].sum()) if holdings_df is not None and not holdings_df.empty else 0
-    net_pos = total_long - total_short
 
-    res_str = "、".join(sr_lines_info.get("resistances", ["暂无"]))
-    sup_str = "、".join(sr_lines_info.get("supports", ["暂无"]))
+    ha = holdings_analysis or {}
+    if ha.get("available"):
+        pos_section = f"""- 前20多单合计：**{ha['total_long']:,}**手
+- 前20空单合计：**{ha['total_short']:,}**手
+- 净持仓：**{ha['net_pos']:+,}**手 → {ha['net_judge']}
+- {ha['zhengzhi_summary']}
+- {ha['fanzhi_summary']}
+- 综合：**{ha['overall_judge']}**"""
+    else:
+        pos_section = "⚠️ 前20持仓数据缺失（当日大商所数据尚未发布）"
+
+    res_str = "、".join(sr_lines_info.get("resistances", ["暂无"])) if sr_lines_info else "暂无"
+    sup_str = "、".join(sr_lines_info.get("supports", ["暂无"])) if sr_lines_info else "暂无"
 
     md = f"""# 🐷 生猪期货每日分析报告
 
@@ -3924,11 +4040,9 @@ def _build_daily_report_md(main_ct, fut_df, spot_dict, ltd, prev_td,
 
 {key_spread_info if key_spread_info else "暂无价差数据"}
 
-## 🏢 四、持仓分析
+## 🏢 四、前20净持仓分析
 
-- 前20多单合计：**{total_long:,}**手
-- 前20空单合计：**{total_short:,}**手
-- 净持仓：**{net_pos:+,}**手
+{pos_section}
 
 ## 📉 五、技术分析
 
@@ -3947,11 +4061,17 @@ def _build_daily_report_md(main_ct, fut_df, spot_dict, ltd, prev_td,
     return md
 
 
-def _build_reportlab_pdf(html_content: str, cn_date: str) -> Optional[bytes]:
-    """使用 reportlab 生成 PDF，失败返回 None"""
+def _build_reportlab_pdf(html_content: str, cn_date: str, chart_images: dict = None) -> Optional[bytes]:
+    """使用 reportlab 生成 PDF（含嵌入图片），失败返回 None"""
     if not HAS_REPORTLAB:
         return None
     try:
+        import re
+        from reportlab.platypus import Image as RLImage
+        import base64
+        import tempfile
+        import os
+
         buf = BytesIO()
         doc = SimpleDocTemplate(buf, pagesize=A4,
             leftMargin=20*mm, rightMargin=20*mm, topMargin=15*mm, bottomMargin=15*mm)
@@ -3972,24 +4092,29 @@ def _build_reportlab_pdf(html_content: str, cn_date: str) -> Optional[bytes]:
         story.append(Paragraph(f"报告日期：{cn_date}", small_style))
         story.append(Spacer(1, 12))
 
-        # Parse simple HTML sections to paragraphs
-        sections = [
-            ("市场概况", "..." ),  # simplified
-        ]
-
-        # Simple approach: extract text from HTML
-        import re
-        # Remove HTML tags for each card
+        # Extract cards from HTML
         cards = re.findall(r'<div class="card">(.*?)</div>', html_content, re.DOTALL)
+        tmp_files = []
         for card_html in cards:
-            # Get h2 title
             h2_match = re.search(r'<h2>(.*?)</h2>', card_html, re.DOTALL)
             if h2_match:
                 title = re.sub(r'<.*?>', '', h2_match.group(1)).strip()
                 story.append(Paragraph(title, h2_style))
-            # Get content
             content = re.sub(r'<h2>.*?</h2>', '', card_html, flags=re.DOTALL)
-            text = re.sub(r'<.*?>', ' ', content).strip()
+            # Check for embedded images
+            img_match = re.search(r'<img src="data:image/png;base64,([^"]+)"', content)
+            if img_match:
+                img_data = base64.b64decode(img_match.group(1))
+                tmpf = tempfile.NamedTemporaryFile(suffix='.png', delete=False)
+                tmpf.write(img_data)
+                tmpf.close()
+                tmp_files.append(tmpf.name)
+                img = RLImage(tmpf.name, width=450, height=200)
+                story.append(img)
+                text = re.sub(r'<img[^>]+>', '', content)
+            else:
+                text = content
+            text = re.sub(r'<.*?>', ' ', text).strip()
             text = re.sub(r'\s+', ' ', text)
             for line in text.split('。'):
                 line = line.strip()
@@ -4011,6 +4136,12 @@ def _build_reportlab_pdf(html_content: str, cn_date: str) -> Optional[bytes]:
         story.append(Paragraph("免责声明：本报告仅供参考，不构成任何投资建议。", small_style))
 
         doc.build(story)
+
+        # Cleanup temp files
+        for f in tmp_files:
+            try: os.unlink(f)
+            except Exception: pass
+
         return buf.getvalue()
     except Exception:
         return None
@@ -4018,7 +4149,7 @@ def _build_reportlab_pdf(html_content: str, cn_date: str) -> Optional[bytes]:
 
 @st.cache_data(ttl=600, show_spinner=False)
 def _compute_daily_report_cache(main_ct: str, spot_hash: int) -> dict:
-    """缓存日报计算，避免重复加载"""
+    """缓存日报计算，避免重复加载。返回所有日报所需数据。"""
     spot_dict, _ = load_spot(str(SPOT_PATH))
     fut_df, _ = load_futures(main_ct)
     ltd = get_latest_trade_date()
@@ -4028,35 +4159,219 @@ def _compute_daily_report_cache(main_ct: str, spot_hash: int) -> dict:
         return {"error": "期货数据不可用"}
 
     fds = sorted(fut_df["date"].unique())
-    if ltd not in [d.date() if hasattr(d, 'date') else d for d in fds]:
+    # Normalize ltd
+    ltd_ts = pd.Timestamp(ltd) if not isinstance(ltd, pd.Timestamp) else ltd
+    if ltd_ts not in list(fds):
         fds_dates = [d.date() if hasattr(d, 'date') else d for d in fds]
-        nearby = [d for d in fds_dates if d <= ltd.date()]
+        target_date = ltd_ts.date() if hasattr(ltd_ts, 'date') else ltd_ts
+        nearby = [d for d in fds_dates if d <= target_date]
         if nearby:
-            ltd = pd.Timestamp(nearby[-1])
+            ltd_ts = pd.Timestamp(nearby[-1])
 
-    td_idx = list(fds).index(ltd) if ltd in list(fds) else -1
+    td_idx = list(fds).index(ltd_ts) if ltd_ts in list(fds) else -1
     prev_td = fds[td_idx - 1] if td_idx > 0 else None
 
     # 基差快照
     regions = get_regions(main_ct)
-    snap = compute_snapshot(main_ct, spot_dict, fut_df, ltd, regions)
+    snap = compute_snapshot(main_ct, spot_dict, fut_df, ltd_ts, regions)
 
-    # 持仓数据
-    holdings_df = _get_holdings(main_ct, ltd)
+    # 持仓数据（真实akshare数据）
+    holdings_df = _get_holdings(main_ct, ltd_ts)
+    holdings_analysis = _analyze_holdings_for_report(holdings_df, main_ct, ltd_ts)
 
-    # 价差 (主力月 vs 次主力月)
+    # 价差
     spread_info = _compute_key_spread(main_ct)
 
     # 技术分析
-    trend_dir, sr_info = _quick_technical(fut_df, ltd)
+    trend_dir, sr_info = _quick_technical(fut_df, ltd_ts)
+
+    # 生成图表并编码为base64
+    chart_images = _generate_report_charts(main_ct, spot_dict, fut_df, ltd_ts, regions, snap)
 
     # 构建HTML和MD
-    html = _build_daily_report_html(main_ct, fut_df, spot_dict, ltd, prev_td,
-                                     snap, holdings_df, spread_info, trend_dir, sr_info)
-    md = _build_daily_report_md(main_ct, fut_df, spot_dict, ltd, prev_td,
-                                 snap, holdings_df, spread_info, trend_dir, sr_info)
+    html = _build_daily_report_html(main_ct, fut_df, spot_dict, ltd_ts, prev_td,
+                                     snap, holdings_analysis, spread_info,
+                                     trend_dir, sr_info, chart_images)
+    md = _build_daily_report_md(main_ct, fut_df, spot_dict, ltd_ts, prev_td,
+                                 snap, holdings_analysis, spread_info,
+                                 trend_dir, sr_info)
 
-    return {"html": html, "md": md, "error": None, "ltd": ltd, "cn_date": _cn(ltd)}
+    return {"html": html, "md": md, "error": None, "ltd": ltd_ts, "cn_date": _cn(ltd_ts),
+            "chart_images": chart_images}
+
+
+def _analyze_holdings_for_report(holdings_df, main_ct, ltd):
+    """分析持仓数据，提取正指/反指动向。数据必须来自真实API。"""
+    if holdings_df is None or holdings_df.empty:
+        return {
+            "available": False,
+            "total_long": 0, "total_short": 0, "net_pos": 0,
+            "net_judge": "数据缺失",
+            "zhengzhi_summary": "数据缺失",
+            "fanzhi_summary": "数据缺失",
+            "overall_judge": "数据缺失",
+        }
+
+    total_long = int(holdings_df["long"].sum())
+    total_short = int(holdings_df["short"].sum())
+    net_pos = total_long - total_short
+
+    if net_pos > 5000:
+        net_judge = "偏多"
+    elif net_pos < -5000:
+        net_judge = "偏空"
+    else:
+        net_judge = "中性"
+
+    # 正指分析
+    zhengzhi_parts = []
+    fanzhi_parts = []
+    zz_bull, zz_bear = 0, 0
+    fz_bull, fz_bear = 0, 0
+
+    for _, row in holdings_df.iterrows():
+        co = str(row.get("company", ""))
+        lc = int(row.get("long_chg", 0)) if pd.notna(row.get("long_chg")) else 0
+        sc = int(row.get("short_chg", 0)) if pd.notna(row.get("short_chg")) else 0
+
+        def _action_text(lc, sc):
+            parts = []
+            if lc > 0: parts.append(f"加多{lc:,}")
+            elif lc < 0: parts.append(f"减多{lc:,}")
+            if sc > 0: parts.append(f"加空{sc:,}")
+            elif sc < 0: parts.append(f"减空{sc:,}")
+            return "、".join(parts) if parts else "持仓不变"
+
+        if co in ZHENGZHI_COMPANIES:
+            action = _action_text(lc, sc)
+            if lc > 0 and sc < 0:
+                intent = "看多"; zz_bull += 1
+            elif lc < 0 and sc > 0:
+                intent = "看空"; zz_bear += 1
+            else:
+                intent = "中性"
+            zhengzhi_parts.append(f"{co}({action}→{intent})")
+        elif co in FANZHI_COMPANIES:
+            action = _action_text(lc, sc)
+            if lc > 0 and sc < 0:
+                intent = "看多"; fz_bull += 1
+            elif lc < 0 and sc > 0:
+                intent = "看空"; fz_bear += 1
+            else:
+                intent = "中性"
+            fanzhi_parts.append(f"{co}({action}→{intent})")
+
+    # 正指方向
+    if zz_bull > zz_bear:
+        zz_dir = "看多"; zz_market = "利多"
+    elif zz_bear > zz_bull:
+        zz_dir = "看空"; zz_market = "利空"
+    else:
+        zz_dir = "分歧"; zz_market = "中性"
+
+    # 反指方向（反指看多=市场利空）
+    if fz_bull > fz_bear:
+        fz_dir = "看多"; fz_market = "利空"
+    elif fz_bear > fz_bull:
+        fz_dir = "看空"; fz_market = "利多"
+    else:
+        fz_dir = "分歧"; fz_market = "中性"
+
+    bull_score = zz_bull + fz_bear
+    bear_score = zz_bear + fz_bull
+    if bull_score > bear_score:
+        overall = "整体偏多"
+    elif bear_score > bull_score:
+        overall = "整体偏空"
+    else:
+        overall = "方向分歧"
+
+    return {
+        "available": True,
+        "total_long": total_long,
+        "total_short": total_short,
+        "net_pos": net_pos,
+        "net_judge": net_judge,
+        "zhengzhi_summary": f"正指{zz_dir}（{zz_market}）：{'；'.join(zhengzhi_parts) if zhengzhi_parts else '无正指席位数据'}",
+        "fanzhi_summary": f"反指{fz_dir}（{fz_market}）：{'；'.join(fanzhi_parts) if fanzhi_parts else '无反指席位数据'}",
+        "overall_judge": f"正指{zz_dir}，反指{fz_dir}，{overall}",
+    }
+
+
+def _generate_report_charts(main_ct, spot_dict, fut_df, ltd, regions, snap) -> dict:
+    """生成日报所需图表，返回 {name: base64_png}"""
+    import base64
+    charts = {}
+
+    # 1. 基差分布图
+    try:
+        fc = float(fut_df[fut_df["date"] == ltd]["close"].iloc[0])
+        recs = []
+        for reg in regions:
+            if reg in spot_dict:
+                r = spot_dict[reg][spot_dict[reg]["date"] == ltd]
+                if not r.empty:
+                    sp = float(r["price"].iloc[0])
+                    pm = get_premium(main_ct, reg)
+                    recs.append({
+                        "region": reg, "basis": int(round(_to_ton(sp) - (fc + pm))),
+                        "spot_price": sp, "futures_close": fc, "premium": pm,
+                        "is_indicator": False
+                    })
+        if recs:
+            # Add indicator values
+            na_basis = snap.get("national_avg", 0)
+            recs.append({"region": "全国均价", "basis": na_basis, "spot_price": 0,
+                         "futures_close": fc, "premium": 0, "is_indicator": True})
+            recs.append({"region": "最大基差", "basis": snap.get("max_basis", 0), "spot_price": 0,
+                         "futures_close": fc, "premium": 0, "is_indicator": True})
+            recs.append({"region": "最小基差", "basis": snap.get("min_basis", 0), "spot_price": 0,
+                         "futures_close": fc, "premium": 0, "is_indicator": True})
+            recs.append({"region": "基差平均值", "basis": snap.get("avg_basis", 0), "spot_price": 0,
+                         "futures_close": fc, "premium": 0, "is_indicator": True})
+
+            fig = fig_distribution(recs, main_ct, ltd, "")
+            fig.update_layout(height=380, margin=dict(t=50, b=40, l=40, r=20))
+            img_bytes = fig.to_image(format="png", scale=1.5)
+            charts["basis_dist"] = base64.b64encode(img_bytes).decode()
+    except Exception:
+        pass
+
+    # 2. 价差走势图（主力 vs 次主力，近60天）
+    try:
+        active = get_active_contracts()
+        others = [c for c in active if c != main_ct]
+        if others:
+            ct_b = others[0]
+            dfa, _ = load_futures(main_ct)
+            dfb, _ = load_futures(ct_b)
+            if dfa is not None and dfb is not None:
+                ac = dfa.set_index("date")["close"]
+                bc = dfb.set_index("date")["close"]
+                cm = sorted(ac.index.intersection(bc.index))
+                if len(cm) > 0:
+                    recent_cm = cm[-60:]
+                    spreads_v = [float(ac[d] - bc[d]) for d in recent_cm]
+                    fig_sp = go.Figure()
+                    fig_sp.add_trace(go.Scatter(
+                        x=recent_cm, y=spreads_v, mode="lines",
+                        name=f"{main_ct}-{ct_b}",
+                        line=dict(color="#E74C3C", width=2),
+                        hovertemplate="%{x|%Y-%m-%d}<br>价差：%{y:+,.0f}<extra></extra>"
+                    ))
+                    fig_sp.add_hline(y=0, line_dash="dash", line_color="gray", opacity=0.3)
+                    fig_sp.update_layout(
+                        title=f"{main_ct}-{ct_b} 价差走势（近60日）",
+                        xaxis=dict(tickformat="%m-%d"), yaxis=dict(title="价差（元/吨）"),
+                        template="plotly_white", height=350,
+                        margin=dict(t=50, b=30, l=40, r=20),
+                    )
+                    img_bytes = fig_sp.to_image(format="png", scale=1.5)
+                    charts["spread_trend"] = base64.b64encode(img_bytes).decode()
+    except Exception:
+        pass
+
+    return charts
 
 
 def _compute_key_spread(main_ct: str) -> str:
@@ -4134,7 +4449,13 @@ def tab_daily_report():
     spot_dict, _ = load_spot(str(SPOT_PATH))
     spot_hash = _spot_hash(spot_dict)
 
-    # 使用缓存
+    # 清除缓存按钮
+    col_refresh, _ = st.columns([1, 5])
+    with col_refresh:
+        if st.button("🔄 刷新日报", key="refresh_daily"):
+            _compute_daily_report_cache.clear()
+            st.rerun()
+
     with st.spinner("🔄 正在生成日报…"):
         cache = _compute_daily_report_cache(main_ct, spot_hash)
 
@@ -4145,13 +4466,13 @@ def tab_daily_report():
     html = cache["html"]
     md = cache["md"]
     cn_date = cache.get("cn_date", "")
+    chart_images = cache.get("chart_images", {})
 
     # ── 下载按钮 ──
-    col_title, col_btn1, col_btn2 = st.columns([4, 1, 1])
+    col_title, col_btn1, col_btn2, col_btn3 = st.columns([3, 1, 1, 1])
     with col_title:
         st.caption(f"📅 报告日期：{cn_date} ｜ 主力合约：{main_ct}")
     with col_btn1:
-        # Markdown download
         st.download_button(
             label="📄 下载 Markdown",
             data=md.encode("utf-8"),
@@ -4161,8 +4482,8 @@ def tab_daily_report():
             key="dl_md"
         )
     with col_btn2:
-        # PDF download - try reportlab
-        pdf_data = _build_reportlab_pdf(html, cn_date)
+        # PDF with images
+        pdf_data = _build_reportlab_pdf(html, cn_date, chart_images)
         if pdf_data:
             st.download_button(
                 label="📄 下载 PDF",
@@ -4173,7 +4494,6 @@ def tab_daily_report():
                 key="dl_pdf"
             )
         else:
-            # Fallback: download HTML (user can print to PDF)
             st.download_button(
                 label="📄 下载 HTML",
                 data=html.encode("utf-8"),
@@ -4181,7 +4501,19 @@ def tab_daily_report():
                 mime="text/html",
                 use_container_width=True,
                 key="dl_html",
-                help="reportlab 未安装，提供 HTML 格式（可在浏览器中打开后打印为 PDF）"
+                help="PDF库不可用，提供HTML格式（浏览器打开后可打印为PDF）"
+            )
+    with col_btn3:
+        # 下载日报为图片
+        img_data = _render_report_as_image(html)
+        if img_data:
+            st.download_button(
+                label="🖼️ 下载图片",
+                data=img_data,
+                file_name=f"生猪期货日报_{cn_date.replace('年','').replace('月','').replace('日','')}.png",
+                mime="image/png",
+                use_container_width=True,
+                key="dl_img"
             )
 
     # ── 渲染 HTML 日报 ──
@@ -4189,6 +4521,30 @@ def tab_daily_report():
 
     # ── 底部分隔 ──
     st.markdown("---")
+
+
+def _render_report_as_image(html: str) -> Optional[bytes]:
+    """将日报HTML渲染为PNG图片"""
+    try:
+        import imgkit
+        img_bytes = imgkit.from_string(html, False, options={
+            'format': 'png', 'width': 900, 'quality': 95,
+            'encoding': 'UTF-8'
+        })
+        return img_bytes
+    except ImportError:
+        pass
+    # Fallback: try with weasyprint then convert
+    try:
+        from weasyprint import HTML
+        import io
+        pdf_buf = io.BytesIO()
+        HTML(string=html).write_pdf(pdf_buf)
+        # Can't easily convert PDF to PNG without extra deps
+        return None
+    except ImportError:
+        pass
+    return None
 
 
 # ══════════════════════════════════════════════════════════════
