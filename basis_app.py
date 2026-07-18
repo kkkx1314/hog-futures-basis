@@ -4305,8 +4305,11 @@ def _build_reportlab_pdf(html_content: str, cn_date: str, chart_images: dict = N
         return None
 
 
-@st.cache_data(ttl=300, show_spinner=False)
-def _compute_daily_report_cache(main_ct: str, spot_hash: int) -> dict:
+# ★ 修改日报逻辑后递增此版本号，使旧缓存自动失效
+_DAILY_REPORT_VERSION = 3
+
+@st.cache_data(ttl=120, show_spinner=False)
+def _compute_daily_report_cache(main_ct: str, spot_hash: int, _version: int = 0) -> dict:
     """缓存日报计算。期货数据用最新交易日，持仓数据用API实际返回日期。"""
     spot_dict, _ = load_spot(str(SPOT_PATH))
     fut_df, _ = load_futures(main_ct)
@@ -4781,7 +4784,7 @@ def tab_daily_report():
             st.rerun()
 
     with st.spinner("🔄 正在生成日报…"):
-        cache = _compute_daily_report_cache(main_ct, spot_hash)
+        cache = _compute_daily_report_cache(main_ct, spot_hash, _DAILY_REPORT_VERSION)
 
     if cache.get("error"):
         st.error(f"❌ {cache['error']}")
