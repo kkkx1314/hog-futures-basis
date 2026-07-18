@@ -4306,7 +4306,7 @@ def _build_reportlab_pdf(html_content: str, cn_date: str, chart_images: dict = N
 
 
 # ★ 修改日报逻辑后递增此版本号，使旧缓存自动失效
-_DAILY_REPORT_VERSION = 3
+_DAILY_REPORT_VERSION = 4
 
 @st.cache_data(ttl=120, show_spinner=False)
 def _compute_daily_report_cache(main_ct: str, spot_hash: int, _version: int = 0) -> dict:
@@ -4573,7 +4573,8 @@ def _generate_report_charts(main_ct, spot_dict, ltd) -> dict:
 
 
 def _compute_key_spread(main_ct: str, ltd=None) -> str:
-    """计算主力合约与次主力合约的价差，使用历史同期（同月同日）均值对比"""
+    """计算主力合约与次主力合约的价差。
+    历史对比：所有历史年份的同月合约对，在同一月/日的价差均值。"""
     active = get_active_contracts()
     if len(active) < 2:
         return "暂无足够合约计算价差"
@@ -4585,41 +4586,60 @@ def _compute_key_spread(main_ct: str, ltd=None) -> str:
         if not others:
             return "暂无其他上市合约"
         ct_b = others[0]
+
+        ma, mb = ct_month(ct_a), ct_month(ct_b)
+
+        # 当前价差
         dfa, _ = load_futures(ct_a)
         dfb, _ = load_futures(ct_b)
         if dfa is None or dfa.empty or dfb is None or dfb.empty:
             return f"{ct_a}-{ct_b} 价差数据不足"
         ac = dfa.set_index("date")["close"]
         bc = dfb.set_index("date")["close"]
-        cm = sorted(ac.index.intersection(bc.index))
-        if len(cm) == 0:
+        cm_cur = sorted(ac.index.intersection(bc.index))
+        if len(cm_cur) == 0:
             return f"{ct_a}-{ct_b} 无共同交易日"
-
-        # 最新价差
         if ltd and ltd in ac.index and ltd in bc.index:
             latest_dt = ltd
         else:
-            latest_dt = cm[-1]
+            latest_dt = cm_cur[-1]
         latest_spread = float(ac[latest_dt] - bc[latest_dt])
-
-        # ★ 历史同期均值：相同月/日的所有年份平均
         target_m, target_d = latest_dt.month, latest_dt.day
+
+        # ★ 跨年份历史同期：取所有历史年份的同月合约对，算同月同日价差
         same_day_vals = []
-        for d in cm:
-            if d.month == target_m and d.day == target_d:
-                same_day_vals.append(float(ac[d] - bc[d]))
-        # Fallback: 如果同日期数据<2个，用近30天均值
-        if len(same_day_vals) >= 2:
+        year_start = 21  # 2021
+        year_end = 27    # 2027
+        for y in range(year_start, year_end):
+            ca, cb = f"LH{y:02d}{ma}", f"LH{y:02d}{mb}"
+            if ca == ct_a and cb == ct_b:
+                continue  # 跳过当前合约对（已单独取值）
+            if ca not in ALL_CONTRACTS or cb not in ALL_CONTRACTS:
+                continue
+            dfa_h, _ = load_futures(ca)
+            dfb_h, _ = load_futures(cb)
+            if dfa_h is None or dfa_h.empty or dfb_h is None or dfb_h.empty:
+                continue
+            try:
+                ach = dfa_h.set_index("date")["close"]
+                bch = dfb_h.set_index("date")["close"]
+                # 找该年份 target_m/target_d 的日期
+                for d in ach.index:
+                    if d.month == target_m and d.day == target_d:
+                        if d in bch.index:
+                            same_day_vals.append(float(ach[d] - bch[d]))
+                        break  # 每年只取一个值
+            except Exception:
+                continue
+
+        if len(same_day_vals) >= 1:
             hist_avg = float(np.mean(same_day_vals))
             hist_label = f"历史同期（{len(same_day_vals)}年）均值"
         else:
-            nearby = [d for d in cm if abs((d - pd.Timestamp(year=2020, month=target_m, day=target_d)).days) <= 15]
-            if nearby:
-                hist_avg = float(np.mean([float(ac[d] - bc[d]) for d in nearby]))
-                hist_label = f"近15日历史均值"
-            else:
-                hist_avg = float((ac[cm] - bc[cm]).mean())
-                hist_label = "全历史均值"
+            # 无历史数据，仅显示当前值
+            cn_dt = _cn(pd.Timestamp(latest_dt))
+            return (f"{ct_a}-{ct_b} 价差 <b>{latest_spread:+,.0f}元/吨</b>（{cn_dt}），"
+                    f"暂无同月同日历史数据可供对比")
 
         diff = latest_spread - hist_avg
         if diff > 300:
