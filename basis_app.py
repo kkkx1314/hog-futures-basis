@@ -3961,7 +3961,8 @@ def _analyze_vol_oi_momentum(fut_df, ltd) -> dict:
 def _build_daily_report_html(main_ct: str, fut_df, spot_dict, ltd, prev_td,
                               snap, holdings_analysis, key_spread_info,
                               trend_direction, sr_lines_info, chart_images=None,
-                              basis_enhanced=None, vol_oi_analysis=None) -> str:
+                              basis_enhanced=None, vol_oi_analysis=None,
+                              spread_date_str=None) -> str:
     """构建日报 HTML 内容"""
     cn_date = _cn(ltd)
     cn_prev = _cn(prev_td) if prev_td else "前一交易日"
@@ -4086,26 +4087,26 @@ def _build_daily_report_html(main_ct: str, fut_df, spot_dict, ltd, prev_td,
 <html lang="zh-CN">
 <head><meta charset="utf-8"><title>生猪期货每日分析报告</title>
 <style>
-body {{ font-family: 'Microsoft YaHei', 'SimHei', sans-serif; background: #f5f6fa; padding: 20px; color: #333; }}
+body {{ font-family: 'Microsoft YaHei', 'SimHei', sans-serif; background: #f0f2f5; padding: 16px; color: #2c3e50; }}
 .report {{ max-width: 900px; margin: 0 auto; }}
-.header {{ background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); color: #fff; padding: 24px 30px; border-radius: 12px 12px 0 0; }}
-.header h1 {{ font-size: 1.6rem; margin: 0 0 4px 0; }}
-.header .sub {{ font-size: 0.85rem; opacity: 0.75; }}
-.card {{ background: #fff; border-radius: 8px; padding: 18px 22px; margin: 12px 0; box-shadow: 0 1px 4px rgba(0,0,0,0.06); }}
-.card h2 {{ font-size: 1.1rem; margin: 0 0 10px 0; padding-bottom: 8px; border-bottom: 2px solid #eee; }}
-.card h2 .icon {{ margin-right: 6px; }}
-.grid2 {{ display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }}
-.kv {{ display: flex; justify-content: space-between; padding: 4px 0; border-bottom: 1px dotted #eee; }}
-.kv .k {{ color: #888; }}
+.header {{ background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); color: #fff; padding: 20px 28px; border-radius: 10px 10px 0 0; }}
+.header h1 {{ font-size: 1.5rem; margin: 0 0 4px 0; letter-spacing: 2px; }}
+.header .sub {{ font-size: 0.82rem; opacity: 0.8; line-height: 1.6; }}
+.card {{ background: #fff; border-radius: 8px; padding: 16px 20px; margin: 10px 0; box-shadow: 0 1px 3px rgba(0,0,0,0.05); border-left: 3px solid #e0e0e0; }}
+.card h2 {{ font-size: 1.05rem; margin: 0 0 8px 0; padding-bottom: 6px; border-bottom: 1px solid #f0f0f0; color: #34495e; }}
+.card h2 .icon {{ margin-right: 5px; }}
+.grid2 {{ display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }}
+.kv {{ display: flex; justify-content: space-between; padding: 3px 0; border-bottom: 1px dotted #f0f0f0; }}
+.kv .k {{ color: #999; font-size: 0.9rem; }}
 .kv .v {{ font-weight: 600; }}
 .up {{ color: #E74C3C; }}
 .down {{ color: #27AE60; }}
-.tag {{ display: inline-block; padding: 2px 10px; border-radius: 4px; font-size: 0.85rem; font-weight: 600; }}
+.tag {{ display: inline-block; padding: 1px 8px; border-radius: 3px; font-size: 0.82rem; font-weight: 600; }}
 .tag-bull {{ background: #fde8e8; color: #E74C3C; }}
 .tag-bear {{ background: #e8f5e9; color: #27AE60; }}
 .tag-neutral {{ background: #e8eaf6; color: #5c6bc0; }}
-.conclusion {{ background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: #fff; padding: 16px 22px; border-radius: 8px; margin: 12px 0; font-size: 1.05rem; text-align: center; }}
-.source {{ text-align: center; color: #aaa; font-size: 0.78rem; margin-top: 16px; }}
+.conclusion {{ background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: #fff; padding: 14px 20px; border-radius: 8px; margin: 12px 0; font-size: 1rem; text-align: center; }}
+.source {{ text-align: center; color: #bbb; font-size: 0.75rem; margin-top: 14px; }}
 </style></head>
 <body><div class="report">
 
@@ -4145,7 +4146,7 @@ body {{ font-family: 'Microsoft YaHei', 'SimHei', sans-serif; background: #f5f6f
 
 <!-- 3. 价差分析 -->
 <div class="card">
-<h2><span class="icon">💰</span>价差分析（{cn_date}）</h2>
+<h2><span class="icon">💰</span>价差分析（{spread_date_str if spread_date_str else cn_date}）</h2>
 <p>{spread_text}</p>
 </div>
 
@@ -4367,7 +4368,7 @@ def _build_reportlab_pdf(html_content: str, cn_date: str, chart_images: dict = N
 
 
 # ★ 修改日报逻辑后递增此版本号，使旧缓存自动失效
-_DAILY_REPORT_VERSION = 10
+_DAILY_REPORT_VERSION = 11
 
 @st.cache_data(ttl=120, show_spinner=False)
 def _compute_daily_report_cache(main_ct: str, spot_hash: int, _version: int = 0) -> dict:
@@ -4412,8 +4413,8 @@ def _compute_daily_report_cache(main_ct: str, spot_hash: int, _version: int = 0)
     # ── 增强基差分析：计算历史分位 ──
     basis_enhanced = _analyze_basis_historical(main_ct, spot_dict, fut_df, ltd_ts, regions, snap)
 
-    # ── 价差（使用期货数据日期）──
-    spread_info = _compute_key_spread(main_ct, ltd_ts)
+    # ── 价差（返回(文本, 实际日期)）──
+    spread_info, spread_date = _compute_key_spread(main_ct, ltd_ts)
 
     # ── 成交量/持仓量动能分析 ──
     vol_oi_analysis = _analyze_vol_oi_momentum(fut_df, ltd_ts)
@@ -4428,7 +4429,7 @@ def _compute_daily_report_cache(main_ct: str, spot_hash: int, _version: int = 0)
     html = _build_daily_report_html(main_ct, fut_df, spot_dict, ltd_ts, prev_td,
                                      snap, holdings_analysis, spread_info,
                                      trend_dir, sr_info, chart_images, basis_enhanced,
-                                     vol_oi_analysis)
+                                     vol_oi_analysis, spread_date)
     md = _build_daily_report_md(main_ct, fut_df, spot_dict, ltd_ts, prev_td,
                                  snap, holdings_analysis, spread_info,
                                  trend_dir, sr_info, basis_enhanced, vol_oi_analysis)
@@ -4637,7 +4638,8 @@ def _generate_report_charts(main_ct, spot_dict, ltd) -> dict:
     return charts
 
 
-def _compute_key_spread(main_ct: str, ltd=None) -> str:
+def _compute_key_spread(main_ct: str, ltd=None):
+    """返回 (html_text, date_str) — date_str为价差实际数据日期"""
     """价差分析 — 使用与 Tab5 完全相同的 spread_collector[(month,day)] 逻辑。
     历史同期均值 = 所有年份同月合约对在同月同日的价差均值。"""
     active = get_active_contracts()
@@ -4657,12 +4659,12 @@ def _compute_key_spread(main_ct: str, ltd=None) -> str:
         dfa, _ = load_futures(ct_a)
         dfb, _ = load_futures(ct_b)
         if dfa is None or dfa.empty or dfb is None or dfb.empty:
-            return f"{ct_a}-{ct_b} 价差数据不足"
+            return f"{ct_a}-{ct_b} 价差数据不足", ""
         ac = dfa.set_index("date")["close"]
         bc = dfb.set_index("date")["close"]
         cm_cur = sorted(ac.index.intersection(bc.index))
         if len(cm_cur) == 0:
-            return f"{ct_a}-{ct_b} 无共同交易日"
+            return f"{ct_a}-{ct_b} 无共同交易日", ""
 
         # 用ltd或最新共同日
         if ltd and ltd in cm_cur:
@@ -4722,7 +4724,7 @@ def _compute_key_spread(main_ct: str, ltd=None) -> str:
                 f"（{_cn(pd.Timestamp(latest_dt))}），"
                 f"历史同期均值 <b>{hist_avg:+,.0f}元/吨</b>，{pos}")
     except Exception as e:
-        return f"价差计算异常: {e}"
+        return f"价差计算异常: {e}", ""
 
 
 def _quick_technical(fut_df, ltd) -> Tuple[str, dict]:
