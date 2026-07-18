@@ -3822,18 +3822,24 @@ def _analyze_basis_historical(main_ct, spot_dict, fut_df, ltd, regions, snap) ->
 
         if hist_vals:
             hist_avg = int(np.mean(hist_vals))
-            sorted_vals = sorted(hist_vals)
-            rank = sum(1 for v in sorted_vals if v < cur)
-            pct = rank / len(sorted_vals) * 100
-            if pct >= 80:
-                level = f"处于历史同期偏高水平（超过{pct:.0f}%的同期值）"
-            elif pct <= 20:
-                level = f"处于历史同期偏低水平（仅高于{pct:.0f}%的同期值）"
+            # ★ 直接用偏离幅度判断（更直观）
+            if hist_avg != 0:
+                deviation = (cur - hist_avg) / abs(hist_avg) * 100
             else:
-                level = f"处于历史同期均值附近（分位{pct:.0f}%）"
-            result[ind_name] = {"current": cur, "hist_avg": hist_avg, "pct": pct, "level": level}
+                deviation = 0
+            if deviation > 30:
+                level = f"明显高于历史同期均值（偏离+{deviation:.0f}%）"
+            elif deviation > 10:
+                level = f"高于历史同期均值（偏离+{deviation:.0f}%）"
+            elif deviation < -30:
+                level = f"明显低于历史同期均值（偏离{deviation:.0f}%）"
+            elif deviation < -10:
+                level = f"低于历史同期均值（偏离{deviation:.0f}%）"
+            else:
+                level = f"处于历史同期均值附近（偏离{deviation:+.0f}%）"
+            result[ind_name] = {"current": cur, "hist_avg": hist_avg, "level": level}
         else:
-            result[ind_name] = {"current": cur, "hist_avg": None, "pct": None, "level": "暂无历史同期数据"}
+            result[ind_name] = {"current": cur, "hist_avg": None, "level": "暂无历史同期数据"}
 
     return result
 
@@ -3853,8 +3859,6 @@ def _build_basis_analysis_html(snap, basis_enhanced, na_basis, max_region, max_b
         na_cur = na.get("current", 0)
         na_hist = na.get("hist_avg", 0)
         na_level = na.get("level", "")
-        na_pct = na.get("pct", 50)
-        tag_cls = "bull" if na_pct >= 80 else ("bear" if na_pct <= 20 else "neutral")
         parts.append(f"全国均价基差 <b>{na_cur:+,}元/吨</b>，"
                    f"历史同期均值 {na_hist:+,}元/吨，{na_level}")
 
@@ -3890,7 +3894,7 @@ def _build_basis_analysis_html(snap, basis_enhanced, na_basis, max_region, max_b
     return "<br>".join(f"• {p}" for p in parts) if parts else "基差数据暂不可用"
 
 
-def _analyze_vol_oi_momentum(fut_df, ltd, main_ct="") -> dict:
+def _analyze_vol_oi_momentum(fut_df, ltd) -> dict:
     """分析成交量和持仓量的动能情况，含历史同期趋势复盘"""
     if fut_df is None or fut_df.empty:
         return {"available": False, "vol_text": "数据不足", "oi_text": "数据不足",
@@ -3946,110 +3950,12 @@ def _analyze_vol_oi_momentum(fut_df, ltd, main_ct="") -> dict:
         else:
             oi_decline = f"持仓量较峰值{_cn(oi_peak_date)}（{oi_peak_val:,.0f}手）回落{(1-cur_oi/oi_peak_val)*100:.1f}%"
 
-        # ── 历史同期持仓量趋势复盘 ──
-        oi_hist_review = _review_historical_oi_pattern(main_ct, ltd, cur_oi)
-
         return {"available": True, "vol_text": vol_text, "oi_text": oi_text,
                 "oi_decline": oi_decline, "vol_trend": vol_trend,
-                "cur_vol": cur_vol, "cur_oi": cur_oi,
-                "oi_hist_review": oi_hist_review}
+                "cur_vol": cur_vol, "cur_oi": cur_oi}
     except Exception:
         return {"available": False, "vol_text": "计算异常", "oi_text": "计算异常",
-                "oi_decline": "计算异常", "vol_trend": "计算异常",
-                "oi_hist_review": "计算异常"}
-
-
-def _review_historical_oi_pattern(main_ct, ltd, cur_oi) -> str:
-    """复盘历史持仓量趋势：峰值时间、减仓节奏、同期对比"""
-    try:
-        tmon = ct_month(main_ct)
-        same_month_cts = [c for c in ALL_CONTRACTS if ct_month(c) == tmon and c != main_ct]
-        if not same_month_cts:
-            return "暂无历史合约数据"
-
-        target_m, target_d = ltd.month, ltd.day
-        peak_info = []     # (合约, 峰值日期, 峰值OI, 减仓开始日期, 同期OI)
-        decline_dates = []  # 减仓开始的(月, 日)
-
-        for c in same_month_cts:
-            fdf, _ = load_futures(c)
-            if fdf is None or fdf.empty: continue
-            oi_col = "open_interest" if "open_interest" in fdf.columns else ("hold" if "hold" in fdf.columns else None)
-            if oi_col is None: continue
-            oi_series = fdf[oi_col].astype(float)
-            dates = pd.to_datetime(fdf["date"])
-            if len(oi_series) < 30: continue
-
-            peak_idx = int(oi_series.idxmax())
-            peak_date = dates.iloc[peak_idx]
-            peak_val = float(oi_series.iloc[peak_idx])
-
-            # 减仓开始：峰值后首次连续3天OI下降的起点
-            after_peak = oi_series.iloc[peak_idx:]
-            after_dates = dates.iloc[peak_idx:]
-            decline_start = None
-            for j in range(3, len(after_peak)):
-                if (float(after_peak.iloc[j]) < float(after_peak.iloc[j-1]) < float(after_peak.iloc[j-2])):
-                    if float(after_peak.iloc[j]) < peak_val * 0.95:
-                        decline_start = after_dates.iloc[j-2]
-                        break
-
-            # 同期OI：同月同日的OI值
-            same_day = dates[(dates.dt.month == target_m) & (dates.dt.day == target_d)]
-            same_day_oi = float(oi_series.iloc[same_day.index[0]]) if not same_day.empty else None
-
-            if decline_start is not None:
-                decline_dates.append((decline_start.month, decline_start.day))
-            peak_info.append({
-                "c": c, "peak_date": peak_date, "peak_oi": peak_val,
-                "decline_start": decline_start, "same_day_oi": same_day_oi
-            })
-
-        if not peak_info:
-            return "暂无历史数据"
-
-        # 峰值月份分布
-        from collections import Counter
-        peak_months = Counter(p.date.month for p in peak_info)
-        main_peak_month = peak_months.most_common(1)[0][0]
-
-        # 减仓时间
-        if decline_dates:
-            from statistics import median
-            sorted_dd = sorted(d.year * 10000 + d[0] * 100 + d[1] for d in decline_dates if hasattr(d, 'year'))
-            if not sorted_dd:
-                # fallback: use (month, day) tuples
-                md_vals = sorted(m * 100 + d for m, d in decline_dates)
-                median_md = int(median(md_vals))
-                decline_text = f"通常在{median_md//100}月{median_md%100}日前后开始减仓"
-                earliest = decline_dates[0]
-                latest = decline_dates[-1]
-                decline_text += f"（最早{earliest[0]}月{earliest[1]}日，最晚{latest[0]}月{latest[1]}日）"
-            else:
-                median_dd = int(median(sorted_dd))
-                decline_text = f"通常在{median_dd//10000}月{(median_dd%10000)//100}日前后开始减仓"
-        else:
-            decline_text = "历史合约未出现明显减仓信号"
-
-        # 同期OI vs 峰值
-        ratios = []
-        for p in peak_info:
-            if p["same_day_oi"] and p["peak_oi"] > 0:
-                ratios.append(p["same_day_oi"] / p["peak_oi"])
-        ratio_text = ""
-        if ratios:
-            avg_ratio = np.mean(ratios)
-            if avg_ratio < 0.5:
-                ratio_text = f"，历史同期OI平均仅为峰值的{avg_ratio*100:.0f}%，已大幅回落"
-            elif avg_ratio < 0.8:
-                ratio_text = f"，历史同期OI平均为峰值的{avg_ratio*100:.0f}%，处于回落阶段"
-            else:
-                ratio_text = f"，历史同期OI平均为峰值的{avg_ratio*100:.0f}%，仍在高位"
-
-        return (f"历史{len(peak_info)}个同月合约，持仓峰值集中在<b>{main_peak_month}月</b>，"
-                f"{decline_text}{ratio_text}")
-    except Exception:
-        return "历史复盘数据不足"
+                "oi_decline": "计算异常", "vol_trend": "计算异常"}
 
 
 def _build_daily_report_html(main_ct: str, fut_df, spot_dict, ltd, prev_td,
@@ -4152,8 +4058,7 @@ def _build_daily_report_html(main_ct: str, fut_df, spot_dict, ltd, prev_td,
         <p style="font-size:0.92rem;line-height:1.8;">
         • 成交量：{vo.get('vol_text', '—')}<br>
         • 持仓量：{vo.get('oi_text', '—')}<br>
-        • 持仓峰值：{vo.get('oi_decline', '—')}<br>
-        • 历史复盘：{vo.get('oi_hist_review', '—')}
+        • 持仓峰值：{vo.get('oi_decline', '—')}
         </p>"""
     else:
         vol_oi_html = "<p>⚠️ 成交量/持仓量数据不足</p>"
@@ -4462,7 +4367,7 @@ def _build_reportlab_pdf(html_content: str, cn_date: str, chart_images: dict = N
 
 
 # ★ 修改日报逻辑后递增此版本号，使旧缓存自动失效
-_DAILY_REPORT_VERSION = 9
+_DAILY_REPORT_VERSION = 10
 
 @st.cache_data(ttl=120, show_spinner=False)
 def _compute_daily_report_cache(main_ct: str, spot_hash: int, _version: int = 0) -> dict:
@@ -4511,7 +4416,7 @@ def _compute_daily_report_cache(main_ct: str, spot_hash: int, _version: int = 0)
     spread_info = _compute_key_spread(main_ct, ltd_ts)
 
     # ── 成交量/持仓量动能分析 ──
-    vol_oi_analysis = _analyze_vol_oi_momentum(fut_df, ltd_ts, main_ct)
+    vol_oi_analysis = _analyze_vol_oi_momentum(fut_df, ltd_ts)
 
     # ── 技术分析（使用期货数据）──
     trend_dir, sr_info = _quick_technical(fut_df, ltd_ts)
@@ -4795,15 +4700,20 @@ def _compute_key_spread(main_ct: str, ltd=None) -> str:
 
         if same_day_vals:
             hist_avg = float(np.mean(same_day_vals))
-            sorted_v = sorted(same_day_vals)
-            rank = sum(1 for v in sorted_v if v < latest_spread)
-            pct = rank / len(sorted_v) * 100
-            if pct >= 80:
-                pos = f"处于历史同期偏高水平（超过{pct:.0f}%的同期值）"
-            elif pct <= 20:
-                pos = f"处于历史同期偏低水平（仅高于{pct:.0f}%的同期值）"
+            if hist_avg != 0:
+                dev = (latest_spread - hist_avg) / abs(hist_avg) * 100
             else:
-                pos = f"处于历史同期均值附近（分位{pct:.0f}%）"
+                dev = 0
+            if dev > 30:
+                pos = f"明显高于历史同期均值（偏离+{dev:.0f}%）"
+            elif dev > 10:
+                pos = f"高于历史同期均值（偏离+{dev:.0f}%）"
+            elif dev < -30:
+                pos = f"明显低于历史同期均值（偏离{dev:.0f}%）"
+            elif dev < -10:
+                pos = f"低于历史同期均值（偏离{dev:.0f}%）"
+            else:
+                pos = f"处于历史同期均值附近（偏离{dev:+.0f}%）"
         else:
             return (f"{ct_a}-{ct_b} 价差 <b>{latest_spread:+,.0f}元/吨</b>"
                     f"（{_cn(pd.Timestamp(latest_dt))}），暂无同月同日历史数据")
@@ -4974,19 +4884,10 @@ def tab_daily_report():
     chart_images = cache.get("chart_images", {})
 
     # ── 下载按钮 ──
-    col_title, col_btn1, col_btn2, col_btn3 = st.columns([3, 1, 1, 1])
+    col_title, col_btn1, col_btn2 = st.columns([4, 1, 1])
     with col_title:
         st.caption(f"📅 报告日期：{cn_date} ｜ 主力合约：{main_ct}")
     with col_btn1:
-        st.download_button(
-            label="📄 下载 Markdown",
-            data=md.encode("utf-8"),
-            file_name=f"生猪期货日报_{cn_date.replace('年','').replace('月','').replace('日','')}.md",
-            mime="text/markdown",
-            use_container_width=True,
-            key="dl_md"
-        )
-    with col_btn2:
         # PDF with images using weasyprint (more reliable than reportlab for HTML+images)
         pdf_data = _build_weasyprint_pdf(html, cn_date)
         if pdf_data is None:
@@ -5010,7 +4911,7 @@ def tab_daily_report():
                 key="dl_html",
                 help="PDF库不可用，提供HTML格式（浏览器打开后可打印为PDF）"
             )
-    with col_btn3:
+    with col_btn2:
         png_data = _compose_report_image(chart_images, cn_date, main_ct)
         if png_data:
             st.download_button(
