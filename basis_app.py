@@ -3048,27 +3048,33 @@ def sync_net_holdings(ct: str, force_full: bool = False) -> Tuple[bool, str]:
         try:
             agg_df = pd.read_csv(agg_path)
             agg_df["date"] = pd.to_datetime(agg_df["date"])
-            cached_set = set(agg_df["date"].dt.strftime("%Y%m%d"))
-            all_dates = sorted(fut_df["date"].unique())
-            pending = [d.strftime("%Y%m%d") for d in all_dates
-                       if d.strftime("%Y%m%d") not in cached_set]
+            latest_cached = agg_df["date"].max()
+            latest_futures = fut_df["date"].max()
 
+            # ★ 如果缓存日期 < 期货最新日期，拉取所有缺失日期
+            if latest_cached >= latest_futures:
+                return True, "📁 已是最新"
+
+            pending = [d for d in sorted(fut_df["date"].unique()) if d > latest_cached]
             if not pending:
                 return True, "📁 已是最新"
 
             fetched = 0
-            for ds in pending:
+            for dt in pending:
+                ds = dt.strftime("%Y%m%d")
                 net = _download_net_single(ct, ds)
                 if net is not None:
                     new_row = pd.DataFrame([{"date": pd.to_datetime(ds), "net_position": net}])
                     agg_df = agg_df[agg_df["date"] != pd.to_datetime(ds)]
                     agg_df = pd.concat([agg_df, new_row], ignore_index=True)
                     fetched += 1
+                # 如果API返回None（数据未发布），不中断，继续尝试后续日期
 
             if fetched > 0:
                 agg_df = agg_df.sort_values("date").reset_index(drop=True)
                 agg_df.to_csv(agg_path, index=False)
-            return True, f"🔄 增量 +{fetched}条" if fetched else "📁 无新数据"
+                _build_seasonal_net_positions.clear()
+            return True, f"🔄 增量 +{fetched}条" if fetched else "📁 暂无新数据可拉取"
         except Exception as e:
             return False, f"❌ 增量失败：{e}"
 
@@ -3152,29 +3158,27 @@ def sync_all_net_holdings(max_workers: int = 4, progress_callback=None) -> Dict[
 
 
 def _ensure_net_cache(ct: str) -> Optional[pd.DataFrame]:
-    """读取净持仓缓存（与 load_futures 逻辑完全一致）。
-    本地有聚合文件 → 直接读取返回。
-    本地无聚合文件 → 惰性同步（仅首次触发，之后秒读）。
-    """
-    agg_path = _net_agg_path(ct)
+    """读取净持仓缓存，自动增量补全缺失日期。
 
-    # ── 本地有数据 → 直接读 ──
-    if agg_path.exists():
-        agg_df = _load_aggregated_net(ct)
-        if agg_df is not None and not agg_df.empty:
-            return agg_df
+    - 本地有聚合文件 → 增量检查并补全缺失交易日
+    - 本地无聚合文件 → 全量下载
+    """
+    agg_df = _load_aggregated_net(ct)
+    if agg_df is not None and not agg_df.empty:
+        # ★ 增量检查：补全最新缺失的交易日
+        sync_net_holdings(ct, force_full=False)
+        return _load_aggregated_net(ct)
 
     # ── 尝试迁移旧 CSV ──
     _migrate_existing_to_aggregated(ct)
     agg_df = _load_aggregated_net(ct)
     if agg_df is not None and not agg_df.empty:
-        return agg_df
-
-    # ── 惰性同步（与 load_futures 首次下载行为一致）──
-    ok, msg = sync_net_holdings(ct, force_full=True)
-    if ok:
+        sync_net_holdings(ct, force_full=False)
         return _load_aggregated_net(ct)
-    return None
+
+    # ── 无缓存，全量下载 ──
+    sync_net_holdings(ct, force_full=True)
+    return _load_aggregated_net(ct)
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -4306,7 +4310,7 @@ def _build_reportlab_pdf(html_content: str, cn_date: str, chart_images: dict = N
 
 
 # ★ 修改日报逻辑后递增此版本号，使旧缓存自动失效
-_DAILY_REPORT_VERSION = 4
+_DAILY_REPORT_VERSION = 5
 
 @st.cache_data(ttl=120, show_spinner=False)
 def _compute_daily_report_cache(main_ct: str, spot_hash: int, _version: int = 0) -> dict:
