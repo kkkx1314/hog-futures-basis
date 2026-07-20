@@ -4026,8 +4026,14 @@ def _build_daily_report_html(main_ct: str, fut_df, spot_dict, ltd, prev_td,
         {ha['fanzhi_summary']}<br>
         📌 综合：<b>{ha['overall_judge']}</b>
         </p>"""
+        pos_card_html = f"""
+        <!-- 5. 前20净持仓分析 -->
+        <div class="card">
+        <h2><span class="icon">🏢</span>前20净持仓分析（{ha_date_cn if ha_date_cn else '—'}）</h2>
+        {pos_section}
+        </div>"""
     else:
-        pos_section = f"<p>⚠️ 前20持仓数据未更新（当日大商所持仓排名尚未发布，通常T+1更新）</p>"
+        pos_card_html = ""
 
     # 技术
     tech_summary = trend_direction if trend_direction else "震荡"
@@ -4164,11 +4170,7 @@ body {{ font-family: 'Microsoft YaHei', 'SimHei', sans-serif; background: #eef0f
 {vol_oi_html}
 </div>
 
-<!-- 5. 前20净持仓分析 -->
-<div class="card">
-<h2><span class="icon">🏢</span>前20净持仓分析（{ha_date_cn if ha_date_cn else '—'}）</h2>
-{pos_section}
-</div>
+{pos_card_html}
 
 <!-- 6. 技术分析 -->
 <div class="card">
@@ -4225,14 +4227,16 @@ def _build_daily_report_md(main_ct, fut_df, spot_dict, ltd, prev_td,
 
     ha = holdings_analysis or {}
     if ha.get("available"):
-        pos_section = f"""- 前20多单合计：**{ha['total_long']:,}**手
+        pos_section = f"""## 🏢 四、前20净持仓分析
+
+- 前20多单合计：**{ha['total_long']:,}**手
 - 前20空单合计：**{ha['total_short']:,}**手
 - 净持仓：**{ha['net_pos']:+,}**手 → {ha['net_judge']}
 - {ha['zhengzhi_summary']}
 - {ha['fanzhi_summary']}
 - 综合：**{ha['overall_judge']}**"""
     else:
-        pos_section = "⚠️ 前20持仓数据缺失（当日大商所数据尚未发布）"
+        pos_section = ""
 
     res_str = "、".join(sr_lines_info.get("resistances", ["暂无"])) if sr_lines_info else "暂无"
     sup_str = "、".join(sr_lines_info.get("supports", ["暂无"])) if sr_lines_info else "暂无"
@@ -4268,10 +4272,7 @@ def _build_daily_report_md(main_ct, fut_df, spot_dict, ltd, prev_td,
 
 {key_spread_info if key_spread_info else "暂无价差数据"}
 
-## 🏢 四、前20净持仓分析
-
 {pos_section}
-
 ## 📉 五、技术分析
 
 - 趋势判断：**{trend_direction or '震荡'}**
@@ -4441,7 +4442,7 @@ def _build_reportlab_pdf(html_content: str, cn_date: str, chart_images: dict = N
 
 
 # ★ 修改日报逻辑后递增此版本号，使旧缓存自动失效
-_DAILY_REPORT_VERSION = 13
+_DAILY_REPORT_VERSION = 14
 
 @st.cache_data(ttl=120, show_spinner=False)
 def _compute_daily_report_cache(main_ct: str, spot_hash: int, _version: int = 0) -> dict:
@@ -4713,8 +4714,6 @@ def _generate_report_charts(main_ct, spot_dict, ltd) -> dict:
 
 def _compute_key_spread(main_ct: str, ltd=None):
     """返回 (html_text, date_str) — date_str为价差实际数据日期"""
-    """价差分析 — 使用与 Tab5 完全相同的 spread_collector[(month,day)] 逻辑。
-    历史同期均值 = 所有年份同月合约对在同月同日的价差均值。"""
     active = get_active_contracts()
     if len(active) < 2:
         return "暂无足够合约计算价差", ""
