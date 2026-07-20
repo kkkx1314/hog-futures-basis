@@ -271,7 +271,7 @@ def norm_region(name: str) -> str:
 # ══════════════════════════════════════════════════════════════
 # 现货加载
 # ══════════════════════════════════════════════════════════════
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=300)
 def load_spot(path_str: str) -> Tuple[Dict[str, pd.DataFrame], str]:
     path = Path(path_str)
     if not path.exists():
@@ -418,7 +418,7 @@ def _get_global_latest_date() -> Optional[pd.Timestamp]:
         except Exception: pass
     return latest
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=60)
 def get_active_contracts() -> List[str]:
     """动态识别当前上市合约，并确保兜底列表始终包含"""
     # 硬编码保底列表：当前正在交易的合约
@@ -481,7 +481,7 @@ def get_latest_futures_date() -> Optional[str]:
         except Exception: pass
     return _cn(latest) if latest else None
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=60)
 def get_latest_trade_date() -> Optional[pd.Timestamp]:
     """获取所有合约CSV中最新的交易日（全局最大值）"""
     return _get_global_latest_date()
@@ -489,7 +489,7 @@ def get_latest_trade_date() -> Optional[pd.Timestamp]:
 
 # ── 读取：优先本地 CSV，缺失时惰性同步 ──
 
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=60)
 def load_futures(ct: str) -> Tuple[Optional[pd.DataFrame], str]:
     """读取期货数据。本地有 CSV → 直接返回；本地无 → 惰性同步这一个合约。"""
     cp = _csv_path(ct)
@@ -738,7 +738,7 @@ def get_spot_data_date() -> str:
 def _to_ton(p: float) -> float:
     return float(p) * 1000
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=120, show_spinner=False)
 def calc_basis(ct: str, region: str, spot_df: pd.DataFrame, fut_df: pd.DataFrame) -> Optional[pd.DataFrame]:
     """basis = 现货(元/吨) − (期货收盘价 + 升贴水)"""
     if fut_df is None or fut_df.empty or spot_df is None or spot_df.empty: return None
@@ -3181,7 +3181,7 @@ def _ensure_net_cache(ct: str) -> Optional[pd.DataFrame]:
     return _load_aggregated_net(ct)
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=120, show_spinner=False)
 def _build_seasonal_net_positions(contracts: Tuple[str, ...], sel_month: str) -> Tuple[Dict[str, pd.DataFrame], defaultdict]:
     """构建季节性净持仓数据 — 和其他板块一样：有本地文件直接读，没有就当场下载。"""
     net_data: Dict[str, pd.DataFrame] = {}
@@ -3234,7 +3234,7 @@ def _spot_hash(spot_dict: dict) -> int:
     return hash(tuple(items))
 
 
-@st.cache_data(ttl=1800, show_spinner=False)
+@st.cache_data(ttl=300, show_spinner=False)
 def _build_calendar_series_cached(
     avail_tuple: Tuple[str, ...],
     sel_items_tuple: Tuple[str, ...],
@@ -3303,7 +3303,7 @@ def _build_calendar_series_cached(
     return series
 
 
-@st.cache_data(ttl=1800, show_spinner=False)
+@st.cache_data(ttl=300, show_spinner=False)
 def _build_vol_oi_seasonal_cached(
     contracts_tuple: Tuple[str, ...],
     sd_str: str,
@@ -4442,7 +4442,7 @@ def _build_reportlab_pdf(html_content: str, cn_date: str, chart_images: dict = N
 
 
 # ★ 修改日报逻辑后递增此版本号，使旧缓存自动失效
-_DAILY_REPORT_VERSION = 16
+_DAILY_REPORT_VERSION = 17
 
 @st.cache_data(ttl=120, show_spinner=False)
 def _compute_daily_report_cache(main_ct: str, spot_hash: int, _version: int = 0,
