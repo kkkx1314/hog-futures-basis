@@ -4442,7 +4442,7 @@ def _build_reportlab_pdf(html_content: str, cn_date: str, chart_images: dict = N
 
 
 # ★ 修改日报逻辑后递增此版本号，使旧缓存自动失效
-_DAILY_REPORT_VERSION = 17
+_DAILY_REPORT_VERSION = 18
 
 @st.cache_data(ttl=120, show_spinner=False)
 def _compute_daily_report_cache(main_ct: str, spot_hash: int, _version: int = 0,
@@ -4927,17 +4927,39 @@ def _quick_technical(fut_df, ltd) -> Tuple[str, dict]:
 
         tech_summary = f"{direction} | {trend} | {macd_text} | {rsi_text} | {bb_text}"
 
-        # 支撑/压力
-        recent_high = float(close.tail(20).max())
-        recent_low = float(close.tail(20).min())
-        resistances = [f"前高{recent_high:.0f}"]
-        supports = [f"前低{recent_low:.0f}"]
-        if bb_up > cur: resistances.append(f"布林上轨{bb_up:.0f}")
-        if bb_low < cur: supports.append(f"布林下轨{bb_low:.0f}")
-        if ma20_v < cur: supports.append(f"MA20={ma20_v:.0f}")
-        else: resistances.append(f"MA20={ma20_v:.0f}")
+        # ── 支撑/压力（Fibonacci + 布林带，与 Tab8 技术分析一致，取近90日）──
+        close_all = df["close"].astype(float).dropna()
+        # 使用近90个交易日（与 Tab8 默认范围一致）
+        close_recent = close_all.tail(90)
+        fib_high = float(close_recent.max())
+        fib_low = float(close_recent.min())
+        fib_range = fib_high - fib_low
 
-        return tech_summary, {"resistances": resistances[:2], "supports": supports[:2]}
+        fib_levels = {
+            "0.0%(顶)": fib_high,
+            "23.6%": fib_high - fib_range * 0.236,
+            "38.2%": fib_high - fib_range * 0.382,
+            "50.0%": fib_high - fib_range * 0.5,
+            "61.8%": fib_high - fib_range * 0.618,
+            "78.6%": fib_high - fib_range * 0.786,
+            "100%(底)": fib_low,
+        }
+
+        fib_res = [(k, v) for k, v in fib_levels.items() if v > cur]
+        fib_res.sort(key=lambda x: x[1])  # 离当前价最近的在前
+        fib_sup = [(k, v) for k, v in fib_levels.items() if v < cur]
+        fib_sup.sort(key=lambda x: x[1], reverse=True)
+
+        resistances = [f"{name}={val:.0f}" for name, val in fib_res[:3]]
+        supports = [f"{name}={val:.0f}" for name, val in fib_sup[:3]]
+
+        # 补充布林带
+        if bb_up > cur:
+            resistances.append(f"布林上轨={bb_up:.0f}")
+        if bb_low < cur:
+            supports.append(f"布林下轨={bb_low:.0f}")
+
+        return tech_summary, {"resistances": resistances, "supports": supports}
     except Exception:
         return "震荡(计算异常)", {"resistances": [], "supports": []}
 
