@@ -1626,7 +1626,7 @@ def tab1():
         actual_td = td
         if td not in fds:
             nearby = [d for d in fds if d <= td]
-            if nearby: actual_td = nearby[-1]; st.info(f"ℹ️ {_cn(td)} 非交易日，已使用 {_cn(actual_td)}")
+            if nearby: actual_td = nearby[-1]; st.info(f"ℹ️ {_cn(td)} 暂无交易数据，已使用最近交易日 {_cn(actual_td)}")
 
         row = fut_df[fut_df["date"] == actual_td]
         if row.empty: st.error("❌ 无期货数据"); return
@@ -2084,10 +2084,10 @@ def tab5():
                 td = nearby[-1]
                 td_fallback = True
 
-        # ── 所选日期非交易日提示 ──
+        # ── 所选日期无数据提示 ──
         if td_fallback:
             st.info(
-                f"📅 **{_cn(pd.to_datetime(sel_date))}** 为非交易日，"
+                f"📅 **{_cn(pd.to_datetime(sel_date))}** 暂无交易数据，"
                 f"已自动切换至最近交易日 **{_cn(td)}**"
             )
 
@@ -4094,12 +4094,12 @@ def _build_daily_report_html(main_ct: str, fut_df, spot_dict, ltd, prev_td,
 <head><meta charset="utf-8"><title>生猪期货每日分析报告</title>
 <style>
 * {{ box-sizing: border-box; }}
-body {{ font-family: 'Microsoft YaHei', 'SimHei', sans-serif; background: #eef0f4; padding: 14px; color: #2c3e50; }}
+body {{ font-family: 'Microsoft YaHei', 'SimHei', sans-serif; background: #eef0f4; padding: 10px 14px 4px 14px; color: #2c3e50; }}
 .report {{ max-width: 900px; margin: 0 auto; }}
 .header {{ background: linear-gradient(135deg, #0f0c29 0%, #1a1a3e 50%, #24243e 100%); color: #fff; padding: 22px 30px; border-radius: 12px 12px 0 0; }}
 .header h1 {{ font-size: 1.5rem; margin: 0 0 4px 0; letter-spacing: 2px; }}
 .header .sub {{ font-size: 0.8rem; opacity: 0.78; line-height: 1.6; }}
-.card {{ background: #fff; border-radius: 10px; padding: 16px 22px; margin: 10px 0; box-shadow: 0 2px 6px rgba(0,0,0,0.04); border-left: 4px solid #ddd; }}
+.card {{ background: #fff; border-radius: 10px; padding: 14px 22px; margin: 6px 0; box-shadow: 0 2px 6px rgba(0,0,0,0.04); border-left: 4px solid #ddd; }}
 .card h2 {{ font-size: 1.02rem; margin: 0 0 8px 0; padding-bottom: 6px; border-bottom: 1px solid #f2f2f2; color: #2c3e50; }}
 .card h2 .icon {{ margin-right: 5px; }}
 .card:nth-of-type(1) {{ border-left-color: #3498DB; background: linear-gradient(135deg, #ffffff 0%, #f8fbff 100%); }}
@@ -4119,8 +4119,8 @@ body {{ font-family: 'Microsoft YaHei', 'SimHei', sans-serif; background: #eef0f
 .tag-bear {{ background: #e8f8e8; color: #1e8449; }}
 .tag-neutral {{ background: #eef0fa; color: #4a5494; }}
 .highlight {{ background: #fff9c4; padding: 1px 6px; border-radius: 3px; font-weight: 700; }}
-.conclusion {{ background: linear-gradient(135deg, #4158D0 0%, #C850C0 50%, #FFCC70 100%); color: #fff; padding: 14px 22px; border-radius: 10px; margin: 12px 0; font-size: 1.02rem; text-align: center; font-weight: 600; letter-spacing: 1px; }}
-.source {{ text-align: center; color: #bbb; font-size: 0.73rem; margin-top: 14px; }}
+.conclusion {{ background: linear-gradient(135deg, #4158D0 0%, #C850C0 50%, #FFCC70 100%); color: #fff; padding: 12px 22px; border-radius: 10px; margin: 8px 0; font-size: 1.02rem; text-align: center; font-weight: 600; letter-spacing: 1px; }}
+.source {{ text-align: center; color: #bbb; font-size: 0.73rem; margin-top: 8px; }}
 </style></head>
 <body><div class="report">
 
@@ -4442,19 +4442,31 @@ def _build_reportlab_pdf(html_content: str, cn_date: str, chart_images: dict = N
 
 
 # ★ 修改日报逻辑后递增此版本号，使旧缓存自动失效
-_DAILY_REPORT_VERSION = 14
+_DAILY_REPORT_VERSION = 16
 
 @st.cache_data(ttl=120, show_spinner=False)
-def _compute_daily_report_cache(main_ct: str, spot_hash: int, _version: int = 0) -> dict:
-    """缓存日报计算。期货数据用最新交易日，持仓数据用API实际返回日期。"""
+def _compute_daily_report_cache(main_ct: str, spot_hash: int, _version: int = 0,
+                                 target_date=None) -> dict:
+    """缓存日报计算。target_date 为可选的目标日期（pd.Timestamp 或 date），
+    不传则自动使用期货数据最新交易日。"""
     spot_dict, _ = load_spot(str(SPOT_PATH))
     fut_df, _ = load_futures(main_ct)
     if fut_df is None or fut_df.empty:
         return {"error": "期货数据不可用"}
 
-    # ── 期货最新交易日 ──
+    # ── 确定目标交易日 ──
     fds = sorted(fut_df["date"].unique())
-    ltd_ts = pd.Timestamp(fds[-1])  # 直接用期货数据的最后一天
+    if target_date is not None:
+        # 用户指定了日期：找到 ≤ 目标日期的最近交易日
+        target_ts = pd.Timestamp(target_date)
+        candidates = [d for d in fds if d <= target_ts]
+        if not candidates:
+            # 目标日期早于所有数据 → 使用最早日期
+            ltd_ts = pd.Timestamp(fds[0])
+        else:
+            ltd_ts = pd.Timestamp(candidates[-1])
+    else:
+        ltd_ts = pd.Timestamp(fds[-1])  # 默认：最新交易日
     td_idx = len(fds) - 1
     prev_td = fds[td_idx - 1] if td_idx > 0 else None
 
@@ -4938,15 +4950,44 @@ def tab_daily_report():
     spot_dict, _ = load_spot(str(SPOT_PATH))
     spot_hash = _spot_hash(spot_dict)
 
-    # 清除缓存按钮
-    col_refresh, _ = st.columns([1, 5])
+    # ── 获取期货可用日期列表（自动检测数据新鲜度）──
+    fut_df_raw, _ = load_futures(main_ct)
+    # ★ 新鲜度检查：直接读 CSV 获取全局最新日期，若缓存过期则强制刷新
+    global_latest = _get_global_latest_date()
+    if global_latest is not None:
+        cache_latest = fut_df_raw["date"].max() if (fut_df_raw is not None and not fut_df_raw.empty) else None
+        if cache_latest is None or global_latest > cache_latest:
+            load_futures.clear(main_ct)
+            _compute_daily_report_cache.clear()
+            fut_df_raw, _ = load_futures(main_ct)
+    if fut_df_raw is not None and not fut_df_raw.empty:
+        avail_dates = sorted(fut_df_raw["date"].dt.date.unique())
+        latest_date = avail_dates[-1]
+    else:
+        avail_dates = [datetime.now().date()]
+        latest_date = datetime.now().date()
+
+    # ── 控件行：刷新 + 合约 + 日期选择 ──
+    col_refresh, col_ct, col_date = st.columns([0.8, 1.2, 1.5])
     with col_refresh:
         if st.button("🔄 刷新日报", key="refresh_daily"):
+            load_futures.clear()
             _compute_daily_report_cache.clear()
             st.rerun()
+    with col_ct:
+        st.caption(f"📌 主力合约：**{main_ct}**")
+    with col_date:
+        sel_date = st.date_input(
+            "📅 选择报告日期",
+            value=latest_date,
+            min_value=avail_dates[0] if avail_dates else datetime(2021, 1, 1).date(),
+            max_value=datetime.now().date(),
+            key="daily_report_date"
+        )
 
     with st.spinner("🔄 正在生成日报…"):
-        cache = _compute_daily_report_cache(main_ct, spot_hash, _DAILY_REPORT_VERSION)
+        cache = _compute_daily_report_cache(main_ct, spot_hash, _DAILY_REPORT_VERSION,
+                                             target_date=sel_date)
 
     if cache.get("error"):
         st.error(f"❌ {cache['error']}")
@@ -4992,7 +5033,7 @@ def tab_daily_report():
             )
 
     # ── 渲染 HTML 日报（使用 components.html 避免 sanitizer 破坏样式）──
-    st.components.v1.html(html, height=2200, scrolling=True)
+    st.components.v1.html(html, height=1650, scrolling=True)
 
     # ── 底部分隔 ──
     st.markdown("---")
