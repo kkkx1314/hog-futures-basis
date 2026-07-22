@@ -2586,8 +2586,8 @@ def _get_holdings(ct: str, target_date, return_meta: bool = False):
                 generic_meta_file.write_text(try_date)
                 source = "akshare" if try_date == date_str else "akshare_fallback"
                 if return_meta:
-                    return merged.head(20), try_date, source
-                return merged.head(20)
+                    return merged, try_date, source
+                return merged
             except Exception as e:
                 last_error = f"{try_date}: {type(e).__name__}: {str(e)[:120]}"
                 if attempt < 2:
@@ -2602,7 +2602,7 @@ def _get_holdings(ct: str, target_date, return_meta: bool = False):
         try:
             df = pd.read_csv(date_cache_file)
             if "company" in df.columns and "long" in df.columns and "short" in df.columns:
-                result = df.sort_values("long", ascending=False).head(20).reset_index(drop=True)
+                result = df.sort_values("long", ascending=False).reset_index(drop=True)
                 if return_meta:
                     return result, date_str, "date_cache"
                 return result
@@ -2621,7 +2621,7 @@ def _get_holdings(ct: str, target_date, return_meta: bool = False):
                         generic_date = generic_meta_file.read_text().strip()[:8]
                     except Exception:
                         pass
-                result = df.sort_values("long", ascending=False).head(20).reset_index(drop=True)
+                result = df.sort_values("long", ascending=False).reset_index(drop=True)
                 if return_meta:
                     return result, generic_date, "generic_cache"
                 return result
