@@ -2361,7 +2361,7 @@ def tab5():
             def _analyze_direction(name: str, lc: int, sc: int, is_zhengzhi: bool) -> str:
                 """根据多空变化判断方向意图。
                 正指和反指均直接描述实际持仓行为方向，不做反转。
-                返回 (tag, name, action, intent, detail)"""
+                返回格式化的分析字符串。"""
                 parts = []
                 if lc > 0: parts.append(f"加多+{lc:,}")
                 elif lc < 0: parts.append(f"减多{lc:,}")
@@ -2369,23 +2369,50 @@ def tab5():
                 elif sc < 0: parts.append(f"减空{sc:,}")
                 action = "、".join(parts) if parts else "持仓不变"
 
-                if lc > 0 and sc < 0:
+                # 净偏多倾向：加多=偏多，减空=偏多，减多=偏空，加空=偏空
+                net = lc - sc  # >0 = 偏多，<0 = 偏空
+
+                if lc == 0 and sc == 0:
+                    intent = "中性"; detail = "持仓不变"
+                elif lc > 0 and sc < 0:
                     intent = "看多"; detail = "加多减空"
                 elif lc < 0 and sc > 0:
                     intent = "看空"; detail = "减多加空"
                 elif lc > 0 and sc > 0:
-                    intent = "多空分歧"; detail = "双向加仓"
+                    # 双向加仓：一方显著大于另一方则判定方向，否则分歧
+                    if lc > sc * 1.5:
+                        intent = "看多"; detail = "加多主导"
+                    elif sc > lc * 1.5:
+                        intent = "看空"; detail = "加空主导"
+                    else:
+                        intent = "多空分歧"; detail = "双向加仓"
                 elif lc < 0 and sc < 0:
-                    intent = "观望离场"; detail = "双向减仓"
+                    # 双向减仓：减仓幅度大的一方表明意图
+                    if abs(sc) > abs(lc) * 1.5:
+                        intent = "看多"; detail = "减空主导"
+                    elif abs(lc) > abs(sc) * 1.5:
+                        intent = "看空"; detail = "减多主导"
+                    else:
+                        intent = "观望离场"; detail = "双向减仓"
                 else:
-                    intent = "中性"; detail = "持仓变化不大"
+                    # 单向操作：只有多单或只有空单变化
+                    if lc > 0:
+                        intent = "看多"; detail = "加多"
+                    elif lc < 0:
+                        intent = "看空"; detail = "减多"
+                    elif sc > 0:
+                        intent = "看空"; detail = "加空"
+                    elif sc < 0:
+                        intent = "看多"; detail = "减空"
+                    else:
+                        intent = "中性"; detail = "持仓不变"
 
                 tag = "🟢正指" if is_zhengzhi else "🔴反指"
                 # 市场含义：正指方向=市场方向，反指方向=市场反向
                 if is_zhengzhi:
-                    market = "利多" if intent == "看多" else ("利空" if intent == "看空" else intent)
+                    market = "利多" if intent in ("看多",) else ("利空" if intent in ("看空",) else intent)
                 else:
-                    market = "利空" if intent == "看多" else ("利多" if intent == "看空" else intent)
+                    market = "利空" if intent in ("看多",) else ("利多" if intent in ("看空",) else intent)
                 return f"{tag} {name}：{action} → {intent}（{market}）"
 
             zhengzhi_found = []
@@ -4580,23 +4607,39 @@ def _analyze_holdings_for_report(holdings_df, main_ct, ltd, holdings_actual_date
             elif sc < 0: parts.append(f"减空{sc:,}")
             return "、".join(parts) if parts else "持仓不变"
 
+        def _classify_intent(lc: int, sc: int) -> str:
+            """根据多空变化判断方向意图，返回 (intent, is_bull, is_bear)"""
+            net = lc - sc
+            if lc == 0 and sc == 0:
+                return "中性"
+            if lc > 0 and sc < 0:
+                return "看多"
+            if lc < 0 and sc > 0:
+                return "看空"
+            if lc > 0 and sc > 0:
+                if lc > sc * 1.5: return "看多"
+                if sc > lc * 1.5: return "看空"
+                return "多空分歧"
+            if lc < 0 and sc < 0:
+                if abs(sc) > abs(lc) * 1.5: return "看多"
+                if abs(lc) > abs(sc) * 1.5: return "看空"
+                return "观望离场"
+            # 单向操作
+            if lc > 0 or sc < 0: return "看多"
+            if lc < 0 or sc > 0: return "看空"
+            return "中性"
+
         if co in ZHENGZHI_COMPANIES:
             action = _action_text(lc, sc)
-            if lc > 0 and sc < 0:
-                intent = "看多"; zz_bull += 1
-            elif lc < 0 and sc > 0:
-                intent = "看空"; zz_bear += 1
-            else:
-                intent = "中性"
+            intent = _classify_intent(lc, sc)
+            if intent == "看多": zz_bull += 1
+            elif intent == "看空": zz_bear += 1
             zhengzhi_parts.append(f"{co}({action}→{intent})")
         elif co in FANZHI_COMPANIES:
             action = _action_text(lc, sc)
-            if lc > 0 and sc < 0:
-                intent = "看多"; fz_bull += 1
-            elif lc < 0 and sc > 0:
-                intent = "看空"; fz_bear += 1
-            else:
-                intent = "中性"
+            intent = _classify_intent(lc, sc)
+            if intent == "看多": fz_bull += 1
+            elif intent == "看空": fz_bear += 1
             fanzhi_parts.append(f"{co}({action}→{intent})")
 
     # 正指方向
