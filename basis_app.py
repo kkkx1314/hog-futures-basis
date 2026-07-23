@@ -2922,7 +2922,18 @@ def tab6():
                 st.dataframe(pd.DataFrame(st_cols), use_container_width=True, hide_index=True)
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def _cached_fetch_holdings(ct: str, date_str: str) -> Optional[pd.DataFrame]:
+    """缓存层：按合约+日期缓存持仓数据，TTL=1小时"""
+    return _fetch_exact_holdings_raw(ct, date_str, use_fallback=True)
+
+
 def _fetch_exact_holdings(ct: str, date_str: str, use_fallback: bool = True) -> Optional[pd.DataFrame]:
+    # 走缓存
+    return _cached_fetch_holdings(ct, date_str)
+
+
+def _fetch_exact_holdings_raw(ct: str, date_str: str, use_fallback: bool = True) -> Optional[pd.DataFrame]:
     """拉取指定合约在指定日期的真实持仓数据（支持交易日回退）
 
     成功返回合并后的 DataFrame，失败返回 None。
@@ -3219,8 +3230,9 @@ def sync_all_net_holdings(max_workers: int = 4, progress_callback=None) -> Dict[
     return results
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
 def _ensure_net_cache(ct: str) -> Optional[pd.DataFrame]:
-    """读取净持仓缓存，自动增量补全缺失日期。
+    """读取净持仓缓存，自动增量补全缺失日期（带内存缓存，TTL=1h）。
 
     - 本地有聚合文件 → 增量检查并补全缺失交易日
     - 本地无聚合文件 → 全量下载
@@ -5360,7 +5372,7 @@ def main():
                 list(ex.map(lambda ct: sync_futures(ct, force_full=False), stale))
         st.session_state["_last_auto_sync_date"] = _today_str
 
-    # 预加载日报缓存（后台静默生成，用户切到日报 tab 时秒开）
+    # 预加载日报缓存
     _main_ct = get_main_contract()
     _spot_dict, _ = load_spot(str(SPOT_PATH))
     _compute_daily_report_cache(_main_ct, _spot_hash(_spot_dict), _DAILY_REPORT_VERSION)
