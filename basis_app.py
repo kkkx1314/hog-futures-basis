@@ -5329,84 +5329,73 @@ def main():
     _spot_dict, _ = load_spot(str(SPOT_PATH))
     _compute_daily_report_cache(_main_ct, _spot_hash(_spot_dict), _DAILY_REPORT_VERSION)
 
-    # ── 八个 Tab ──
-    t1, t2, t3, t4, t5, t6, t7, t8 = st.tabs([
-        "📋 每日期货分析日报",
-        "📊 当日基差分布",
-        "📈 单合约基差走势",
-        "🔄 合约基差比较",
-        "📉 合约价差比较",
-        "📊 持仓与成交分析",
-        "📅 季节性持仓对比",
-        "📉 技术分析",
-    ])
+    # ── 刷新 + 自动同步（放在顶部，始终可见）──
+    col_r1, col_r2, col_r3 = st.columns([1, 1, 6])
+    with col_r1:
+        if st.button("🔄 强制刷新", use_container_width=True, key="main_refresh",
+                     help="强制拉取最新数据并清除缓存"):
+            with st.spinner("正在并行更新…"):
+                active = get_active_contracts()
+                with ThreadPoolExecutor(max_workers=5) as ex:
+                    list(ex.map(lambda ct: sync_futures(ct, force_full=False), active))
+                with ThreadPoolExecutor(max_workers=4) as ex:
+                    list(ex.map(lambda ct: sync_net_holdings(ct, force_full=False) if _csv_path(ct).exists() else None, active))
+                _build_seasonal_net_positions.clear()
+                _compute_daily_report_cache.clear()
+                load_spot.clear()
+                load_futures.clear()
+            st.rerun()
+    with col_r2:
+        if st.button("🗑️ 清除缓存", use_container_width=True, key="main_clear"):
+            st.cache_data.clear()
+            st.rerun()
+    with col_r3:
+        st.caption(f"📅 期货: {get_latest_futures_date() or '加载中…'} ｜ 现货: {get_spot_data_date()} ｜ "
+                   f"活跃合约: {'、'.join(get_active_contracts())}")
 
-    with t1: tab_daily_report()
-    with t2: tab1()
-    with t3: tab2()
-    with t4: tab3()
-    with t5: tab4()
-    with t6: tab5()
-    with t7: tab6()
-    with t8: tab7()
-
-    # ── 16:00 后每 10 分钟自动增量同步最新数据 ──
+    # ── 16:00 后每 10 分钟自动增量同步 ──
     _now = datetime.now()
     if _now.hour >= 16:
         _last_sync = st.session_state.get("_last_auto_sync_ts", 0)
         if time.time() - _last_sync > 600:
             st.session_state["_last_auto_sync_ts"] = time.time()
-            _active = get_active_contracts()
             with ThreadPoolExecutor(max_workers=5) as _ex:
-                list(_ex.map(lambda ct: sync_futures(ct, force_full=False), _active))
+                list(_ex.map(lambda ct: sync_futures(ct, force_full=False), get_active_contracts()))
             _compute_daily_report_cache.clear()
             _compute_daily_report_cache(_main_ct, _spot_hash(_spot_dict), _DAILY_REPORT_VERSION)
             st.rerun()
 
-    # ── 页面底部信息 ──
+    # ── 模块导航（按钮组 + 懒加载，只渲染当前选中模块）──
+    if "active_tab" not in st.session_state:
+        st.session_state["active_tab"] = 0
+
+    tab_names = [
+        "📋 日报", "📊 基差分布", "📈 基差走势", "🔄 合约比较",
+        "📉 价差比较", "📊 持仓成交", "📅 季节持仓", "📉 技术分析"
+    ]
+    cols = st.columns(len(tab_names))
+    for i, (col, name) in enumerate(zip(cols, tab_names)):
+        with col:
+            btn_type = "primary" if st.session_state["active_tab"] == i else "secondary"
+            if st.button(name, key=f"tabbtn_{i}", use_container_width=True, type=btn_type):
+                st.session_state["active_tab"] = i
+                st.rerun()
+
     st.markdown("---")
-    fut_update_date = get_latest_futures_date() or "加载中…"
-    spot_update_date = get_spot_data_date()
-    cached = get_cached_contracts()
-    cache_str = f"<b>{'、'.join(cached)}</b>" if cached else "暂无"
-    active_cts = get_active_contracts()
-    active_str = f"<b>{'、'.join(active_cts)}</b>" if active_cts else "识别中…"
-    st.markdown(f"""
-    <p class="footer-info">
-        📊 当前上市合约：{active_str}（{len(active_cts)}个）&nbsp;｜&nbsp;
-        📅 期货数据更新日期：<b>{fut_update_date}</b> &nbsp;｜&nbsp;
-        📅 现货数据更新日期：<b>{spot_update_date}</b> &nbsp;｜&nbsp;
-        📦 已缓存合约：<b>{len(cached)}</b> 个
-    </p>
-    """, unsafe_allow_html=True)
 
-    # ── 操作按钮 ──
-    c1, c2, c3 = st.columns([1, 1, 8])
-    with c1:
-        if st.button("🔄 刷新数据", use_container_width=True, key="main_refresh"):
-            st.session_state["_startup_all_synced"] = False
-            st.session_state["_last_auto_sync_date"] = datetime.now().strftime("%Y%m%d")
-            with st.spinner("🔄 正在并行更新活跃合约…"):
-                active = get_active_contracts()
-                # 并行更新期货数据
-                with ThreadPoolExecutor(max_workers=5) as ex:
-                    list(ex.map(lambda ct: sync_futures(ct, force_full=False), active))
-                # 并行更新净持仓数据
-                with ThreadPoolExecutor(max_workers=4) as ex:
-                    list(ex.map(lambda ct: sync_net_holdings(ct, force_full=False) if _csv_path(ct).exists() else None, active))
-                _build_seasonal_net_positions.clear()
-                # 只清除日报和基差相关缓存，不清除期货数据缓存
-                _compute_daily_report_cache.clear()
-                load_spot.clear()
-            st.rerun()
-    with c2:
-        if st.button("🗑️ 清除缓存", use_container_width=True, key="main_clear"):
-            st.cache_data.clear()
-            st.session_state["_startup_all_synced"] = False
-            if FUTURES_DIR.exists(): shutil.rmtree(FUTURES_DIR); FUTURES_DIR.mkdir()
-            HOLDINGS_DIR.mkdir(exist_ok=True)
-            st.rerun()
+    # 只渲染当前选中的模块
+    idx = st.session_state["active_tab"]
+    if idx == 0: tab_daily_report()
+    elif idx == 1: tab1()
+    elif idx == 2: tab2()
+    elif idx == 3: tab3()
+    elif idx == 4: tab4()
+    elif idx == 5: tab5()
+    elif idx == 6: tab6()
+    elif idx == 7: tab7()
 
+    # ── 页面底部 ──
+    st.markdown("---")
     st.caption("⚠️ 免责声明：本平台数据仅供参考，不构成任何投资建议。投资有风险，入市需谨慎。")
     st.markdown("<p style='text-align:right; font-size:0.75rem; color:#adb5bd; margin-top:-8px;'>创作者：chen</p>", unsafe_allow_html=True)
 
