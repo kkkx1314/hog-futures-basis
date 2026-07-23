@@ -5329,26 +5329,46 @@ def main():
     _spot_dict, _ = load_spot(str(SPOT_PATH))
     _compute_daily_report_cache(_main_ct, _spot_hash(_spot_dict), _DAILY_REPORT_VERSION)
 
-    # ── 八个 Tab ──
-    t1, t2, t3, t4, t5, t6, t7, t8 = st.tabs([
-        "📋 每日期货分析日报",     # Tab 1 (新增)
-        "📊 当日基差分布",         # Tab 2 (原 Tab 1)
-        "📈 单合约基差走势",       # Tab 3 (原 Tab 2)
-        "🔄 合约基差比较",         # Tab 4 (原 Tab 3)
-        "📉 合约价差比较",         # Tab 5 (原 Tab 4)
-        "📊 持仓与成交分析",       # Tab 6 (原 Tab 5)
-        "📅 季节性持仓对比",       # Tab 7 (原 Tab 6)
-        "📉 技术分析",             # Tab 8 (原 Tab 7)
-    ])
+    # ── 模块导航（radio≈懒加载，只渲染当前选中页）──
+    page = st.radio(
+        "选择分析模块",
+        ["📋 每日期货分析日报", "📊 当日基差分布", "📈 单合约基差走势",
+         "🔄 合约基差比较", "📉 合约价差比较", "📊 持仓与成交分析",
+         "📅 季节性持仓对比", "📉 技术分析"],
+        horizontal=True, key="main_page", label_visibility="collapsed"
+    )
 
-    with t1: tab_daily_report()
-    with t2: tab1()
-    with t3: tab2()
-    with t4: tab3()
-    with t5: tab4()
-    with t6: tab5()
-    with t7: tab6()
-    with t8: tab7()
+    # 只渲染当前选中的模块（懒加载，其余不计算）
+    if page == "📋 每日期货分析日报":
+        tab_daily_report()
+    elif page == "📊 当日基差分布":
+        tab1()
+    elif page == "📈 单合约基差走势":
+        tab2()
+    elif page == "🔄 合约基差比较":
+        tab3()
+    elif page == "📉 合约价差比较":
+        tab4()
+    elif page == "📊 持仓与成交分析":
+        tab5()
+    elif page == "📅 季节性持仓对比":
+        tab6()
+    elif page == "📉 技术分析":
+        tab7()
+
+    # ── 16:00 后每 10 分钟自动增量同步最新数据 ──
+    _now = datetime.now()
+    if _now.hour >= 16:
+        _last_sync = st.session_state.get("_last_auto_sync_ts", 0)
+        if time.time() - _last_sync > 600:  # 10 分钟
+            st.session_state["_last_auto_sync_ts"] = time.time()
+            _active = get_active_contracts()
+            with ThreadPoolExecutor(max_workers=5) as _ex:
+                list(_ex.map(lambda ct: sync_futures(ct, force_full=False), _active))
+            _compute_daily_report_cache.clear()
+            # 静默重算日报缓存
+            _compute_daily_report_cache(_main_ct, _spot_hash(_spot_dict), _DAILY_REPORT_VERSION)
+            st.rerun()
 
     # ── 页面底部信息 ──
     st.markdown("---")
