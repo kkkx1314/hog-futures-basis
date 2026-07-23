@@ -489,7 +489,7 @@ def get_latest_trade_date() -> Optional[pd.Timestamp]:
 
 # ── 读取：优先本地 CSV，缺失时惰性同步 ──
 
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=600)
 def load_futures(ct: str) -> Tuple[Optional[pd.DataFrame], str]:
     """读取期货数据。本地有 CSV → 直接返回；本地无 → 惰性同步这一个合约。"""
     cp = _csv_path(ct)
@@ -4469,9 +4469,9 @@ def _build_reportlab_pdf(html_content: str, cn_date: str, chart_images: dict = N
 
 
 # ★ 修改日报逻辑后递增此版本号，使旧缓存自动失效
-_DAILY_REPORT_VERSION = 18
+_DAILY_REPORT_VERSION = 19
 
-@st.cache_data(ttl=120, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner="正在生成日报…")
 def _compute_daily_report_cache(main_ct: str, spot_hash: int, _version: int = 0,
                                  target_date=None) -> dict:
     """缓存日报计算。target_date 为可选的目标日期（pd.Timestamp 或 date），
@@ -5015,16 +5015,8 @@ def tab_daily_report():
     spot_dict, _ = load_spot(str(SPOT_PATH))
     spot_hash = _spot_hash(spot_dict)
 
-    # ── 获取期货可用日期列表（自动检测数据新鲜度）──
+    # ── 获取期货可用日期列表 ──
     fut_df_raw, _ = load_futures(main_ct)
-    # ★ 新鲜度检查：直接读 CSV 获取全局最新日期，若缓存过期则强制刷新
-    global_latest = _get_global_latest_date()
-    if global_latest is not None:
-        cache_latest = fut_df_raw["date"].max() if (fut_df_raw is not None and not fut_df_raw.empty) else None
-        if cache_latest is None or global_latest > cache_latest:
-            load_futures.clear(main_ct)
-            _compute_daily_report_cache.clear()
-            fut_df_raw, _ = load_futures(main_ct)
     if fut_df_raw is not None and not fut_df_raw.empty:
         avail_dates = sorted(fut_df_raw["date"].dt.date.unique())
         latest_date = avail_dates[-1]
@@ -5035,8 +5027,10 @@ def tab_daily_report():
     # ── 控件行：刷新 + 合约 + 日期选择 ──
     col_refresh, col_ct, col_date = st.columns([0.8, 1.2, 1.5])
     with col_refresh:
-        if st.button("🔄 刷新日报", key="refresh_daily"):
+        if st.button("🔄 刷新日报", key="refresh_daily",
+                     help="强制重新生成日报（有新数据时点击）"):
             load_futures.clear()
+            load_spot.clear()
             _compute_daily_report_cache.clear()
             st.rerun()
     with col_ct:
@@ -5312,21 +5306,28 @@ def main():
 
     _today_str = datetime.now().strftime("%Y%m%d")
     if st.session_state["_last_auto_sync_date"] != _today_str:
-        # 只增量同步有期货 CSV 的活跃合约（已是最新时 <0.1s 秒过）
-        for ct in get_active_contracts():
-            cp = _csv_path(ct)
-            if cp.exists():
-                try:
-                    df = pd.read_csv(cp, usecols=["date"])
-                    if not df.empty:
-                        last_date = pd.to_datetime(df["date"].max()).date()
-                        # 数据已经是今天或周末/假日（最近2天内）→ 跳过
-                        if last_date >= (datetime.now().date() - timedelta(days=2)):
-                            continue
-                except Exception:
-                    pass
-                sync_futures(ct, force_full=False)
+        active = [ct for ct in get_active_contracts() if _csv_path(ct).exists()]
+        # 只检查最近 2 天没更新的合约
+        stale = []
+        for ct in active:
+            try:
+                df = pd.read_csv(_csv_path(ct), usecols=["date"])
+                if not df.empty:
+                    last_date = pd.to_datetime(df["date"].max()).date()
+                    if last_date >= (datetime.now().date() - timedelta(days=2)):
+                        continue
+            except Exception:
+                pass
+            stale.append(ct)
+        if stale:
+            with ThreadPoolExecutor(max_workers=5) as ex:
+                list(ex.map(lambda ct: sync_futures(ct, force_full=False), stale))
         st.session_state["_last_auto_sync_date"] = _today_str
+
+    # 预加载日报缓存（后台静默生成，用户切到日报 tab 时秒开）
+    _main_ct = get_main_contract()
+    _spot_dict, _ = load_spot(str(SPOT_PATH))
+    _compute_daily_report_cache(_main_ct, _spot_hash(_spot_dict), _DAILY_REPORT_VERSION)
 
     # ── 八个 Tab ──
     t1, t2, t3, t4, t5, t6, t7, t8 = st.tabs([
@@ -5370,16 +5371,20 @@ def main():
     c1, c2, c3 = st.columns([1, 1, 8])
     with c1:
         if st.button("🔄 刷新数据", use_container_width=True, key="main_refresh"):
-            st.cache_data.clear()
             st.session_state["_startup_all_synced"] = False
             st.session_state["_last_auto_sync_date"] = datetime.now().strftime("%Y%m%d")
-            with st.spinner("🔄 正在更新活跃合约最新数据…"):
-                # 只增量更新活跃合约（已是最新时秒过，<1秒）
-                for ct in get_active_contracts():
-                    sync_futures(ct, force_full=False)
-                    if _csv_path(ct).exists():
-                        sync_net_holdings(ct, force_full=False)
+            with st.spinner("🔄 正在并行更新活跃合约…"):
+                active = get_active_contracts()
+                # 并行更新期货数据
+                with ThreadPoolExecutor(max_workers=5) as ex:
+                    list(ex.map(lambda ct: sync_futures(ct, force_full=False), active))
+                # 并行更新净持仓数据
+                with ThreadPoolExecutor(max_workers=4) as ex:
+                    list(ex.map(lambda ct: sync_net_holdings(ct, force_full=False) if _csv_path(ct).exists() else None, active))
                 _build_seasonal_net_positions.clear()
+                # 只清除日报和基差相关缓存，不清除期货数据缓存
+                _compute_daily_report_cache.clear()
+                load_spot.clear()
             st.rerun()
     with c2:
         if st.button("🗑️ 清除缓存", use_container_width=True, key="main_clear"):
