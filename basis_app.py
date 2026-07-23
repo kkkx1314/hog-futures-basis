@@ -847,7 +847,7 @@ def _make_trace_label(ct: str, trade_year, item_label: str) -> str:
 # 技术指标计算 (Tab 6)
 # ══════════════════════════════════════════════════════════════
 def calculate_technicals(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
-    """计算完整技术指标：MA5/10/20/60, 布林带, MACD, RSI14, KDJ。
+    """计算完整技术指标：MA5/10/20/60, 布林带, MACD, RSI14, KDJ, ATR, OBV, WR, CCI。
     返回 (df, warnings) — warnings 为数据不足等提示列表。"""
     warnings_list: List[str] = []
     if df is None or df.empty:
@@ -858,10 +858,10 @@ def calculate_technicals(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
         close = df["close"].astype(float)
         high = df["high"].astype(float)
         low = df["low"].astype(float)
+        volume = df.get("volume", pd.Series(0, index=df.index)).astype(float)
     except KeyError as e:
         return df, [f"缺少必要列：{e}"]
 
-    # ── 数据量检查 ──
     if n_rows < 20:
         warnings_list.append(f"数据仅 {n_rows} 个交易日，MA20/布林带/MACD 可能不完整")
     if n_rows < 60:
@@ -895,20 +895,48 @@ def calculate_technicals(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
     rs = avg_gain / avg_loss.replace(0, np.nan)
     df["rsi14"] = 100 - (100 / (1 + rs))
 
-    # ── KDJ (9, 3, 3) — 向量化，避免 Python 循环 ──
+    # ── KDJ (9, 3, 3) ──
     n = 9
     lowest_low = low.rolling(n).min()
     highest_high = high.rolling(n).max()
     rsv = ((close - lowest_low) / (highest_high - lowest_low).replace(0, np.nan)) * 100
-    # ewm(alpha=1/3, adjust=False) 等价于 K = 2/3*K_prev + 1/3*RSV
-    k_series = rsv.ewm(alpha=1/3, adjust=False).mean()
-    # 前 n-1 个值为 NaN，手动回退到 50
-    k_series = k_series.fillna(50.0)
+    k_series = rsv.ewm(alpha=1/3, adjust=False).mean().fillna(50.0)
     d_series = k_series.ewm(alpha=1/3, adjust=False).mean()
-    j_series = 3 * k_series - 2 * d_series
     df["kdj_k"] = k_series
     df["kdj_d"] = d_series
-    df["kdj_j"] = j_series
+    df["kdj_j"] = 3 * k_series - 2 * d_series
+
+    # ── ATR (Average True Range, 14日) — 波动率指标 ──
+    tr1 = high - low
+    tr2 = (high - close.shift(1)).abs()
+    tr3 = (low - close.shift(1)).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    df["atr14"] = tr.rolling(14).mean()
+    # ATR百分比（相对当前价格的波动率）
+    df["atr_pct"] = df["atr14"] / close * 100
+
+    # ── OBV (On-Balance Volume) — 量能潮汐 ──
+    obv = pd.Series(0.0, index=df.index)
+    for i in range(1, len(df)):
+        if close.iloc[i] > close.iloc[i-1]:
+            obv.iloc[i] = obv.iloc[i-1] + volume.iloc[i]
+        elif close.iloc[i] < close.iloc[i-1]:
+            obv.iloc[i] = obv.iloc[i-1] - volume.iloc[i]
+        else:
+            obv.iloc[i] = obv.iloc[i-1]
+    df["obv"] = obv
+    df["obv_ma5"] = obv.rolling(5).mean()
+
+    # ── Williams %R (14日) — 超买超卖 ──
+    highest_14 = high.rolling(14).max()
+    lowest_14 = low.rolling(14).min()
+    df["wr14"] = ((highest_14 - close) / (highest_14 - lowest_14).replace(0, np.nan)) * -100
+
+    # ── CCI (Commodity Channel Index, 20日) — 趋势强度 ──
+    tp = (high + low + close) / 3  # typical price
+    sma_tp = tp.rolling(20).mean()
+    mad = tp.rolling(20).apply(lambda x: np.abs(x - x.mean()).mean(), raw=True)
+    df["cci20"] = (tp - sma_tp) / (0.015 * mad.replace(0, np.nan))
 
     return df, warnings_list
 
@@ -3713,10 +3741,72 @@ def tab7():
             bb_text = "布林带数据不足"
             bb_signal = "neutral"
 
-        # ── 综合判断（方向判断，无交易建议）──
-        signals = [trend_signal, macd_signal, rsi_signal, bb_signal]
-        bull_count = sum(1 for s in signals if "bullish" in s)
-        bear_count = sum(1 for s in signals if "bearish" in s)
+        # ── ATR 波动率 ──
+        atr_v = latest_row.get("atr14", np.nan); atr_pct = latest_row.get("atr_pct", np.nan)
+        if pd.notna(atr_v) and pd.notna(atr_pct):
+            atr_text = f"ATR14={atr_v:.0f}({atr_pct:.1f}%)，{'波动剧烈' if atr_pct > 2 else '波动正常'}"
+        else:
+            atr_text = "数据不足"
+
+        # ── OBV 量能 ──
+        obv_v = latest_row.get("obv", np.nan); obv_ma5 = latest_row.get("obv_ma5", np.nan)
+        obv_signal = "neutral"
+        if pd.notna(obv_v) and pd.notna(obv_ma5) and len(df) >= 10:
+            obv_trend = obv_v - df["obv"].iloc[-10] if not pd.isna(df["obv"].iloc[-10]) else 0
+            if obv_v > obv_ma5 and obv_trend > 0:
+                obv_text = "OBV上行，量价配合，资金流入"
+                obv_signal = "bullish"
+            elif obv_v < obv_ma5 and obv_trend < 0:
+                obv_text = "OBV下行，量价背离，资金流出"
+                obv_signal = "bearish"
+            else:
+                obv_text = "OBV平稳，量能中性"
+        else:
+            obv_text = "数据不足"
+
+        # ── WR 威廉指标 ──
+        wr_v = latest_row.get("wr14", np.nan)
+        wr_signal = "neutral"
+        if pd.notna(wr_v):
+            if wr_v > -20:
+                wr_text = f"WR={wr_v:.0f}，超买"
+                wr_signal = "bearish"
+            elif wr_v < -80:
+                wr_text = f"WR={wr_v:.0f}，超卖"
+                wr_signal = "bullish"
+            else:
+                wr_text = f"WR={wr_v:.0f}，正常"
+        else:
+            wr_text = "数据不足"
+
+        # ── CCI 商品通道 ──
+        cci_v = latest_row.get("cci20", np.nan)
+        cci_signal = "neutral"
+        if pd.notna(cci_v):
+            if cci_v > 200:
+                cci_text = f"CCI={cci_v:.0f}，极度超买"
+                cci_signal = "bullish_extreme"
+            elif cci_v > 100:
+                cci_text = f"CCI={cci_v:.0f}，偏多"
+                cci_signal = "bullish"
+            elif cci_v < -200:
+                cci_text = f"CCI={cci_v:.0f}，极度超卖"
+                cci_signal = "bearish_extreme"
+            elif cci_v < -100:
+                cci_text = f"CCI={cci_v:.0f}，偏空"
+                cci_signal = "bearish"
+            else:
+                cci_text = f"CCI={cci_v:.0f}，中性"
+        else:
+            cci_text = "数据不足"
+
+        # ── 综合判断（多指标交叉验证）──
+        signals = [trend_signal, macd_signal, rsi_signal, bb_signal, obv_signal, wr_signal, cci_signal]
+        bull_count = sum(1 for s in signals if "bullish" in str(s))
+        bear_count = sum(1 for s in signals if "bearish" in str(s))
+        # extreme 信号加权
+        bull_count += sum(2 for s in signals if "bullish_extreme" in str(s))
+        bear_count += sum(2 for s in signals if "bearish_extreme" in str(s))
         if bull_count >= 3 and bear_count <= 1:
             direction = "偏多"
             direction_sentiment = "bullish"
@@ -3750,9 +3840,13 @@ def tab7():
             f"MACD：{macd_text}",
             f"RSI：{rsi_text}",
             f"布林带：{bb_text}",
+            f"波动率：{atr_text}",
+            f"量能(OBV)：{obv_text}",
+            f"威廉(WR)：{wr_text}",
+            f"商品通道(CCI)：{cci_text}",
             f"压力位：{res_str}",
             f"支撑位：{sup_str}",
-            f"方向判断：{direction}",
+            f"综合判断：{direction}（{bull_count}多 vs {bear_count}空，7指标交叉验证）",
         ]
         display_conclusion(f"📊 技术分析结论（{ct}）", tech_items, direction_sentiment)
 
