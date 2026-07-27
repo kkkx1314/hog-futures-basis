@@ -29,7 +29,14 @@ import requests
 import time
 import shutil
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+
+# 中国标准时间 (UTC+8)
+CST = timezone(timedelta(hours=8))
+
+def _cst_now() -> datetime:
+    """返回当前中国标准时间"""
+    return datetime.now(CST)
 from pathlib import Path
 from collections import defaultdict
 from typing import Dict, List, Tuple, Optional
@@ -532,7 +539,7 @@ def sync_futures(ct: str, force_full: bool = False) -> Tuple[bool, str]:
         return True, "⏭️ 已到期，跳过"
 
     cp = _csv_path(ct)
-    today = datetime.now()
+    today = _cst_now()
 
     # ── 增量更新（本地有数据 且 不强制全量）──
     if cp.exists() and not force_full:
@@ -620,7 +627,12 @@ def _download_futures(ct: str, sd: str, ed: str) -> Optional[pd.DataFrame]:
         df = ak.futures_zh_daily_sina(symbol=ct)
         if df is not None and not df.empty:
             df["date"] = pd.to_datetime(df["date"]); df = df.sort_values("date")
-            return df[(df["date"]>=sd)&(df["date"]<=ed)].reset_index(drop=True)
+            filtered = df[(df["date"]>=sd)&(df["date"]<=ed)]
+            if not filtered.empty:
+                return filtered.reset_index(drop=True)
+            # ★ 关键修复：akshare 返回了历史数据但目标日期区间内无新数据时，
+            #    不要返回空 DataFrame，改为继续尝试 eastmoney 兜底。
+            #    场景：Sina API 未及时更新当天数据时，eastmoney 可能已有数据。
     except Exception:
         pass
     # eastmoney 兜底：只试 1 次
@@ -637,7 +649,9 @@ def _download_futures(ct: str, sd: str, ed: str) -> Optional[pd.DataFrame]:
                     if len(p) >= 7:
                         recs.append({"date":pd.to_datetime(p[0]),"open":float(p[1]),"close":float(p[2]),
                                      "high":float(p[3]),"low":float(p[4]),"volume":int(float(p[5])),"settle":float(p[2]),"hold":0})
-                if recs: return pd.DataFrame(recs).sort_values("date").reset_index(drop=True)
+                if recs:
+                    em_df = pd.DataFrame(recs).sort_values("date")
+                    return em_df[(em_df["date"]>=sd)&(em_df["date"]<=ed)].reset_index(drop=True)
     except Exception:
         pass
     return None
@@ -5445,7 +5459,7 @@ def main():
     if "_last_auto_sync_date" not in st.session_state:
         st.session_state["_last_auto_sync_date"] = None
 
-    _today_str = datetime.now().strftime("%Y%m%d")
+    _today_str = _cst_now().strftime("%Y%m%d")
     if st.session_state["_last_auto_sync_date"] != _today_str:
         active = [ct for ct in get_active_contracts() if _csv_path(ct).exists()]
         # 检查是否有合约数据未覆盖到最近交易日（包括今天）
@@ -5456,7 +5470,7 @@ def main():
                 if not df.empty:
                     last_date = pd.to_datetime(df["date"].max()).date()
                     # 只在数据确实是今天（或未来）时才跳过；否则尝试增量更新
-                    if last_date >= datetime.now().date():
+                    if last_date >= _cst_now().date():
                         continue
             except Exception:
                 pass
@@ -5495,8 +5509,8 @@ def main():
         st.caption(f"📅 期货: {get_latest_futures_date() or '...'} ｜ 现货: {get_spot_data_date()} ｜ "
                    f"合约: {'、'.join(get_active_contracts())}")
 
-    # ── 16:00 后每 10 分钟自动增量同步 ──
-    _now = datetime.now()
+    # ── 16:00（中国时间）后每 10 分钟自动增量同步 ──
+    _now = _cst_now()
     if _now.hour >= 16:
         _last_sync = st.session_state.get("_last_auto_sync_ts", 0)
         if time.time() - _last_sync > 600:
