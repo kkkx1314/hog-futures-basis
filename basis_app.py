@@ -553,8 +553,16 @@ def sync_futures(ct: str, force_full: bool = False) -> Tuple[bool, str]:
                 return True, "📁 已是最新"
             new = _download_futures(ct, start_dt.strftime("%Y%m%d"), today.strftime("%Y%m%d"))
             if new is not None and not new.empty:
+                # 合并新旧数据，新数据优先，但保留旧数据中有效的持仓量（hold）
                 combined = pd.concat([old, new], ignore_index=True)
-                combined = combined.drop_duplicates(subset=["date"]).sort_values("date")
+                # 对相同date的行，hold列取有效值（优先非0非NaN）
+                if "hold" in combined.columns:
+                    # 按date分组，保留最后一条非NaN非0的hold值
+                    combined = combined.sort_values("date")
+                    combined["_has_valid_hold"] = combined["hold"].notna() & (combined["hold"] > 0)
+                    combined = combined.sort_values(["_has_valid_hold", "date"], ascending=[False, True])
+                combined = combined.drop_duplicates(subset=["date"], keep="first").sort_values("date")
+                combined = combined.drop(columns=["_has_valid_hold"], errors="ignore")
                 combined.to_csv(cp, index=False)
                 return True, f"🔄 增量 +{len(new)}条"
             return True, "📁 已是最新"
@@ -650,7 +658,7 @@ def _download_futures(ct: str, sd: str, ed: str) -> Optional[pd.DataFrame]:
                     p = k.split(",")
                     if len(p) >= 7:
                         recs.append({"date":pd.to_datetime(p[0]),"open":float(p[1]),"close":float(p[2]),
-                                     "high":float(p[3]),"low":float(p[4]),"volume":int(float(p[5])),"settle":float(p[2]),"hold":0})
+                                     "high":float(p[3]),"low":float(p[4]),"volume":int(float(p[5])),"settle":float(p[2]),"hold":np.nan})
                 if recs:
                     em_df = pd.DataFrame(recs).sort_values("date")
                     return em_df[(em_df["date"]>=sd)&(em_df["date"]<=ed)].reset_index(drop=True)
@@ -971,7 +979,7 @@ def fig_distribution(recs: list, ct: str, target_date, data_date: str = "") -> g
     fig = go.Figure()
     fig.add_trace(go.Bar(x=df["region"], y=df["basis"], marker_color=clrs,
         text=[f"{v:+,}" for v in df["basis"]], textposition="outside", textfont=dict(size=11),
-        hovertemplate="<b>%{x}</b><br>基差：%{y:+,}元/吨<br>现货：%{customdata[0]:.2f}元/公斤<br>期货：%{customdata[1]:.0f}元/吨<br>升贴水：%{customdata[2]:+d}元/吨<extra></extra>",
+        hovertemplate="<b>%{x}</b><br>基差：%{y:+,.2f}元/吨<br>现货：%{customdata[0]:.2f}元/公斤<br>期货：%{customdata[1]:.0f}元/吨<br>升贴水：%{customdata[2]:+d}元/吨<extra></extra>",
         customdata=df[["spot_price","futures_close","premium"]].values))
     fig.add_hline(y=0, line_dash="solid", line_color="gray", opacity=0.5)
     fig.update_layout(title=title, xaxis_title="区域", yaxis_title="基差（元/吨）",
@@ -992,7 +1000,7 @@ def fig_trend(basis_dict: Dict[str, pd.DataFrame], ct: str, data_date: str = "")
         fig.add_trace(go.Scatter(x=df["date"], y=df["basis"],
             mode="lines+markers" if len(df)<60 else "lines", name=label,
             line=dict(color=c, width=w, dash=d), marker=dict(size=3),
-            hovertemplate=f"<b>{label}</b><br>%{{customdata}}<br>基差：%{{y:+,}}元/吨<extra></extra>",
+            hovertemplate=f"<b>{label}</b><br>%{{customdata}}<br>基差：%{{y:+,.2f}}元/吨<extra></extra>",
             customdata=[_cn(d) for d in df["date"]]))
     fig.add_hline(y=0, line_dash="dash", line_color="gray", opacity=0.5)
     title = f"{ct} 基差走势"
@@ -1020,7 +1028,7 @@ def fig_calendar_comparison(series: Dict[str, pd.DataFrame], tmon: str, data_dat
             mode="lines+markers", name=label,
             line=dict(color=c, width=w, dash=d),
             marker=dict(size=4, opacity=0.01, color=c),
-            hovertemplate=f"<b>{label}</b><br>%{{customdata[1]}}<br>基差：%{{y:+,}}元/吨<extra></extra>",
+            hovertemplate=f"<b>{label}</b><br>%{{customdata[1]}}<br>基差：%{{y:+,.2f}}元/吨<extra></extra>",
             customdata=[[ct_code, _cn_md(r["plot_date"])] for _,r in df.iterrows()]))
     fig.add_hline(y=0, line_dash="dash", line_color="gray", opacity=0.5)
     title = f"{tmon}月合约基差季节图（同比 — 自然日对齐）"
@@ -1189,7 +1197,7 @@ def fig_delivery_comparison(series: Dict[str, pd.DataFrame], data_date: str = ""
         else: c, w, d = _contract_color_from_label(label), 2, "solid"
         fig.add_trace(go.Scatter(x=df["days"], y=df["basis"], mode="lines", name=label,
             line=dict(color=c, width=w, dash=d),
-            hovertemplate=f"<b>{label}</b><br>距交割：%{{x}}天<br>基差：%{{y:+,}}元/吨<extra></extra>"))
+            hovertemplate=f"<b>{label}</b><br>距交割：%{{x}}天<br>基差：%{{y:+,.2f}}元/吨<extra></extra>"))
     fig.add_hline(y=0, line_dash="dash", line_color="gray", opacity=0.5)
     title = "合约基差比较 — 距离交易日对齐"
     if data_date: title += f"<br><sup>📡 期货数据来源：akshare，数据日期：{data_date}</sup>"
@@ -1450,7 +1458,7 @@ def _build_window_basis_series(
     # 历史均值（按 trading_days 对齐）
     for item_short, td_map in td_collectors.items():
         if td_map:
-            avg_rows = [{"trading_days": td, "basis": int(round(np.mean(v)))}
+            avg_rows = [{"trading_days": td, "basis": float(np.mean(v))}
                         for td, v in sorted(td_map.items()) if v]
             if avg_rows:
                 series[f"历史均值 {item_short} ±{window_days}td"] = pd.DataFrame(avg_rows).sort_values("trading_days")
@@ -1488,7 +1496,7 @@ def fig_delivery_aligned_v2(series: Dict[str, pd.DataFrame], tmon: str = "", dat
                 f"<b>{label}</b><br>"
                 f"日期：%{{customdata}}<br>"
                 f"距交割：%{{x}}交易日<br>"
-                f"基差：%{{y:+,}}元/吨<extra></extra>"
+                f"基差：%{{y:+,.2f}}元/吨<extra></extra>"
             ),
             customdata=[[_cn(r["date"]) if "date" in df.columns else ""] for _, r in df.iterrows()],
         ))
@@ -1539,7 +1547,7 @@ def fig_window_aligned_comparison(series: Dict[str, pd.DataFrame], tmon: str = "
                 f"<b>{label}</b><br>"
                 f"日期：%{{customdata}}<br>"
                 f"距交割：%{{x}}交易日<br>"
-                f"窗口均值基差：%{{y:+,}}元/吨<extra></extra>"
+                f"窗口均值基差：%{{y:+,.2f}}元/吨<extra></extra>"
             ),
             customdata=[[_cn(r["date"]) if "date" in df.columns else ""] for _, r in df.iterrows()],
         ))
@@ -1593,12 +1601,12 @@ def _gen_delivery_conclusion(series: Dict, contracts: list = None, focus_ct: str
     cur_row = target_df[target_df["trading_days"] == cur_td]
     if cur_row.empty:
         return None
-    cur_basis = int(cur_row["basis"].iloc[-1])
+    cur_basis = float(cur_row["basis"].iloc[-1])
     cur_date = _cn(cur_row["date"].iloc[-1]) if "date" in cur_row.columns else ""
 
     ct_code = focus_ct or ("LH" + target_label[:4] if len(target_label) >= 4 else "")
     items.append(f"分析合约：{ct_code}")
-    items.append(f"• 距交割 <b>{cur_td} 交易日</b>（{cur_date}），基差 <b>{cur_basis:+,}元/吨</b>")
+    items.append(f"• 距交割 <b>{cur_td} 交易日</b>（{cur_date}），基差 <b>{cur_basis:+,.0f}元/吨</b>")
 
     # 历史均值
     avg_keys = [k for k in series if "历史均值" in k]
@@ -1606,11 +1614,11 @@ def _gen_delivery_conclusion(series: Dict, contracts: list = None, focus_ct: str
     if avg_df is not None and not avg_df.empty:
         arow = avg_df[avg_df["trading_days"] == cur_td]
         if not arow.empty:
-            hist_avg = int(arow["basis"].iloc[-1])
-            items.append(f"• 历史同期均值（T={cur_td}）：{hist_avg:+,}元/吨")
+            hist_avg = float(arow["basis"].iloc[-1])
+            items.append(f"• 历史同期均值（T={cur_td}）：{hist_avg:+,.0f}元/吨")
             dev = cur_basis - hist_avg
             direction = "偏高" if dev > 0 else "偏低"
-            items.append(f"• 当前较历史均值{direction}{abs(dev):,}元/吨")
+            items.append(f"• 当前较历史均值{direction}{abs(dev):,.0f}元/吨")
 
     if abs(cur_basis) < 200:
         items.append("• 基差接近零轴，期现价格趋于一致")
@@ -1650,12 +1658,12 @@ def _gen_window_conclusion(series: Dict, window_days: int, contracts: list = Non
         cur_row = df[df["trading_days"] == cur_td]
         if cur_row.empty:
             continue
-        cur_basis = int(cur_row["basis"].iloc[-1])
+        cur_basis = float(cur_row["basis"].iloc[-1])
         cur_date = _cn(cur_row["date"].iloc[-1]) if "date" in cur_row.columns else ""
 
         items.append(f"分析合约：{ct_code}")
         date_note = f"（{cur_date}）" if cur_date != analysis_date else ""
-        items.append(f"• 当前距交割 <b>{cur_td} 交易日</b>{date_note}，±{window_days}td 窗口均值基差：<b>{cur_basis:+,}元/吨</b>")
+        items.append(f"• 当前距交割 <b>{cur_td} 交易日</b>{date_note}，±{window_days}td 窗口均值基差：<b>{cur_basis:+,.0f}元/吨</b>")
 
         hist_avg = None
         for alabel, adf in avg_items.items():
@@ -1663,14 +1671,14 @@ def _gen_window_conclusion(series: Dict, window_days: int, contracts: list = Non
                 continue
             arow = adf[adf["trading_days"] == cur_td]
             if not arow.empty:
-                hist_avg = int(arow["basis"].iloc[-1])
+                hist_avg = float(arow["basis"].iloc[-1])
                 break
 
         if hist_avg is not None:
-            items.append(f"• 历史同期均值（T={cur_td}）：{hist_avg:+,}元/吨")
+            items.append(f"• 历史同期均值（T={cur_td}）：{hist_avg:+,.0f}元/吨")
             deviation = cur_basis - hist_avg
             direction = "偏高" if deviation > 0 else "偏低"
-            items.append(f"• 当前较历史同期{direction}{abs(deviation):,}元/吨")
+            items.append(f"• 当前较历史同期{direction}{abs(deviation):,.0f}元/吨")
 
         break
 
@@ -1679,9 +1687,11 @@ def _gen_window_conclusion(series: Dict, window_days: int, contracts: list = Non
     return (f"📊 ±{window_days}交易日窗口分析结论（分析日期：{analysis_date}）", items, sentiment)
 
 
-def _gen_window_conclusion_v2(series: Dict, window_days: int, contracts: list = None, focus_ct: str = None):
-    """板块二窗口均值结论：当前单日基差 vs 历史 ±N 交易日窗口均值。
+def _gen_window_conclusion_v2(series: Dict, window_days: int, contracts: list = None, focus_ct: str = None,
+                               win_series: Dict = None):
+    """板块二窗口均值结论：当前窗口均值 vs 历史 ±N 交易日窗口均值。
     focus_ct 指定要分析的目标合约（如 LH2609），不传则取最新合约。
+    win_series: 窗口均值数据（用于取当前T点的窗口均值，与图表一致），不传则从 series 取原始日度值。
     数值保留两位小数。
     """
     if not series:
@@ -1699,7 +1709,7 @@ def _gen_window_conclusion_v2(series: Dict, window_days: int, contracts: list = 
     sentiment = "neutral"
     wsize = 2 * window_days + 1
 
-    # ★ 优先 focus_ct，否则取最新合约
+    # ★ 优先 focus_ct，否则取最新合约（从series找标签）
     target_label = None
     target_df = None
     if focus_ct:
@@ -1715,35 +1725,73 @@ def _gen_window_conclusion_v2(series: Dict, window_days: int, contracts: list = 
     if target_df is None:
         return None
 
+    # ★ 当前T：优先从 win_series 取窗口均值（与图表一致），否则取原始日度值
     cur_td = int(target_df["trading_days"].min())
-    cur_row = target_df[target_df["trading_days"] == cur_td]
-    if cur_row.empty:
-        return None
-    cur_basis = cur_row["basis"].iloc[-1]
-    cur_date = _cn(cur_row["date"].iloc[-1]) if "date" in cur_row.columns else ""
+    if win_series:
+        win_non_avg = {k: v for k, v in win_series.items() if "历史均值" not in k}
+        win_target = win_non_avg.get(target_label) if target_label in win_non_avg else None
+        if win_target is not None and not win_target.empty:
+            win_row = win_target[win_target["trading_days"] == cur_td]
+            if not win_row.empty:
+                cur_basis = win_row["basis"].iloc[-1]
+                cur_date = _cn(win_row["date"].iloc[-1]) if "date" in win_row.columns else ""
+            else:
+                cur_row = target_df[target_df["trading_days"] == cur_td]
+                cur_basis = cur_row["basis"].iloc[-1] if not cur_row.empty else 0
+                cur_date = _cn(cur_row["date"].iloc[-1]) if "date" in cur_row.columns else ""
+        else:
+            cur_row = target_df[target_df["trading_days"] == cur_td]
+            cur_basis = cur_row["basis"].iloc[-1] if not cur_row.empty else 0
+            cur_date = _cn(cur_row["date"].iloc[-1]) if "date" in cur_row.columns else ""
+    else:
+        cur_row = target_df[target_df["trading_days"] == cur_td]
+        if cur_row.empty:
+            return None
+        cur_basis = cur_row["basis"].iloc[-1]
+        cur_date = _cn(cur_row["date"].iloc[-1]) if "date" in cur_row.columns else ""
 
     ct_code = focus_ct or ("LH" + target_label[:4] if len(target_label) >= 4 else "")
     items.append(f"分析合约：{ct_code}")
     date_note = f"（{cur_date}）" if cur_date != analysis_date else ""
-    items.append(f"• 当前距交割 <b>{cur_td} 交易日</b>{date_note}，单日基差：<b>{cur_basis:+.2f}元/吨</b>")
+    value_label = "窗口均值基差" if win_series else "单日基差"
+    items.append(f"• 当前距交割 <b>{cur_td} 交易日</b>{date_note}，{value_label}：<b>{cur_basis:+.0f}元/吨</b>")
 
-    # 收集历史同T点窗口均值（排除当前合约）
+    # ★ 历史同期窗口均值：有 win_series 时用预计算均值（与图表完全一致），否则从 series 滚动计算
     hist_vals = []
-    for hl, hdf in non_avg.items():
-        if hl == target_label or hdf.empty:
-            continue
-        hdf = hdf.sort_values("trading_days").copy()
-        hdf["basis_roll"] = hdf["basis"].rolling(window=wsize, center=True, min_periods=1).mean()
-        match = hdf[hdf["trading_days"] == cur_td]
-        if not match.empty and pd.notna(match["basis_roll"].iloc[-1]):
-            hist_vals.append(float(match["basis_roll"].iloc[-1]))
+    if win_series:
+        # 从 win_series 的历史均值 key 取当前T点的均值
+        avg_key = None
+        for k in win_series:
+            if "历史均值" in k:
+                avg_key = k; break
+        if avg_key and not win_series[avg_key].empty:
+            avg_df = win_series[avg_key]
+            arow = avg_df[avg_df["trading_days"] == cur_td]
+            if not arow.empty:
+                hist_avg_val = float(arow["basis"].iloc[-1])
+                # 统计年份数：win_series 中非平均值、非当前合约的数量
+                win_non_avg = {k: v for k, v in win_series.items() if "历史均值" not in k and not v.empty}
+                n_years = len([k for k in win_non_avg if k != target_label])
+                hist_vals = [hist_avg_val]  # 用作 hist_avg = np.mean(hist_vals) = 该值
+                hist_year_count = n_years
+    else:
+        hist_year_count = 0
+        for hl, hdf in non_avg.items():
+            if hl == target_label or hdf.empty:
+                continue
+            hdf = hdf.sort_values("trading_days").copy()
+            hdf["basis_roll"] = hdf["basis"].rolling(window=wsize, center=True, min_periods=1).mean()
+            match = hdf[hdf["trading_days"] == cur_td]
+            if not match.empty and pd.notna(match["basis_roll"].iloc[-1]):
+                hist_vals.append(float(match["basis_roll"].iloc[-1]))
+        hist_year_count = len(hist_vals)
 
     if hist_vals:
         hist_avg = np.mean(hist_vals)
-        items.append(f"• 历史同期 ±{window_days}td 窗口均值：<b>{hist_avg:+.2f}元/吨</b>（{len(hist_vals)} 个年份）")
+        items.append(f"• 历史同期 ±{window_days}td 窗口均值：<b>{hist_avg:+.0f}元/吨</b>（{hist_year_count} 个年份）")
         deviation = cur_basis - hist_avg
         direction = "偏高" if deviation > 0 else "偏低"
-        items.append(f"• 当前单日值较历史窗口均值{direction}<b>{abs(deviation):.2f}元/吨</b>")
+        items.append(f"• 当前值较历史窗口均值{direction}<b>{abs(deviation):.0f}元/吨</b>")
         if hist_avg != 0:
             dev_pct = deviation / abs(hist_avg) * 100
             if dev_pct > 30: sentiment = "bullish"
@@ -1751,7 +1799,7 @@ def _gen_window_conclusion_v2(series: Dict, window_days: int, contracts: list = 
     else:
         items.append(f"• 历史同期 ±{window_days}td 窗口均值：暂无足够历史数据")
 
-    return (f"📊 ±{window_days}交易日窗口分析（分析日期：{analysis_date}，{ct_code} 单日 vs 历史窗口均值）", items, sentiment)
+    return (f"📊 ±{window_days}交易日窗口分析（分析日期：{analysis_date}，{ct_code} {'窗口均值' if win_series else '单日'} vs 历史窗口均值）", items, sentiment)
 
 
 def fig_spread_season(data: Dict[str, pd.DataFrame], ma: str, mb: str, data_date: str = "") -> go.Figure:
@@ -1763,7 +1811,7 @@ def fig_spread_season(data: Dict[str, pd.DataFrame], ma: str, mb: str, data_date
         else: c, w, d = _contract_color_from_label(label), 2, "solid"
         fig.add_trace(go.Scatter(x=df["plot_date"], y=df["spread"], mode="lines", name=label,
             line=dict(color=c, width=w, dash=d),
-            hovertemplate=f"<b>{label}</b><br>%{{customdata}}<br>价差：%{{y:+,}}元/吨<extra></extra>",
+            hovertemplate=f"<b>{label}</b><br>%{{customdata}}<br>价差：%{{y:+,.2f}}元/吨<extra></extra>",
             # ★ 修复：直接使用已修正的 plot_date
             customdata=[_cn_md(r["plot_date"]) for _,r in df.iterrows()]))
     fig.add_hline(y=0, line_dash="dash", line_color="gray", opacity=0.5)
@@ -1918,7 +1966,7 @@ def fig_spread_delivery_aligned(data: Dict, ma: str, mb: str, data_date: str = "
                 "<b>%{name}</b><br>"
                 "日期：%{customdata}<br>"
                 "距交割：%{x}交易日<br>"
-                "价差：%{y:+,}元/吨<extra></extra>"
+                "价差：%{y:+,.2f}元/吨<extra></extra>"
             ),
             customdata=[[_cn(r["date"]) if "date" in df.columns else ""] for _, r in df.iterrows()],
         ))
@@ -1932,16 +1980,30 @@ def fig_spread_delivery_aligned(data: Dict, ma: str, mb: str, data_date: str = "
                 fig.add_vline(x=cur_td, line_dash="dot", line_color="#E74C3C", line_width=1.5,
                               annotation_text=f"T={int(cur_td)}", annotation_position="top")
                 break
+    # ── 从数据计算Y轴范围，确保所有值完整显示 ──
+    all_spreads = []
+    for _, df in data.items():
+        if df is not None and not df.empty and "spread" in df.columns:
+            all_spreads.extend(df["spread"].dropna().tolist())
+    if all_spreads:
+        y_min, y_max = min(all_spreads), max(all_spreads)
+        y_pad = max((y_max - y_min) * 0.12, 50)  # 至少50元/吨的padding
+        y_range = [y_min - y_pad, y_max + y_pad]
+    else:
+        y_range = None
     title = f"{ma}月 − {mb}月 合约价差（交易日对齐）"
     if data_date:
         title += f"<br><sup>📡 期货数据来源：akshare，数据日期：{data_date}</sup>"
     fig.update_layout(
         title=title, xaxis_title="距交割剩余交易日数", yaxis_title="价差（元/吨）",
         template="plotly_white", height=550, hovermode="x unified",
-        legend=dict(orientation="h", y=1.02, x=0), margin=dict(t=80, b=40, l=60, r=40),
+        legend=dict(orientation="h", y=1.02, x=0), margin=dict(t=80, b=40, l=70, r=40),
     )
     fig.update_xaxes(autorange="reversed")
-    fig.update_yaxes(autorange=True)
+    if y_range:
+        fig.update_yaxes(range=y_range, automargin=True)
+    else:
+        fig.update_yaxes(autorange=True, automargin=True)
     return fig
 
 
@@ -1973,7 +2035,7 @@ def fig_spread_window_aligned(data: Dict, ma: str, mb: str, data_date: str = "",
                 "<b>%{name}</b><br>"
                 "日期：%{customdata}<br>"
                 "距交割：%{x}交易日<br>"
-                "窗口均值价差：%{y:+,}元/吨<extra></extra>"
+                "窗口均值价差：%{y:+,.2f}元/吨<extra></extra>"
             ),
             customdata=[[_cn(r["date"]) if "date" in df.columns else ""] for _, r in df.iterrows()],
         ))
@@ -1981,16 +2043,30 @@ def fig_spread_window_aligned(data: Dict, ma: str, mb: str, data_date: str = "",
     if latest_td is not None:
         fig.add_vline(x=int(latest_td), line_dash="dot", line_color="#E74C3C", line_width=1.5,
                       annotation_text=f"T={int(latest_td)}", annotation_position="top")
+    # ── 从数据计算Y轴范围，确保所有值完整显示 ──
+    all_spreads = []
+    for _, df in data.items():
+        if df is not None and not df.empty and "spread" in df.columns:
+            all_spreads.extend(df["spread"].dropna().tolist())
+    if all_spreads:
+        y_min, y_max = min(all_spreads), max(all_spreads)
+        y_pad = max((y_max - y_min) * 0.12, 50)
+        y_range = [y_min - y_pad, y_max + y_pad]
+    else:
+        y_range = None
     title = f"{ma}月 − {mb}月 合约价差（±{window_days}交易日窗口）"
     if data_date:
         title += f"<br><sup>📡 期货数据来源：akshare，数据日期：{data_date}</sup>"
     fig.update_layout(
         title=title, xaxis_title="距交割剩余交易日数", yaxis_title="价差（元/吨）",
         template="plotly_white", height=550, hovermode="x unified",
-        legend=dict(orientation="h", y=1.02, x=0), margin=dict(t=80, b=40, l=60, r=40),
+        legend=dict(orientation="h", y=1.02, x=0), margin=dict(t=80, b=40, l=70, r=40),
     )
     fig.update_xaxes(autorange="reversed")
-    fig.update_yaxes(autorange=True)
+    if y_range:
+        fig.update_yaxes(range=y_range, automargin=True)
+    else:
+        fig.update_yaxes(autorange=True, automargin=True)
     return fig
 
 
@@ -2060,18 +2136,18 @@ def _gen_spread_delivery_conclusion(data: Dict, ma: str, mb: str):
         cur_td = int(target_df["trading_days"].min())  # ★ 当前距交割交易日数
         cur_row = target_df[target_df["trading_days"] == cur_td]
         if not cur_row.empty:
-            cur_spread = int(cur_row["spread"].iloc[-1])
+            cur_spread = float(cur_row["spread"].iloc[-1])
             items.append(f"分析价差对：{target_label}")
-            items.append(f"• 距交割 <b>{cur_td} 交易日</b>，价差 <b>{cur_spread:+,}元/吨</b>")
+            items.append(f"• 距交割 <b>{cur_td} 交易日</b>，价差 <b>{cur_spread:+,.0f}元/吨</b>")
             avg_df = data.get("历史均值")
             if avg_df is not None and not avg_df.empty:
                 arow = avg_df[avg_df["trading_days"] == cur_td]
                 if not arow.empty:
-                    hist_avg = int(arow["spread"].iloc[-1])
-                    items.append(f"• 历史同期均值（T={cur_td}）：{hist_avg:+,}元/吨")
+                    hist_avg = float(arow["spread"].iloc[-1])
+                    items.append(f"• 历史同期均值（T={cur_td}）：{hist_avg:+,.0f}元/吨")
                     dev = cur_spread - hist_avg
                     direction = "偏高" if dev > 0 else "偏低"
-                    items.append(f"• 当前较历史均值{direction}{abs(dev):,}元/吨")
+                    items.append(f"• 当前较历史均值{direction}{abs(dev):,.0f}元/吨")
     if not items:
         return None
     return (f"📊 价差交易日对齐分析（{ma}月−{mb}月）", items, sentiment)
@@ -2103,19 +2179,19 @@ def _gen_spread_window_conclusion(data: Dict, ma: str, mb: str, window_days: int
     row = df[df["trading_days"] == cur_td]
     if row.empty:
         return None
-    cur_spread = int(row["spread"].iloc[-1])
+    cur_spread = float(row["spread"].iloc[-1])
     cur_date = _cn(row["date"].iloc[-1]) if "date" in row.columns else ""
     items.append(f"分析价差对：{target_label}")
-    items.append(f"• 距交割 <b>{cur_td} 交易日</b>（{cur_date}），±{window_days}td 窗口均值价差：<b>{cur_spread:+,}元/吨</b>")
+    items.append(f"• 距交割 <b>{cur_td} 交易日</b>（{cur_date}），±{window_days}td 窗口均值价差：<b>{cur_spread:+,.0f}元/吨</b>")
     avg_df = data.get(f"历史均值 ±{window_days}td")
     if avg_df is not None and not avg_df.empty:
         arow = avg_df[avg_df["trading_days"] == cur_td]
         if not arow.empty:
-            hist_avg = int(arow["spread"].iloc[-1])
-            items.append(f"• 历史同期均值（T={cur_td}）：{hist_avg:+,}元/吨")
+            hist_avg = float(arow["spread"].iloc[-1])
+            items.append(f"• 历史同期均值（T={cur_td}）：{hist_avg:+,.0f}元/吨")
             dev = cur_spread - hist_avg
             direction = "偏高" if dev > 0 else "偏低"
-            items.append(f"• 当前较历史均值{direction}{abs(dev):,}元/吨")
+            items.append(f"• 当前较历史均值{direction}{abs(dev):,.0f}元/吨")
             if dev > 1000: sentiment = "bullish"
             elif dev < -1000: sentiment = "bearish"
     if not items:
@@ -2211,10 +2287,10 @@ def _gen_tab3_conclusion_calendar(series: Dict, tmon: str, sel_items: list, cont
 
         cur_row = _get_row_at_md(df, target_m, target_d)
         if cur_row is None: continue
-        cur_basis = int(cur_row["basis"])
+        cur_basis = float(cur_row["basis"])
 
         items.append(f"分析合约：{ct_code}")
-        items.append(f"• 当前基差（{_cn_md(ltd)}）：{cur_basis:+,}元/吨")
+        items.append(f"• 当前基差（{_cn_md(ltd)}）：{cur_basis:+,.0f}元/吨")
 
         # ★ 直接使用图表中的历史均值线，不自行计算
         hist_avg = None
@@ -2225,21 +2301,21 @@ def _gen_tab3_conclusion_calendar(series: Dict, tmon: str, sel_items: list, cont
             if arow.empty:
                 arow = _get_row_at_md(adf, target_m, target_d)  # fallback
                 if arow is not None:
-                    hist_avg = int(arow["basis"])
+                    hist_avg = float(arow["basis"])
             else:
-                hist_avg = int(arow["basis"].iloc[-1])
+                hist_avg = float(arow["basis"].iloc[-1])
             break  # 取第一条历史均值线
 
         if hist_avg is not None:
-            items.append(f"• 历史同期均值：{hist_avg:+,}元/吨")
+            items.append(f"• 历史同期均值：{hist_avg:+,.0f}元/吨")
             deviation = cur_basis - hist_avg
             direction = "偏高" if deviation > 0 else "偏低"
-            items.append(f"• 当前基差较历史同期均值{direction}{abs(deviation):,}元/吨")
+            items.append(f"• 当前基差较历史同期均值{direction}{abs(deviation):,.0f}元/吨")
 
         # 近期变化方向
         if len(df) >= 20:
-            recent_start = int(df["basis"].iloc[-20])
-            recent_end = int(df["basis"].iloc[-1])
+            recent_start = float(df["basis"].iloc[-20])
+            recent_end = float(df["basis"].iloc[-1])
             change = recent_end - recent_start
             if abs(change) < 20:
                 dir_str = "震荡"
@@ -2247,10 +2323,10 @@ def _gen_tab3_conclusion_calendar(series: Dict, tmon: str, sel_items: list, cont
                 dir_str = "走扩"
             else:
                 dir_str = "收敛"
-            items.append(f"• 近期（近20个交易日）基差变化方向：{dir_str}（从{recent_start:+,}变化至{recent_end:+,}）")
+            items.append(f"• 近期（近20个交易日）基差变化方向：{dir_str}（从{recent_start:+,.0f}变化至{recent_end:+,.0f}）")
         elif len(df) >= 5:
-            recent_start = int(df["basis"].iloc[-5])
-            recent_end = int(df["basis"].iloc[-1])
+            recent_start = float(df["basis"].iloc[-5])
+            recent_end = float(df["basis"].iloc[-1])
             change = recent_end - recent_start
             if abs(change) < 20:
                 dir_str = "震荡"
@@ -2258,7 +2334,7 @@ def _gen_tab3_conclusion_calendar(series: Dict, tmon: str, sel_items: list, cont
                 dir_str = "走扩"
             else:
                 dir_str = "收敛"
-            items.append(f"• 近期（近5个交易日）基差变化方向：{dir_str}（从{recent_start:+,}变化至{recent_end:+,}）")
+            items.append(f"• 近期（近5个交易日）基差变化方向：{dir_str}（从{recent_start:+,.0f}变化至{recent_end:+,.0f}）")
 
         # 季节性（从历史均值线提取）
         if avg_items:
@@ -2374,24 +2450,24 @@ def _gen_tab4_conclusion(spreads: Dict, ma: str, mb: str, active_cts: list = Non
     if not latest_pair[1].empty:
         cur_row = _get_row_at_md(latest_pair[1], target_m, target_d)
         if cur_row is None: return None
-        cur_spread = int(cur_row["spread"])
+        cur_spread = float(cur_row["spread"])
         items.append(f"分析价差对：{latest_pair[0]}")
-        items.append(f"• 当前价差（{_cn_md(ltd)}）：{cur_spread:+,}元/吨")
+        items.append(f"• 当前价差（{_cn_md(ltd)}）：{cur_spread:+,.0f}元/吨")
 
         # ★ 直接使用图表中的历史均值线
         if avg_df is not None and not avg_df.empty:
             arow = avg_df[(avg_df["plot_date"].dt.month == target_m) & (avg_df["plot_date"].dt.day == target_d)]
             if not arow.empty:
-                hist_avg = int(arow["spread"].iloc[-1])
-                items.append(f"• 历史同期均值：{hist_avg:+,}元/吨")
+                hist_avg = float(arow["spread"].iloc[-1])
+                items.append(f"• 历史同期均值：{hist_avg:+,.0f}元/吨")
                 deviation = cur_spread - hist_avg
                 direction = "偏高" if deviation > 0 else "偏低"
-                items.append(f"• 当前价差较历史同期均值{direction}{abs(deviation):,}元/吨")
+                items.append(f"• 当前价差较历史同期均值{direction}{abs(deviation):,.0f}元/吨")
 
         # 近期变化
         if len(latest_pair[1]) >= 20:
-            recent_end = int(latest_pair[1]["spread"].iloc[-1])
-            recent_start = int(latest_pair[1]["spread"].iloc[-20])
+            recent_end = float(latest_pair[1]["spread"].iloc[-1])
+            recent_start = float(latest_pair[1]["spread"].iloc[-20])
             change = recent_end - recent_start
             if abs(change) < 20:
                 dir_str = "震荡"
@@ -2399,7 +2475,7 @@ def _gen_tab4_conclusion(spreads: Dict, ma: str, mb: str, active_cts: list = Non
                 dir_str = "走扩"
             else:
                 dir_str = "收敛"
-            items.append(f"• 近期（近20个交易日）价差变化方向：{dir_str}（从{recent_start:+,}变化至{recent_end:+,}）")
+            items.append(f"• 近期（近20个交易日）价差变化方向：{dir_str}（从{recent_start:+,.0f}变化至{recent_end:+,.0f}）")
 
     # 季节性
     if avg_df is not None and not avg_df.empty:
@@ -2810,9 +2886,10 @@ def tab3():
                 window_series, tmon, fut_update_date or "", window_days),
                           use_container_width=True, key="t3_window_chart")
 
-        # ★ 板块二结论：针对主力合约（LH2609），当前单日值 vs 历史窗口均值
+        # ★ 板块二结论：针对主力合约（LH2609），当前窗口均值 vs 历史窗口均值（与图表一致）
         result_win = _gen_window_conclusion_v2(
-            delivery_series, window_days, contracts, focus_ct=main_ct)
+            delivery_series, window_days, contracts, focus_ct=main_ct,
+            win_series=window_series)
         if result_win:
             display_conclusion(*result_win)
         elif not delivery_series:
@@ -2820,7 +2897,7 @@ def tab3():
 
         st.markdown("---")
         st.markdown("### 📈 现货与期货价格走势")
-        default_ct = ref_ct
+        default_ct = main_ct  # 始终显示当前主力合约
         sel_label = _resolve_selected_item_for_chart(sel_items, spot_dict, ref_regions)
         st.caption(f"{default_ct} — {sel_label['title']}")
         fig_sf = _make_spot_futures_chart_with_item(default_ct, spot_dict, sel_label)
@@ -4318,7 +4395,7 @@ def _build_vol_oi_seasonal_cached(
                 md = (row["date"].month, row["date"].day)
                 if "volume" in grp.columns:
                     vol_collector[md].append(int(row["volume"]))
-                if oi_col:
+                if oi_col and pd.notna(row[oi_col]):
                     oi_collector[md].append(int(row[oi_col]))
 
     # 历史均值
@@ -4949,8 +5026,14 @@ def _analyze_vol_oi_momentum(fut_df, ltd) -> dict:
         oi = df[oi_col].astype(float)
 
         cur_vol = float(vol.iloc[-1])
-        cur_oi = float(oi.iloc[-1])
+        cur_oi = float(oi.iloc[-1]) if pd.notna(oi.iloc[-1]) and oi.iloc[-1] > 0 else None
         cur_close = float(close.iloc[-1])
+
+        # 持仓量未获取时，只返回成交量信息
+        if cur_oi is None:
+            return {"available": True, "vol_text": f"成交量 {cur_vol:,.0f}手",
+                    "oi_text": "持仓量暂未获取", "oi_decline": "持仓量暂未获取",
+                    "vol_trend": "数据不足", "oi_hist_review": "数据不足"}
 
         # ── 成交量 ──
         vol_5 = float(vol.tail(5).mean())
@@ -5020,7 +5103,8 @@ def _build_daily_report_html(main_ct: str, fut_df, spot_dict, ltd, prev_td,
             low_v = float(row_t["low"]) if pd.notna(row_t.get("low")) else close_v
             vol_v = int(row_t["volume"]) if pd.notna(row_t.get("volume")) else 0
             oi_col = "open_interest" if "open_interest" in row_t.index else ("hold" if "hold" in row_t.index else None)
-            oi_v = int(row_t[oi_col]) if oi_col and pd.notna(row_t.get(oi_col)) else 0
+            oi_raw = int(row_t[oi_col]) if oi_col and pd.notna(row_t.get(oi_col)) else 0
+            oi_v = oi_raw if oi_raw > 0 else None  # 持仓量为0或NaN视为未获取
             prev_close = float(row_prev["close"].iloc[-1]) if row_prev is not None and not row_prev.empty else close_v
             chg = close_v - prev_close
             chg_pct = chg / prev_close * 100 if prev_close != 0 else 0
@@ -5110,7 +5194,7 @@ def _build_daily_report_html(main_ct: str, fut_df, spot_dict, ltd, prev_td,
     # ── 持仓量与成交量分析 HTML ──
     vo = vol_oi_analysis or {}
     oi_text = vo.get('oi_text', '')
-    oi_zero = ('0手' in oi_text or '-100.0%' in oi_text)  # 持仓量为0时隐藏
+    oi_zero = ('0手' in oi_text or '暂未获取' in oi_text or '-100.0%' in oi_text)  # 持仓量为0或未获取时隐藏
     if vo.get("available") and not oi_zero:
         vol_oi_html = f"""
         <p style="font-size:0.92rem;line-height:1.8;">
@@ -5198,7 +5282,7 @@ body {{ font-family: 'Microsoft YaHei', 'SimHei', sans-serif; background: #eef0f
 <div class="kv"><span class="k">最高价</span><span class="v">{high_v:.0f} 元/吨</span></div>
 <div class="kv"><span class="k">最低价</span><span class="v">{low_v:.0f} 元/吨</span></div>
 <div class="kv"><span class="k">成交量</span><span class="v">{vol_v:,} 手</span></div>
-<div class="kv"><span class="k">持仓量</span><span class="v">{oi_v:,} 手</span></div>
+<div class="kv"><span class="k">持仓量</span><span class="v">{f'{oi_v:,} 手' if oi_v else '暂未获取'}</span></div>
 </div>
 <p style="margin-top:10px;font-size:0.92rem;color:#666;">
 📝 {main_ct} 当日收于 <b>{close_v:.0f}</b> 元/吨，较前日（{cn_prev}）<b class="{chg_class}">{chg_sign}{chg:.0f} ({chg_sign}{chg_pct:.2f}%)</b>，成交量{vol_v:,}手。
@@ -5266,7 +5350,8 @@ def _build_daily_report_md(main_ct, fut_df, spot_dict, ltd, prev_td,
         low_v = float(row_t.get("low", close_v))
         vol_v = int(row_t.get("volume", 0))
         oi_col = "open_interest" if "open_interest" in fut_df.columns else ("hold" if "hold" in fut_df.columns else None)
-        oi_v = int(row_t[oi_col]) if oi_col and pd.notna(row_t.get(oi_col)) else 0
+        oi_raw = int(row_t[oi_col]) if oi_col and pd.notna(row_t.get(oi_col)) else 0
+        oi_v = oi_raw if oi_raw > 0 else None
         prev_close = float(row_prev["close"].iloc[-1]) if row_prev is not None and not row_prev.empty else close_v
         chg = close_v - prev_close
         chg_pct = chg / prev_close * 100 if prev_close != 0 else 0
@@ -5312,7 +5397,7 @@ def _build_daily_report_md(main_ct, fut_df, spot_dict, ltd, prev_td,
 | 最高价 | {high_v:.0f} 元/吨 |
 | 最低价 | {low_v:.0f} 元/吨 |
 | 成交量 | {vol_v:,} 手 |
-| 持仓量 | {oi_v:,} 手 |
+| 持仓量 | {f'{oi_v:,} 手' if oi_v else '暂未获取'} |
 
 📝 {main_ct} 当日收于 **{close_v:.0f}** 元/吨，较{cn_prev} **{chg:+.0f}**（{chg_pct:+.2f}%）。
 
@@ -5730,7 +5815,7 @@ def _generate_report_charts(main_ct, spot_dict, ltd) -> dict:
                 avail, spot_dict, regions, ["📊 全国均价基差"])
             if del_series:
                 fig_basis = fig_delivery_aligned_v2(del_series, tmon, "")
-                fig_basis.update_layout(height=380, margin=dict(t=40, b=30, l=40, r=20))
+                fig_basis.update_layout(height=380, margin=dict(t=40, b=30, l=70, r=30))
                 img_bytes = fig_basis.to_image(format="png", scale=1.0, width=800)
                 charts["basis_comparison"] = base64.b64encode(img_bytes).decode()
     except Exception:
@@ -5752,7 +5837,16 @@ def _generate_report_charts(main_ct, spot_dict, ltd) -> dict:
             del_spreads, _ = _build_spread_delivery_aligned(valid_years, ma, mb)
             if del_spreads:
                 fig_sp = fig_spread_delivery_aligned(del_spreads, ma, mb)
-                fig_sp.update_layout(height=380, margin=dict(t=40, b=30, l=40, r=20))
+                fig_sp.update_layout(height=380, margin=dict(t=40, b=30, l=70, r=30))
+                # 确保Y轴范围足够：至少覆盖到 ±2000
+                y_range = fig_sp.layout.yaxis.range if fig_sp.layout.yaxis.range else [None, None]
+                y_low = y_range[0] if y_range[0] is not None else -2000
+                y_high = y_range[1] if y_range[1] is not None else 2000
+                if y_high < 2000:
+                    y_high = max(y_high + 300, 2000)
+                if y_low > -2000:
+                    y_low = min(y_low - 300, -2000)
+                fig_sp.update_yaxes(range=[y_low, y_high])
                 img_bytes = fig_sp.to_image(format="png", scale=1.0, width=800)
                 charts["spread_trend"] = base64.b64encode(img_bytes).decode()
     except Exception:
@@ -5819,7 +5913,7 @@ def _compute_key_spread(main_ct: str, ltd=None):
             if avg_del is not None and not avg_del.empty:
                 arow = avg_del[avg_del["trading_days"] == int(cur_td)]
                 if not arow.empty:
-                    hist_avg_del = int(arow["spread"].iloc[-1])
+                    hist_avg_del = float(arow["spread"].iloc[-1])
                     result["delivery"] = _format_spread_html(
                         ct_a, ct_b, latest_spread, latest_dt, hist_avg_del,
                         f"📐 交易日对齐（距交割{int(cur_td)}交易日，板块一）")
@@ -5831,7 +5925,7 @@ def _compute_key_spread(main_ct: str, ltd=None):
             if win_avg is not None and not win_avg.empty:
                 arow = win_avg[win_avg["trading_days"] == int(cur_td)]
                 if not arow.empty:
-                    hist_avg_win = int(arow["spread"].iloc[-1])
+                    hist_avg_win = float(arow["spread"].iloc[-1])
                     result["window"] = _format_spread_html(
                         ct_a, ct_b, latest_spread, latest_dt, hist_avg_win,
                         f"📏 ±3交易日窗口均值（板块二）")
