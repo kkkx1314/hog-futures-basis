@@ -280,7 +280,7 @@ def norm_region(name: str) -> str:
 # ══════════════════════════════════════════════════════════════
 # 现货加载
 # ══════════════════════════════════════════════════════════════
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=1800, show_spinner=False)
 def load_spot(path_str: str) -> Tuple[Dict[str, pd.DataFrame], str]:
     path = Path(path_str)
     if not path.exists():
@@ -427,7 +427,7 @@ def _get_global_latest_date() -> Optional[pd.Timestamp]:
         except Exception: pass
     return latest
 
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=900, show_spinner=False)
 def get_active_contracts() -> List[str]:
     """动态识别当前上市合约，并确保兜底列表始终包含"""
     # 硬编码保底列表：当前正在交易的合约
@@ -458,6 +458,7 @@ def get_active_contracts() -> List[str]:
     return sorted([c for c in active if c in ALL_CONTRACTS])
 
 
+@st.cache_data(ttl=1800, show_spinner=False)
 def get_main_contract() -> str:
     """返回主力合约（活跃合约中近20日成交量最高的）。
     兜底返回活跃合约列表中最后一个，或硬编码 LH2609。"""
@@ -479,6 +480,7 @@ def get_main_contract() -> str:
     return best_ct or (active[-1] if active else "LH2609")
 
 
+@st.cache_data(ttl=900, show_spinner=False)
 def get_latest_futures_date() -> Optional[str]:
     latest = None
     for f in FUTURES_DIR.glob("LH*.csv"):
@@ -490,7 +492,7 @@ def get_latest_futures_date() -> Optional[str]:
         except Exception: pass
     return _cn(latest) if latest else None
 
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=900, show_spinner=False)
 def get_latest_trade_date() -> Optional[pd.Timestamp]:
     """获取所有合约CSV中最新的交易日（全局最大值）"""
     return _get_global_latest_date()
@@ -684,6 +686,7 @@ def _get_row_at_md(df, target_month: int, target_day: int):
     return df.iloc[-1]
 
 
+@st.cache_data(ttl=1800, show_spinner=False)
 def get_spot_data_date() -> str:
     """从现货Excel文件名或内部数据提取最新日期"""
 
@@ -762,7 +765,7 @@ def get_spot_data_date() -> str:
 def _to_ton(p: float) -> float:
     return float(p) * 1000
 
-@st.cache_data(ttl=120, show_spinner=False)
+@st.cache_data(ttl=900, show_spinner=False)
 def calc_basis(ct: str, region: str, spot_df: pd.DataFrame, fut_df: pd.DataFrame) -> Optional[pd.DataFrame]:
     """basis = 现货(元/吨) − (期货收盘价 + 升贴水)"""
     if fut_df is None or fut_df.empty or spot_df is None or spot_df.empty: return None
@@ -6552,11 +6555,6 @@ def main():
                 list(ex.map(lambda ct: sync_futures(ct, force_full=False), stale))
         st.session_state["_last_auto_sync_date"] = _today_str
 
-    # 预加载日报缓存
-    _main_ct = get_main_contract()
-    _spot_dict, _ = load_spot(str(SPOT_PATH))
-    _compute_daily_report_cache(_main_ct, _spot_hash(_spot_dict), _DAILY_REPORT_VERSION)
-
     # ── 操作栏（顶部，快速可见）──
     col_a, col_b, col_c = st.columns([1, 1, 8])
     with col_a:
@@ -6581,20 +6579,18 @@ def main():
         st.caption(f"📅 期货: {get_latest_futures_date() or '...'} ｜ 现货: {get_spot_data_date()} ｜ "
                    f"合约: {'、'.join(get_active_contracts())}")
 
-    # ── 16:00（中国时间）后每 10 分钟自动增量同步 ──
+    # ── 16:00（中国时间）后每 30 分钟自动增量同步（不强制 rerun）──
     _now = _cst_now()
     if _now.hour >= 16:
         _last_sync = st.session_state.get("_last_auto_sync_ts", 0)
-        if time.time() - _last_sync > 600:
+        if time.time() - _last_sync > 1800:
             st.session_state["_last_auto_sync_ts"] = time.time()
             with ThreadPoolExecutor(max_workers=5) as _ex:
                 list(_ex.map(lambda ct: sync_futures(ct, force_full=False), get_active_contracts()))
             _compute_daily_report_cache.clear()
-            _compute_daily_report_cache(_main_ct, _spot_hash(_spot_dict), _DAILY_REPORT_VERSION)
-            st.rerun()
 
-    # ── 八个 Tab ──
-    t1, t2, t3, t4, t5, t6, t7, t8 = st.tabs([
+    # ── 懒加载：只渲染当前选中的标签页 ──
+    TAB_NAMES = [
         "📋 每日期货分析日报",
         "📊 当日基差分布",
         "📈 单合约基差走势",
@@ -6603,20 +6599,17 @@ def main():
         "📊 持仓与成交分析",
         "📅 季节性持仓对比",
         "📉 技术分析",
-    ])
+    ]
+    TAB_FUNCS = [tab_daily_report, tab1, tab2, tab3, tab4, tab5, tab6, tab7]
 
-    with t1: tab_daily_report()
-    with t2: tab1()
-    with t3: tab2()
-    with t4: tab3()
-    with t5: tab4()
-    with t6: tab5()
-    with t7: tab6()
-    with t8: tab7()
-
-    st.markdown("---")
-    st.caption("⚠️ 免责声明：本平台数据仅供参考，不构成任何投资建议。投资有风险，入市需谨慎。")
-    st.markdown("<p style='text-align:right; font-size:0.75rem; color:#adb5bd; margin-top:-8px;'>创作者：chen</p>", unsafe_allow_html=True)
+    active_tab = st.radio(
+        "导航", TAB_NAMES,
+        index=0, horizontal=True,
+        key="active_tab",
+        label_visibility="collapsed",
+    )
+    tab_idx = TAB_NAMES.index(active_tab)
+    TAB_FUNCS[tab_idx]()
 
     # ── 页面底部 ──
     st.markdown("---")
