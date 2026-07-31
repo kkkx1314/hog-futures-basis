@@ -5,8 +5,8 @@ __pycache__/
 .venv/
 venv/
 
-# Futures cache (auto-downloaded at runtime)
-data/futures/*.csv
+# Futures cache (tracked to speed up Streamlit Cloud cold start)
+# data/futures/*.csv
 
 # Holdings cache (individual date files are large, only commit aggregated net position data)
 data/holdings/*

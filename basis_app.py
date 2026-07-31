@@ -111,8 +111,9 @@ def _find_latest_spot() -> Path:
     if candidates:
         candidates.sort(key=lambda x: x[0], reverse=True)
         return candidates[0][1]
-    # 4. 兜底
-    return Path(r"D:\CC\Desktop\2026年6月29日涌益咨询日度数据.xlsx")
+    # 4. 兜底：使用项目内数据文件（兼容 Streamlit Cloud / Linux）
+    fallback = DATA_DIR / "涌益咨询日度数据.xlsx"
+    return fallback
 
 SPOT_PATH = _find_latest_spot()
 
