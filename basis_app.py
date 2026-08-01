@@ -6590,8 +6590,8 @@ def main():
                 list(_ex.map(lambda ct: sync_futures(ct, force_full=False), get_active_contracts()))
             _compute_daily_report_cache.clear()
 
-    # ── 懒加载：只渲染当前选中的标签页 ──
-    TAB_NAMES = [
+    # ── 八个 Tab ──
+    t1, t2, t3, t4, t5, t6, t7, t8 = st.tabs([
         "📋 每日期货分析日报",
         "📊 当日基差分布",
         "📈 单合约基差走势",
@@ -6600,17 +6600,16 @@ def main():
         "📊 持仓与成交分析",
         "📅 季节性持仓对比",
         "📉 技术分析",
-    ]
-    TAB_FUNCS = [tab_daily_report, tab1, tab2, tab3, tab4, tab5, tab6, tab7]
+    ])
 
-    active_tab = st.radio(
-        "导航", TAB_NAMES,
-        index=0, horizontal=True,
-        key="active_tab",
-        label_visibility="collapsed",
-    )
-    tab_idx = TAB_NAMES.index(active_tab)
-    TAB_FUNCS[tab_idx]()
+    with t1: tab_daily_report()
+    with t2: tab1()
+    with t3: tab2()
+    with t4: tab3()
+    with t5: tab4()
+    with t6: tab5()
+    with t7: tab6()
+    with t8: tab7()
 
     # ── 页面底部 ──
     st.markdown("---")
