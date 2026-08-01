@@ -1,6 +1,0 @@
-# Streamlit Cloud Linux 系统依赖
-# kaleido (plotly 静态图表导出)
-libgl1-mesa-glx
-libglib2.0-0
-# 中文字体支持
-fonts-noto-cjk
