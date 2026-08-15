@@ -144,7 +144,7 @@ def _build_contracts() -> List[str]:
     for y in range(21, 28):
         for m in ALL_MONTHS:
             c = f"LH{y}{m}"
-            if "LH2109" <= c <= "LH2705":
+            if c >= "LH2109":
                 cts.append(c)
     return cts
 
@@ -3376,15 +3376,7 @@ def _render_momentum_anomaly(anomaly: dict, ct: str, td):
         tbl["持仓动能比"] = tbl["持仓动能比"].apply(
             lambda x: "∞" if x == "∞" else (f"{x:.2f}" if pd.notna(x) else "—"))
 
-        def _style_div(v):
-            if "背离" in str(v):
-                return "color:#E74C3C;font-weight:600;"
-            if "共振" in str(v):
-                return "color:#27AE60;"
-            return ""
-        st.dataframe(
-            tbl.style.map(_style_div, subset=["背离状态"]),
-            use_container_width=True, hide_index=True)
+        st.dataframe(tbl, use_container_width=True, hide_index=True)
     else:
         st.caption("📋 明细数据不足")
 
@@ -5483,6 +5475,11 @@ def _momentum_anomaly_html(anomaly, cn_date: str) -> str:
         • 前20净持仓背离：连续 <b>{anomaly['divergence_count']}</b> 日<br>
         • 资金异动评分：<b style="color:{score_color};font-size:1.05rem;">{score}</b> / 100 → {anomaly['score_level']}
         </p>{warn}
+        <p style="font-size:0.72rem;color:#999;line-height:1.6;border-top:1px dashed #eee;padding-top:6px;margin-top:8px;">
+        计算方法：持仓变化率 = 当日持仓量变动 ÷ 前日持仓量 × 100%；<br>
+        持仓动能比 = 持仓变化率 ÷ |价格变化率|（价格变化率 = |当日收盘 − 前日收盘| ÷ 前日收盘）。比值 &gt; 2 视为资金异动，&lt; 0.3 视为资金跟进不足。<br>
+        资金异动评分（0-100）：动能比 &gt;2 或 &lt;0.3 计 30 分；出现“多头/空头主动增仓”计 20 分；净持仓连续背离 ≥2 日计 25 分；|持仓变化率| &gt;5% 计 25 分。
+        </p>
         </div>"""
 
 
@@ -5503,6 +5500,8 @@ def _momentum_anomaly_md(anomaly) -> str:
         f"- 持仓动能比：**{ratio_str}**（{anomaly['momentum_ratio_label']}）",
         f"- 前20净持仓背离：连续 **{anomaly['divergence_count']}** 日",
         f"- 资金异动评分：**{anomaly['score']}**/100 → {anomaly['score_level']}",
+        "",
+        "> 计算方法：持仓变化率 = 当日持仓量变动 ÷ 前日持仓量 × 100%；持仓动能比 = 持仓变化率 ÷ |价格变化率|（|当日收盘−前日收盘|÷前日收盘）。比值>2 视为资金异动，<0.3 视为资金跟进不足。评分(0-100)：动能比>2或<0.3 计30分；多头/空头主动增仓 计20分；净持仓连续背离≥2日 计25分；|持仓变化率|>5% 计25分。",
     ]
     return "\n".join(lines) + warn
 
