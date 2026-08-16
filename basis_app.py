@@ -3147,7 +3147,7 @@ def _compute_momentum_anomaly(fut_df, ct: str, ltd_ts) -> dict:
         "momentum_ratio_current": None, "momentum_ratio_label": "—",
         "momentum_series": pd.DataFrame(),
         "divergence_series": [], "divergence_count": 0,
-        "divergence_warning": False, "score": 0, "score_level": "💤 低资金活跃，市场平淡",
+        "divergence_warning": False,
         "oi_chg_pct": None, "detail_rows": [],
     }
     if fut_df is None or fut_df.empty:
@@ -3323,24 +3323,6 @@ def _compute_momentum_anomaly(fut_df, ct: str, ltd_ts) -> dict:
                 divergence_count = cnt
                 divergence_warning = cnt >= 3
 
-        # ── 资金异动综合评分（0-100） ──
-        score = 0
-        if ratio_cur is not None and (ratio_cur > 2.0 or ratio_cur < 0.3):
-            score += 30
-        if cur_label in ("多头主动增仓", "空头主动增仓"):
-            score += 20
-        if divergence_count >= 2:
-            score += 25
-        if oi_chg_pct is not None and abs(oi_chg_pct) > 5:
-            score += 25
-
-        if score > 60:
-            score_level = "🚨 高资金异动，关注主力动向"
-        elif score >= 30:
-            score_level = "📊 中等资金活跃，正常跟踪"
-        else:
-            score_level = "💤 低资金活跃，市场平淡"
-
         # ── 明细表（近20日） ──
         detail_rows = []
         tbl = df.iloc[max(0, cur - 19):cur + 1]
@@ -3375,8 +3357,6 @@ def _compute_momentum_anomaly(fut_df, ct: str, ltd_ts) -> dict:
             "divergence_series": divergence_series,
             "divergence_count": divergence_count,
             "divergence_warning": divergence_warning,
-            "score": int(score),
-            "score_level": score_level,
             "oi_chg_pct": oi_chg_pct,
             "oi_volume_ratio": oi_volume_ratio,
             "oi_volume_ratio_20d": oi_volume_ratio_20d,
@@ -3412,20 +3392,7 @@ def _render_momentum_anomaly(anomaly: dict, ct: str, td):
             '⚠️ 注意：前20净持仓与价格已连续3日背离，市场分歧加剧，谨慎追涨/杀跌！</div>',
             unsafe_allow_html=True)
 
-    # ── 1. 顶部：综合评分进度条 + 文字预警 ──
-    score = anomaly["score"]
-    score_level = anomaly["score_level"]
-    score_color = "#E74C3C" if score > 60 else ("#F39C12" if score >= 30 else "#27AE60")
-    st.markdown(
-        f'<div style="background:#f8f9fa;padding:14px 18px;border-radius:8px;border-left:4px solid {score_color};margin:8px 0;">'
-        f'<div style="font-size:0.95rem;color:#333;">资金异动综合评分</div>'
-        f'<div style="font-size:2rem;font-weight:700;color:{score_color};">{score}<span style="font-size:1rem;color:#888;"> / 100</span></div>'
-        f'<div style="height:10px;background:#e9ecef;border-radius:5px;overflow:hidden;margin:6px 0;">'
-        f'<div style="height:100%;width:{score}%;background:{score_color};"></div></div>'
-        f'<div style="font-weight:600;color:{score_color};">{score_level}</div></div>',
-        unsafe_allow_html=True)
-
-    # ── 2. 中上部：量价关系状态卡片 ──
+    # ── 1. 量价关系状态卡片 ──
     _sent_colors = {"bull": "#E74C3C", "bear": "#27AE60", "bull_weak": "#E67E22",
                     "bear_weak": "#16A085", "neutral": "#95A5A6"}
     s_color = _sent_colors.get(anomaly["state_sentiment"], "#95A5A6")
@@ -5634,8 +5601,6 @@ def _momentum_anomaly_html(anomaly, cn_date: str) -> str:
         ovr_compare = "高于均值（资金沉淀偏强）" if ovr > ovr_20 else ("低于均值（投机偏强）" if ovr < ovr_20 else "与均值持平")
     pvo = anomaly.get("price_volume_oi") or "—"
     oi_note = "（持仓量缺失，OI 指标暂不计算）" if anomaly.get("oi_missing") else ""
-    score = anomaly.get("score", 0)
-    score_color = "#E74C3C" if score > 60 else ("#F39C12" if score >= 30 else "#27AE60")
     dd = anomaly.get("data_date", "")
     dd_note = f"（数据截至 {dd}）" if dd and dd != cn_date else ""
     return f"""
@@ -5648,15 +5613,13 @@ def _momentum_anomaly_html(anomaly, cn_date: str) -> str:
         • 成交量状态：<b>{vstate}</b>（较5日均值 {vchg_str}）{vol_alert or ''}<br>
         • 近5日状态：{seq}<br>
         • 持仓动能比：<b>{ratio_str}</b>（{anomaly['momentum_ratio_label']}）<br>
-        • 前20净持仓背离：连续 <b>{anomaly['divergence_count']}</b> 日<br>
-        • 资金异动评分：<b style="color:{score_color};font-size:1.05rem;">{score}</b> / 100 → {anomaly['score_level']}
+        • 前20净持仓背离：连续 <b>{anomaly['divergence_count']}</b> 日
         </p>{warn}
         <p style="font-size:0.72rem;color:#999;line-height:1.6;border-top:1px dashed #eee;padding-top:6px;margin-top:8px;">
         计算方法：持仓变化率 = 当日持仓量变动 ÷ 前日持仓量 × 100%；<br>
         持仓/成交比 = 当日持仓量 ÷ 当日成交量（&gt;3 资金沉淀、1~3 均衡、&lt;1 投机主导）；<br>
         持仓动能比 = 持仓变化率 ÷ |价格变化率|。比值 &gt;2 资金异动，&lt;0.3 资金跟进不足；<br>
-        成交量状态 = 当日成交量 ÷ 前5日均量（&gt;1.2 放量、&lt;0.8 缩量）；<br>
-        资金异动评分（0-100）：动能比 &gt;2 或 &lt;0.3 计 30 分；多头/空头主动增仓计 20 分；净持仓连续背离 ≥2 日计 25 分；|持仓变化率| &gt;5% 计 25 分。
+        成交量状态 = 当日成交量 ÷ 前5日均量（&gt;1.2 放量、&lt;0.8 缩量）。
         </p>
         </div>"""
 
@@ -5695,9 +5658,8 @@ def _momentum_anomaly_md(anomaly) -> str:
         f"- 近5日状态：{seq}",
         f"- 持仓动能比：**{ratio_str}**（{anomaly['momentum_ratio_label']}）",
         f"- 前20净持仓背离：连续 **{anomaly['divergence_count']}** 日",
-        f"- 资金异动评分：**{anomaly['score']}**/100 → {anomaly['score_level']}",
         "",
-        "> 计算方法：持仓变化率=当日持仓量变动÷前日持仓量×100%；持仓/成交比=当日持仓量÷当日成交量（>3资金沉淀、1~3均衡、<1投机主导）；持仓动能比=持仓变化率÷|价格变化率|（>2资金异动、<0.3资金跟进不足）；成交量状态=当日成交量÷前5日均量（>1.2放量、<0.8缩量）。评分(0-100)：动能比>2或<0.3计30分；多头/空头主动增仓计20分；净持仓连续背离≥2日计25分；|持仓变化率|>5%计25分。",
+        "> 计算方法：持仓变化率=当日持仓量变动÷前日持仓量×100%；持仓/成交比=当日持仓量÷当日成交量（>3资金沉淀、1~3均衡、<1投机主导）；持仓动能比=持仓变化率÷|价格变化率|（>2资金异动、<0.3资金跟进不足）；成交量状态=当日成交量÷前5日均量（>1.2放量、<0.8缩量）。",
     ]
     return "\n".join(lines) + warn
 
