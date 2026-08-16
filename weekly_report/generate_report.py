@@ -150,6 +150,13 @@ class DataReader:
                 return r
         return 0
 
+    def _col_by_name(self, df, hdr_row, keyword):
+        """在表头行找包含关键词的列索引，找不到返回 None"""
+        for i, h in enumerate(df.iloc[hdr_row].values):
+            if pd.notna(h) and keyword in str(h):
+                return i
+        return None
+
     def _wide_timeseries(self, df, prov, val_shift=0):
         """宽表(省份行 × 日期列) → {date, value}。日期列自动检测，值列 = 日期列 + val_shift"""
         hdr = 0
@@ -265,50 +272,23 @@ class DataReader:
         return result
 
     def get_national_price(self):
-        """全国均价 - 主要省份均值（兼容两种格式）"""
+        """全国均价 - 直接读取 价格+宰量 的 全国均价 列"""
         if not self.file_ridu:
             return None
-        idx = self._sheet_index(self.file_ridu, '省份均价')
+        idx = self._sheet_index(self.file_ridu, '价格+宰量')
         if idx is None:
-            idx = self._sheet_index(self.file_ridu, '日价_均价')
+            idx = self._sheet_index(self.file_ridu, '价格+宰量')
         if idx is None:
             return None
         df = self._read_sheet(self.file_ridu, idx)
-        hdr = self._header_row(df, ['河南'])
+        hdr = self._header_row(df, ['全国均价', '均价'])
         headers = df.iloc[hdr].values
-        prov_cols = {}
+        val_col = 1
         for i, h in enumerate(headers):
-            if pd.notna(h):
-                for p in TARGET_PROVINCES:
-                    if p in str(h):
-                        prov_cols[p] = i
-                        break
-        if not prov_cols:
-            prov_cols = {'河南': 1, '辽宁': 9, '四川': 12, '广东': 14, '广西': 15}
-        ds = hdr + 1
-        all_vals = []
-        for r in range(ds, len(df)):
-            d = df.iloc[r, 0]
-            if pd.notna(d):
-                prov_vals = []
-                for p in TARGET_PROVINCES:
-                    c = prov_cols.get(p)
-                    if c is not None:
-                        try:
-                            v = self._parse_range(df.iloc[r, c])
-                            if not np.isnan(v):
-                                prov_vals.append(v)
-                        except Exception:
-                            pass
-                if prov_vals:
-                    try:
-                        dt = pd.to_datetime(d) if not isinstance(d, datetime) else d
-                        all_vals.append({'date': dt, 'value': np.mean(prov_vals)})
-                    except Exception:
-                        pass
-        if not all_vals:
-            return None
-        return pd.DataFrame(all_vals).sort_values('date')
+            if pd.notna(h) and '均价' in str(h):
+                val_col = i
+                break
+        return self._extract_timeseries(df, val_col=val_col, date_row_start=hdr + 1)
 
     def get_province_slaughter(self):
         """各省屠宰量 - 兼容 宽表(屠宰企业日度屠宰量) 与 长表(日_屠宰量)"""
@@ -363,14 +343,20 @@ class DataReader:
     # ==================== (2) 周度数据读取 ====================
 
     def get_weight_split(self):
-        """体重拆分(集团+散户) - File 2 [10] 周度-体重拆分"""
+        """体重拆分(集团+散户)"""
         if not self.file_zhoudou:
             return {}
-        df = self._read_sheet(self.file_zhoudou, 10)
-        # 全国平均体重在col 1, 集团col 2, 散户col 3
+        idx = self._sheet_index(self.file_zhoudou, '体重拆分')
+        if idx is None:
+            return {}
+        df = self._read_sheet(self.file_zhoudou, idx)
+        hdr = self._header_row(df, ['全国均重'])
         result = {}
-        for key, col in [('全国平均', 1), ('集团', 2), ('散户', 3)]:
-            result[key] = self._extract_timeseries(df, val_col=col)
+        for kw, label in [('全国均重', '全国平均'), ('集团', '集团'), ('散户', '散户')]:
+            col = self._col_by_name(df, hdr, kw)
+            if col is None:
+                col = {'全国平均': 1, '集团': 2, '散户': 3}[label]
+            result[label] = self._extract_timeseries(df, val_col=col, date_col=0, date_row_start=hdr + 1)
         return result
 
     def _wide_mean_timeseries(self, df):
@@ -408,65 +394,80 @@ class DataReader:
         df = self._read_sheet(self.file_zhoudou, idx)
         return self._wide_mean_timeseries(df)
 
-    def get_fresh_sale_rate(self):
-        """鲜销率-全国平均 - File 2 [32] 周度-白条鲜销, 最后一列为全国"""
+    def _province_series(self, sheet_keyword, prov='河南'):
+        """读周度数据的某省份时间序列（按省份名找列，兼容不同sheet顺序）"""
         if not self.file_zhoudou:
             return None
-        df = self._read_sheet(self.file_zhoudou, 32)
-        # Last column is the national average
-        national_col = df.shape[1] - 1
-        return self._extract_timeseries(df, val_col=national_col)
+        idx = self._sheet_index(self.file_zhoudou, sheet_keyword)
+        if idx is None:
+            return None
+        df = self._read_sheet(self.file_zhoudou, idx)
+        hdr = self._header_row(df, [prov, '结束日期', '日期'])
+        col = self._col_by_name(df, hdr, prov)
+        if col is None:
+            col = 2
+        date_col = 1 if self._col_by_name(df, hdr, '结束日期') is not None else 0
+        return self._extract_timeseries(df, date_col=date_col, val_col=col, date_row_start=hdr + 1)
+
+    def get_fresh_sale_rate(self):
+        """鲜销率 - 全国均值"""
+        if not self.file_zhoudou:
+            return None
+        idx = self._sheet_index(self.file_zhoudou, '鲜销率')
+        if idx is None:
+            return None
+        df = self._read_sheet(self.file_zhoudou, idx)
+        hdr = self._header_row(df, ['全国'])
+        col = self._col_by_name(df, hdr, '全国')
+        if col is None:
+            col = df.shape[1] - 1
+        return self._extract_timeseries(df, val_col=col, date_col=1, date_row_start=hdr + 1)
 
     def get_frozen_stock(self):
-        """冻品库存率-全国 - File 2 [33] 周度-冻品库容"""
+        """冻品库存率 - 冻品库存多样本全国均值"""
         if not self.file_zhoudou:
             return None
-        df = self._read_sheet(self.file_zhoudou, 33)
-        # 全国在最后一列
-        national_col = df.shape[1] - 1
-        for c in range(df.shape[1]):
-            if pd.notna(df.iloc[1, c]) and '全国' in str(df.iloc[1, c]):
-                national_col = c
-                break
-        return self._extract_timeseries(df, val_col=national_col)
+        idx = self._sheet_index(self.file_zhoudou, '冻品库存多样本')
+        if idx is None:
+            idx = self._sheet_index(self.file_zhoudou, '冻品库存')
+        if idx is None:
+            return None
+        df = self._read_sheet(self.file_zhoudou, idx)
+        hdr = self._header_row(df, ['全国'])
+        col = self._col_by_name(df, hdr, '全国')
+        if col is None:
+            col = df.shape[1] - 1
+        return self._extract_timeseries(df, val_col=col, date_col=0, date_row_start=hdr + 1)
 
     def get_slaughter_profit(self):
-        """屠宰利润（白条头均利润）- File 2 [27] 周度-河南屠宰白条成本"""
+        """屠宰利润（白条头均利润）"""
         if not self.file_zhoudou:
             return None
-        df = self._read_sheet(self.file_zhoudou, 27)
-        # 白条头均利润在 col 9
-        return self._extract_timeseries(df, val_col=9)
+        idx = self._sheet_index(self.file_zhoudou, '河南屠宰白条成本')
+        if idx is None:
+            return None
+        df = self._read_sheet(self.file_zhoudou, idx)
+        hdr = self._header_row(df, ['白条头均利润'])
+        col = self._col_by_name(df, hdr, '白条头均利润')
+        if col is None:
+            col = 9
+        return self._extract_timeseries(df, val_col=col, date_row_start=hdr + 1)
 
     def get_cull_sow_price(self):
-        """淘汰母猪价格(河南均值) - File 2 [28] 周度-淘汰母猪价格"""
-        if not self.file_zhoudou:
-            return None
-        df = self._read_sheet(self.file_zhoudou, 28)
-        # 河南在col 3
-        return self._extract_timeseries(df, val_col=3)
+        """淘汰母猪价格（河南）"""
+        return self._province_series('淘汰母猪价格', '河南')
 
     def get_high_parity_discount(self):
-        """高胎母猪折扣(河南) - File 2 [30] 周度-高胎淘母折扣价"""
-        if not self.file_zhoudou:
-            return None
-        df = self._read_sheet(self.file_zhoudou, 30)
-        return self._extract_timeseries(df, val_col=3)
+        """高胎母猪折扣（河南）"""
+        return self._province_series('高胎淘母折扣', '河南')
 
     def get_low_parity_discount(self):
-        """低胎母猪折扣(河南) - File 2 [29] 周度-低胎淘母折扣"""
-        if not self.file_zhoudou:
-            return None
-        df = self._read_sheet(self.file_zhoudou, 29)
-        return self._extract_timeseries(df, val_col=3)
+        """低胎母猪折扣（河南）"""
+        return self._province_series('低胎母猪折扣', '河南')
 
     def get_binary_sow_price(self):
-        """二元母猪价格 - File 2 [24] 周度-50公斤二元母猪价格"""
-        if not self.file_zhoudou:
-            return None
-        df = self._read_sheet(self.file_zhoudou, 24)
-        # 河南在col 3
-        return self._extract_timeseries(df, val_col=3)
+        """二元母猪价格（河南）"""
+        return self._province_series('二元母猪价格', '河南')
 
     # ==================== (3) 图表版数据读取 ====================
 
@@ -513,22 +514,36 @@ class DataReader:
         return pd.DataFrame({'date': dates, 'value': vals}).sort_values('date')
 
     def get_maobai_spread(self):
-        """毛白价差 - File 2 [23] 周度-毛白价差 col 3"""
+        """毛白价差"""
         if not self.file_zhoudou:
             return None
-        df = self._read_sheet(self.file_zhoudou, 23)
-        return self._extract_timeseries(df, val_col=3, date_row_start=1)
+        idx = self._sheet_index(self.file_zhoudou, '毛白价差')
+        if idx is None:
+            return None
+        df = self._read_sheet(self.file_zhoudou, idx)
+        hdr = self._header_row(df, ['价差'])
+        # 毛白价差 sheet 为简单表：价差在最后一列（第4列）
+        col = self._col_by_name(df, hdr, '价差')
+        if col is None or col == 0:
+            col = 3
+        return self._extract_timeseries(df, val_col=col, date_col=0, date_row_start=hdr + 1)
 
     def get_breeding_profit(self):
-        """养殖利润 - File 2 [19] 周度-养殖利润, 返回{label: df}"""
+        """养殖利润 - 返回{label: df}"""
         if not self.file_zhoudou:
             return {}
-        df = self._read_sheet(self.file_zhoudou, 19)
+        idx = self._sheet_index(self.file_zhoudou, '养殖利润最新')
+        if idx is None:
+            idx = self._sheet_index(self.file_zhoudou, '养殖利润')
+        if idx is None:
+            return {}
+        df = self._read_sheet(self.file_zhoudou, idx)
+        hdr = self._header_row(df, ['母猪', '利润', '外购'])
         result = {}
-        # col 3=母猪50头以下, col 8=5000-10000, col 9=外购仔猪
-        labels = {3: '母猪50头以下', 8: '5000-10000头', 9: '外购仔猪育肥'}
-        for col, label in labels.items():
-            result[label] = self._extract_timeseries(df, val_col=col)
+        for kw, label in [('母猪50头以下', '母猪50头以下'), ('5000-10000', '5000-10000头'), ('外购', '外购仔猪育肥')]:
+            col = self._col_by_name(df, hdr, kw)
+            if col is not None:
+                result[label] = self._extract_timeseries(df, val_col=col, date_col=1, date_row_start=hdr + 1)
         return result
 
     # ==================== 批量加载 ====================
@@ -727,48 +742,55 @@ class Analyzer:
         return f'{val:+.2f}{unit}'
 
     @staticmethod
+    def _week_period_str(df):
+        """返回 (本周自然周日期串, 上周日期串, 去年同周日期串)"""
+        if df is None or df.empty:
+            return ('—', '—', '—')
+        df = df.sort_values('date')
+        latest = df['date'].iloc[-1]
+        monday = latest - timedelta(days=latest.weekday())
+        sunday = monday + timedelta(days=6)
+        cur = f"{monday.month}月{monday.day}日-{sunday.month}月{sunday.day}日"
+        pm, ps = monday - timedelta(days=7), monday - timedelta(days=1)
+        prev = f"{pm.month}月{pm.day}日-{ps.month}月{ps.day}日"
+        ly = monday - timedelta(days=364)
+        ly2 = ly + timedelta(days=6)
+        last = f"{ly.month}月{ly.day}日-{ly2.month}月{ly2.day}日"
+        return (cur, prev, last)
+
+    @staticmethod
     def analyze_price(data):
-        """价格分析（自然周均价 + 价差两两组合）"""
+        """价格分析（自然周均价，标注日期，价差只在图中展示）"""
         prov_price = data.get('province_price', {})
         national = data.get('national_price')
         lines = []
         lines.append("【价格分析】")
 
-        # 各省自然周均价
+        # 各省自然周均价（标注自然周日期/上周/去年同期）
         for p in TARGET_PROVINCES:
             df = prov_price.get(p)
             if df is not None and not df.empty:
+                cur_s, prev_s, ly_s = Analyzer._week_period_str(df)
                 m = Analyzer._natural_week_mean(df, 'price')
                 cmp = Analyzer._week_avg_compare(df, 'price')
-                if m is not None:
-                    wow_str = Analyzer._fmt(cmp[3], is_pct=True) if cmp and cmp[3] is not None else 'N/A'
-                    yoy_str = Analyzer._fmt(cmp[4], is_pct=True) if cmp and cmp[4] is not None else 'N/A'
-                    lines.append(f"- {p}自然周均价: {m:.2f}元/kg, "
-                                 f"环比{wow_str}, 同比{yoy_str}")
+                if m is not None and cmp:
+                    wow_str = Analyzer._fmt(cmp[3], is_pct=True) if cmp[3] is not None else 'N/A'
+                    yoy_str = Analyzer._fmt(cmp[4], is_pct=True) if cmp[4] is not None else 'N/A'
+                    prev_mean = f"{cmp[1]:.2f}" if cmp[1] is not None else '—'
+                    ly_mean = f"{cmp[2]:.2f}" if cmp[2] is not None else '—'
+                    lines.append(f"- {p}自然周均价({cur_s}): {m:.2f}元/kg，"
+                                 f"上周({prev_s}){prev_mean}元/kg(环比{wow_str})，"
+                                 f"去年同期({ly_s}){ly_mean}元/kg(同比{yoy_str})")
 
         # 全国均价自然周
         if national is not None and not national.empty:
+            cur_s, prev_s, ly_s = Analyzer._week_period_str(national)
             m = Analyzer._natural_week_mean(national, 'value')
+            cmp = Analyzer._week_avg_compare(national, 'value')
             if m is not None:
-                lines.append(f"- 全国均价自然周: {m:.2f}元/kg")
-
-        # 价差两两组合
-        series = {}
-        for p in TARGET_PROVINCES:
-            if p in prov_price and prov_price[p] is not None and not prov_price[p].empty:
-                series[p] = prov_price[p].set_index('date')['price']
-        if national is not None and not national.empty:
-            series['全国均价'] = national.set_index('date')['value']
-        regions = [r for r in ['河南', '广东', '四川', '辽宁', '全国均价'] if r in series]
-        for i in range(len(regions)):
-            for j in range(i + 1, len(regions)):
-                a, b = regions[i], regions[j]
-                sa, sb = series[a], series[b]
-                common = sa.index.intersection(sb.index)
-                if len(common) > 0:
-                    spread = sa[common] - sb[common]
-                    lines.append(f"- {a}-{b}价差: 最新{spread.iloc[-1]:+.2f}元/kg, "
-                                 f"均值{spread.mean():+.2f}元/kg")
+                wow_str = Analyzer._fmt(cmp[3], is_pct=True) if cmp and cmp[3] is not None else 'N/A'
+                yoy_str = Analyzer._fmt(cmp[4], is_pct=True) if cmp and cmp[4] is not None else 'N/A'
+                lines.append(f"- 全国均价自然周({cur_s}): {m:.2f}元/kg，环比{wow_str}，同比{yoy_str}")
 
         # 肥标价差
         fss = data.get('fat_std_spread', {})
@@ -1029,8 +1051,8 @@ class Analyzer:
         ly_monday = monday - timedelta(days=364)
         ly = df[(df['date'] >= ly_monday) & (df['date'] <= latest - timedelta(days=364))]
         ly_mean = float(ly[val_col].mean()) if not ly.empty else None
-        wow = (cur_mean / prev_mean - 1) * 100 if prev_mean else None
-        yoy = (cur_mean / ly_mean - 1) * 100 if ly_mean else None
+        wow = (cur_mean / prev_mean - 1) if prev_mean else None
+        yoy = (cur_mean / ly_mean - 1) if ly_mean else None
         return (cur_mean, prev_mean, ly_mean, wow, yoy)
 
     @staticmethod
@@ -1105,15 +1127,6 @@ def build_report_layout(analysis_text):
                                  dbc.Col([dcc.Graph(id='chart-price-yoy-guangdong')], width=6),
                                  dbc.Col([dcc.Graph(id='chart-price-yoy-liaoning')], width=6),
                              ]),
-                             html.H5("四省屠宰量季节性对比", className='mt-3'),
-                             dbc.Row([
-                                 dbc.Col([dcc.Graph(id='chart-price-sl-henan')], width=6),
-                                 dbc.Col([dcc.Graph(id='chart-price-sl-sichuan')], width=6),
-                             ]),
-                             dbc.Row([
-                                 dbc.Col([dcc.Graph(id='chart-price-sl-guangdong')], width=6),
-                                 dbc.Col([dcc.Graph(id='chart-price-sl-liaoning')], width=6),
-                             ]),
                              html.H5("价差历史同期（河南 vs 广东/四川/辽宁/全国均价）", className='mt-3'),
                              dbc.Row([
                                  dbc.Col([dcc.Graph(id='chart-spread-hn-gd')], width=6),
@@ -1153,7 +1166,16 @@ def build_report_layout(analysis_text):
             build_section('sec-slaughter', '三、屠宰分析',
                          analysis_extract(analysis_text, '【屠宰分析】', '【母猪分析】'),
                          [
-                             html.H5("全国鲜销率 & 冻品库存季节性同比"),
+                             html.H5("四省屠宰量季节性对比"),
+                             dbc.Row([
+                                 dbc.Col([dcc.Graph(id='chart-price-sl-henan')], width=6),
+                                 dbc.Col([dcc.Graph(id='chart-price-sl-sichuan')], width=6),
+                             ]),
+                             dbc.Row([
+                                 dbc.Col([dcc.Graph(id='chart-price-sl-guangdong')], width=6),
+                                 dbc.Col([dcc.Graph(id='chart-price-sl-liaoning')], width=6),
+                             ]),
+                             html.H5("全国鲜销率 & 冻品库存季节性同比", className='mt-3'),
                              dbc.Row([
                                  dbc.Col([dcc.Graph(id='chart-fresh')], width=6),
                                  dbc.Col([dcc.Graph(id='chart-frozen')], width=6),
