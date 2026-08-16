@@ -1061,7 +1061,7 @@ class Analyzer:
         lines.append("- 风险因素: 二育/压栏可能导致短期供给后移; 进口猪肉量变化; 疫病风险; 饲料成本波动")
         lines.append("- 综合判断: 短期猪价底部震荡, 中期看涨但幅度有限, 关注产能去化进度和终端消费恢复情况")
         lines.append("")
-        lines.append("免责声明: 以上分析基于涌益咨询周度数据自动生成, 仅供参考, 不构成投资建议。")
+        lines.append("免责声明: 本报告仅供参考, 不构成投资建议。")
         return '\n'.join(lines)
 
     @staticmethod
@@ -1149,7 +1149,7 @@ NAVBAR = dbc.Navbar(
             dbc.NavItem(dbc.NavLink("报告预览", href="#", active=True, id="nav-preview")),
             dbc.NavItem(dbc.NavLink("在线编辑", href="#", id="nav-edit")),
         ], className="ms-auto", navbar=True),
-        dbc.Button("下载PDF (浏览器打印→另存PDF)", id="btn-pdf", color="danger", size="sm", className="ms-2"),
+        dbc.Button("下载PDF", id="btn-pdf", color="danger", size="sm", className="ms-2"),
         dbc.Button("刷新数据", id="btn-refresh", color="warning", size="sm"),
     ]),
     color="dark", dark=True, className="mb-3",
@@ -1303,6 +1303,7 @@ def build_report_layout(analysis_text):
 
         # Store for analysis text
         dcc.Store(id='analysis-store', data=analysis_text),
+        dcc.Download(id="download-pdf"),
     ], fluid=True)
 
 
@@ -1548,7 +1549,7 @@ def update_all_charts(n):
                 if yr_df.empty: continue
                 c = YR_COLORS.get(yr, '#888')
                 fig.add_trace(go.Scatter(x=yr_df['plot_date'], y=yr_df['value'], mode='lines',
-                    name=f'{yr}年', line=dict(color=c, width=2 if yr==2026 else 1.2),
+                    name=f'{yr}年', line=dict(color=c, width=2),
                     opacity=0.9 if yr==2026 else 0.5))
         fig.add_hline(y=0, line_dash="dash", line_color="gray", opacity=0.5)
         fig.update_layout(template='plotly_white', title=f'{key}养殖利润季节性同比 (元/头)',
@@ -1595,7 +1596,96 @@ def save_edits(n, text):
     return dash.no_update, dash.no_update
 
 
-# PDF下载 - 使用浏览器Ctrl+P打印为PDF
+def _generate_report_pdf(text: str = None) -> bytes:
+    """生成周报 PDF（服务端渲染：图表不分页、无浏览器页脚/IP、含分析文本与图表）"""
+    import io
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.units import cm
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+    from reportlab.platypus import (SimpleDocTemplate, Paragraph, Spacer, Image, KeepTogether)
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+
+    content = text if text else analysis_text
+
+    # 1. 渲染图表为 PNG
+    chart_pngs = []
+    try:
+        figs = update_all_charts(None)
+    except Exception:
+        figs = []
+    for fig in figs:
+        try:
+            if fig is None or not getattr(fig, 'data', None):
+                continue
+            title = fig.layout.title.text if fig.layout.title and fig.layout.title.text else ''
+            png = fig.to_image(format='png', width=1000, height=560)
+            chart_pngs.append((title, png))
+        except Exception:
+            continue
+
+    # 2. 注册中文字体
+    try:
+        pdfmetrics.registerFont(UnicodeCIDFont('STSong-Light'))
+        FONT = 'STSong-Light'
+    except Exception:
+        FONT = 'Helvetica'
+
+    # 3. 构建 PDF
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4, topMargin=1.5 * cm, bottomMargin=1.5 * cm,
+                            leftMargin=1.4 * cm, rightMargin=1.4 * cm,
+                            title=f'涌益生猪周报 {REPORT_PERIOD}')
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle('T', parent=styles['Title'], fontName=FONT,
+                                 fontSize=17, leading=22, spaceAfter=10)
+    head_style = ParagraphStyle('H', parent=styles['Heading2'], fontName=FONT,
+                                fontSize=13, leading=17, spaceBefore=8, spaceAfter=4,
+                                textColor='#333333')
+    body_style = ParagraphStyle('B', parent=styles['BodyText'], fontName=FONT,
+                                fontSize=8.8, leading=13.5)
+
+    def _esc(s):
+        return s.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+
+    story = [Paragraph(f'涌益咨询生猪周度报告（{REPORT_PERIOD}）', title_style)]
+    for line in content.split('\n'):
+        s = line.strip()
+        if not s or s.startswith('='):
+            continue
+        if s.startswith('涌益咨询生猪周度报告'):
+            continue
+        if s.startswith('【'):
+            story.append(Paragraph(_esc(s), head_style))
+        else:
+            story.append(Paragraph(_esc(s), body_style))
+
+    # 4. 图表（KeepTogether 保证每张图不分页）
+    for title, png in chart_pngs:
+        img = Image(io.BytesIO(png), width=18 * cm, height=18 * cm * 560 / 1000)
+        story.append(KeepTogether([
+            Paragraph(_esc(title), head_style),
+            img,
+            Spacer(1, 0.25 * cm),
+        ]))
+
+    doc.build(story)
+    return buf.getvalue()
+
+
+@app.callback(
+    Output('download-pdf', 'data'),
+    Input('btn-pdf', 'n_clicks'),
+    State('analysis-store', 'data'),
+    prevent_initial_call=True,
+)
+def download_pdf(n_clicks, edited_text):
+    """一键下载 PDF（服务端生成）"""
+    try:
+        pdf_bytes = _generate_report_pdf(edited_text)
+        return dcc.send_bytes(pdf_bytes, f'涌益生猪周报_{REPORT_PERIOD}.pdf')
+    except Exception as e:
+        return dcc.send_bytes(f'PDF生成失败: {e}'.encode('utf-8'), 'error.txt')
 
 
 # ============================================================
@@ -1612,7 +1702,7 @@ if __name__ == '__main__':
     print("  启动地址: http://localhost:8051")
     print("  - 报告预览: 查看完整图表和分析")
     print("  - 在线编辑: 修改分析文本")
-    print("  - 下载PDF: 浏览器打印为PDF")
+    print("  - 下载PDF: 一键下载PDF")
     print("=" * 60)
     print()
     print("  [提示] 替换数据源文件夹中的Excel文件后重启即可生成新报告")
