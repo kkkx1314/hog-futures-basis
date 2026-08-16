@@ -170,6 +170,35 @@ def extract_weekly(path):
     return out
 
 
+# ── 期货数据 ──
+_FUTURES_DIR = r"D:\CC\test-claude\sentiment_platform\data\futures"
+
+
+def list_futures():
+    if not os.path.isdir(_FUTURES_DIR):
+        return []
+    return sorted(os.path.splitext(os.path.basename(f))[0]
+                  for f in glob.glob(os.path.join(_FUTURES_DIR, "LH*.csv")))
+
+
+def get_futures(ct):
+    p = os.path.join(_FUTURES_DIR, f"{ct}.csv")
+    if not os.path.exists(p):
+        return None
+    df = pd.read_csv(p)
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.sort_values("date")
+    last, prev = df.iloc[-1], (df.iloc[-2] if len(df) > 1 else df.iloc[-1])
+    close = float(last["close"])
+    prev_close = float(prev["close"])
+    hold = float(last["hold"]) if pd.notna(last["hold"]) else None
+    return {
+        "ct": ct, "date": last["date"].date(), "close": close, "prev_close": prev_close,
+        "chg": close - prev_close, "chg_pct": (close / prev_close - 1) * 100 if prev_close else 0,
+        "hold": hold, "volume": float(last["volume"]),
+    }
+
+
 # ── PDF ──
 def _font():
     try:
@@ -178,8 +207,8 @@ def _font():
         pass
 
 
-def build_pdf(data, conclusion):
-    """根据提取的数据 + 结论生成 PDF bytes。"""
+def build_pdf(data, futures, conclusion):
+    """根据提取的数据 + 期货数据 + 结论生成 PDF bytes。"""
     _font()
     sts = getSampleStyleSheet()
     title = ParagraphStyle('t', fontName='SimHei', fontSize=19, leading=25, alignment=TA_CENTER,
@@ -255,7 +284,19 @@ def build_pdf(data, conclusion):
                   ['月度出栏完成率', f"{data['出栏完成率']['全国']*100:.1f}%", '—']],
                  [70 * mm, 48 * mm, 48 * mm]))
 
-    S.append(Paragraph("六、期货操作结论", h))
+    if futures:
+        f = futures
+        basis = data["price"]["全国"] * 1000 - f["close"]
+        S.append(Paragraph("六、期货端", h))
+        S.append(tbl([['指标', '数值'],
+                      [f'{f["ct"]} 收盘（{f["date"]}）', f"{f['close']:,.0f} 元/吨"],
+                      ['较前日', f"{f['chg']:+,.0f}（{f['chg_pct']:+.2f}%）"],
+                      ['持仓量', f"{f['hold']:,.0f} 手" if f['hold'] else '—'],
+                      ['成交量', f"{f['volume']:,.0f} 手"],
+                      ['基差（现货全国×1000 − 期货）', f"{basis:+,.0f} 元/吨"]],
+                     [90 * mm, 70 * mm]))
+
+    S.append(Paragraph("七、期货操作结论", h))
     for line in conclusion.split("\n"):
         line = line.strip()
         if line:
@@ -292,13 +333,25 @@ with st.spinner("正在提取指标…"):
 
 st.success(f"已解析：{data['file']}")
 
+st.markdown("### 期货合约")
+fut_list = list_futures()
+if fut_list:
+    sel_ct = st.selectbox("选择期货合约", fut_list, index=fut_list.index("LH2609") if "LH2609" in fut_list else 0)
+    futures = get_futures(sel_ct)
+else:
+    futures = None
+    st.info("未检测到本地期货数据（可在 D:\\CC\\test-claude\\sentiment_platform\\data\\futures 放置 LH*.csv）")
+
 st.markdown("### 指标预览")
 p = data["price"]
-c1, c2, c3, c4 = st.columns(4)
+c1, c2, c3, c4, c5 = st.columns(5)
 c1.metric("全国出栏均价", f"{p['全国']:.2f} 元/公斤", f"{p['环比']:+.2f}%")
 c2.metric("鲜销率", f"{data['鲜销率']['本周']*100:.2f}%")
 c3.metric("冻品库存率", f"{data['冻品库存']['本周']*100:.2f}%", f"去年 {data['冻品库存']['去年']*100:.2f}%")
 c4.metric("二育利用率", f"{data['二育']['本周']*100:.2f}%")
+if futures:
+    basis = p["全国"] * 1000 - futures["close"]
+    c5.metric(f"{futures['ct']} 收盘", f"{futures['close']:,.0f}", f"基差 {basis:+,.0f}")
 
 st.markdown("### 编辑结论（可自行修改）")
 default_conclusion = """1. 短期：现货端关注价格持续性，期货端关注基差与资金动向，建议震荡思路、不追高。
@@ -310,6 +363,6 @@ conclusion = st.text_area("结论内容（每条一行，生成 PDF 时逐条展
 
 if st.button("📄 生成 PDF", type="primary", use_container_width=True):
     with st.spinner("生成 PDF…"):
-        pdf_bytes = build_pdf(data, conclusion)
+        pdf_bytes = build_pdf(data, futures, conclusion)
     st.download_button("⬇️ 下载 PDF", data=pdf_bytes, file_name="生猪周报.pdf", mime="application/pdf",
                        use_container_width=True)
