@@ -233,10 +233,6 @@ PREMIUM_V4 = {
     "内蒙古":-300,"吉林":-300,"贵州":-300,"黑龙江":-500,"云南":-600,
 }
 
-# 注册仓单（交割库）区域 —— 大商所生猪期货已设立交割库的区域（可自行增删）
-REGISTERED_RECEIPT_REGIONS = ["河南", "山东", "湖北", "江苏", "安徽", "浙江", "河北", "广东", "四川", "重庆"]
-
-
 def get_version(ct: str) -> Tuple[str, Dict]:
     try:
         n = int(ct[2:])
@@ -889,9 +885,6 @@ def compute_snapshot(ct: str, spot_dict: dict, fut_df: pd.DataFrame, target_date
         na_basis = int(round(_to_ton(float(nr["price"].iloc[0]))-fc)) if not nr.empty else int(round(_to_ton(np.mean([x[2] for x in items]))-fc))
     else:
         na_basis = int(round(_to_ton(np.mean([x[2] for x in items]))-fc))
-    # 注册仓单（交割库）区域的最小基差
-    receipt_items = [x for x in items if x[0] in REGISTERED_RECEIPT_REGIONS]
-    receipt_min = min(receipt_items, key=lambda x: x[1]) if receipt_items else None
     return {
         "max_region": items[0][0], "max_basis": items[0][1],
         "min_region": items[-1][0], "min_basis": items[-1][1],
@@ -899,8 +892,6 @@ def compute_snapshot(ct: str, spot_dict: dict, fut_df: pd.DataFrame, target_date
         "national_avg": na_basis,
         "range": items[0][1]-items[-1][1],
         "futures_close": fc,
-        "receipt_min_region": receipt_min[0] if receipt_min else None,
-        "receipt_min_basis": receipt_min[1] if receipt_min else None,
     }
 
 # ══════════════════════════════════════════════════════════════
@@ -5843,10 +5834,6 @@ def _build_daily_report_html(main_ct: str, fut_df, spot_dict, ltd, prev_td,
 
     # ── 构建基差分析HTML（含历史分位）──
     basis_analysis_html = _build_basis_analysis_html(snap, basis_enhanced, na_basis, max_region, max_basis, min_region, min_basis)
-    # 注册仓单（交割库）区域最小基差
-    if snap and snap.get('receipt_min_region'):
-        basis_analysis_html += (f"<br>🏢 注册仓单区域最小基差：<b>{snap['receipt_min_region']}</b>"
-                               f"（{snap['receipt_min_basis']:+,}元/吨）")
 
     # ── 量价状态卡片 ──
     anomaly_card_html = _momentum_anomaly_html(momentum_anomaly, cn_date,
