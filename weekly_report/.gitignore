@@ -1,0 +1,6 @@
+# 数据文件与生成产物不提交
+数据源/
+report_output/
+__pycache__/
+assets/
+*.xlsx
