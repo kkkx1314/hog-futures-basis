@@ -511,23 +511,27 @@ if run:
             st.dataframe(pred_df.style.format({"预测均值": "{:,.0f}", "变化率%": "{:+.2f}"}),
                          use_container_width=True, hide_index=True)
 
-            # 预测每日值折线图（具体量级）
-            st.markdown("##### 预测每日值")
+            # 各方案预测时间段均值（柱状图）
+            st.markdown("##### 各方案预测时间段均值")
             fig = go.Figure()
-            colors = {"历史全均值": "#E74C3C", "多年度组合": "#3498DB", "聚类分析": "#9B59B6", "走势复盘": "#27AE60"}
-            x_labels = [_md_label(k) for k in pred_keys]
+            names, means = [], []
             for s in pr["schemes"]:
-                daily = s.get("daily")
                 if s["name"] == "多年度组合":
                     for cname, c in s.get("combos", {}).items():
-                        fig.add_trace(go.Scatter(x=x_labels, y=c["daily"], mode="lines+markers",
-                                                 name=f"多年度·{cname}",
-                                                 line=dict(color=colors.get("多年度组合", "#95A5A6"))))
-                elif daily is not None:
-                    fig.add_trace(go.Scatter(x=x_labels, y=daily, mode="lines+markers",
-                                             name=s["name"], line=dict(color=colors.get(s["name"], "#95A5A6"))))
-            fig.update_layout(xaxis_title="农历日期", yaxis_title="预测值（头）",
-                              template="plotly_white", height=400, hovermode="x unified")
+                        names.append(f"多年度·{cname}")
+                        means.append(float(np.mean(c["daily"])))
+                elif s["name"] == "聚类分析" and s.get("cluster") and s.get("daily"):
+                    names.append("聚类·最接近类")
+                    means.append(float(np.mean(s["daily"])))
+                elif s.get("daily") is not None:
+                    names.append(s["name"])
+                    means.append(float(np.mean(s["daily"])))
+            fig.add_trace(go.Bar(x=names, y=means, marker_color="#2E86AB",
+                                 hovertemplate="%{x}<br>预测均值：%{y:,.0f}<extra></extra>"))
+            fig.add_hline(y=pr["base_mean"], line_dash="dash", line_color="#E74C3C",
+                          annotation_text=f"今年基准均值 {pr['base_mean']:,.0f}")
+            fig.update_layout(xaxis_title="方案", yaxis_title="预测时间段均值（头）",
+                              template="plotly_white", height=380)
             st.plotly_chart(fig, use_container_width=True)
 
             # 聚类详情
