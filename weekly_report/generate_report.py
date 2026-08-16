@@ -1362,8 +1362,8 @@ PROV_EN = {'河南': 'henan', '四川': 'sichuan', '广东': 'guangdong', '辽�
 chart_outputs = []
 chart_inputs = []
 
-for prov in TARGET_PROVINCES:
-    en = PROV_EN.get(prov, prov)
+for prov in PROV_EN:
+    en = PROV_EN[prov]
     chart_outputs.append(Output(f'chart-price-sl-{en}', 'figure'))
     chart_outputs.append(Output(f'chart-price-yoy-{en}', 'figure'))
 
@@ -1404,7 +1404,7 @@ def update_all_charts(n):
     results = []
 
     # 各省屠宰量季节性对比（纯屠宰量）
-    for prov in TARGET_PROVINCES:
+    for prov in PROV_EN:
         sdf = data.get('province_slaughter', {}).get(prov)
         if sdf is not None and not sdf.empty:
             results.append(make_seasonal_fig(sdf, f'{prov}屠宰量季节性对比 (头/日)', '头/日'))
