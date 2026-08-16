@@ -207,102 +207,150 @@ def _font():
         pass
 
 
-def build_pdf(data, futures, conclusion):
-    """根据提取的数据 + 期货数据 + 结论生成 PDF bytes。"""
-    _font()
-    sts = getSampleStyleSheet()
-    title = ParagraphStyle('t', fontName='SimHei', fontSize=19, leading=25, alignment=TA_CENTER,
-                           textColor=HexColor('#1a1a2e'), spaceAfter=4)
-    sub = ParagraphStyle('s', fontName='SimHei', fontSize=8.5, leading=12, alignment=TA_CENTER,
-                         textColor=HexColor('#888888'), spaceAfter=10)
-    h = ParagraphStyle('h', fontName='SimHei', fontSize=12.5, leading=17, textColor=HexColor('#2c3e50'),
-                       spaceBefore=9, spaceAfter=5)
-    body = ParagraphStyle('b', fontName='SimHei', fontSize=9.5, leading=15, textColor=HexColor('#333333'))
-    bullet = ParagraphStyle('bl', fontName='SimHei', fontSize=9.5, leading=15, textColor=HexColor('#333333'),
-                            leftIndent=12, spaceAfter=3)
+def generate_markdown(data, futures):
+    """根据提取的数据生成完整周报 Markdown（结论可自行编辑）。"""
+    p = data["price"]
+    ws = data["weight_split"]
+    w = data["weight"]
+    L = []
+    L.append("# 生猪市场周报")
+    L.append("")
+    L.append(f"> 数据来源：{data['file']}")
+    L.append("")
+    L.append("## 一、现货价格")
+    L.append("")
+    L.append("| 指标 | 本周 | 上周 | 环比 |")
+    L.append("|---|---|---|---|")
+    L.append(f"| 全国出栏均价 | {p['全国']:.2f} 元/公斤 | {p['上周']:.2f} 元/公斤 | {p['环比']:+.2f}% |")
+    L.append(f"| 河南 | {p['河南']:.2f} | — | — |")
+    L.append(f"| 四川 | {p['四川']:.2f} | — | — |")
+    L.append(f"| 广东 | {p['广东']:.2f} | — | — |")
+    L.append(f"| 山东 | {p['山东']:.2f} | — | — |")
+    L.append(f"| 辽宁 | {p['辽宁']:.2f} | — | — |")
+    L.append("")
+    L.append("## 二、出栏体重与结构")
+    L.append("")
+    L.append("| 指标 | 本周 | 同期 |")
+    L.append("|---|---|---|")
+    L.append(f"| 全国均重 | {ws['均重']:.1f} 公斤 | 去年同周 {w.get('90kg以下',{}).get('去年') and ''}— |")
+    L.append(f"| 集团均重 | {ws['集团']:.1f} 公斤 | — |")
+    L.append(f"| 散户均重 | {ws['散户']:.1f} 公斤 | — |")
+    L.append(f"| 集团/散户权重 | {ws['集团权重']*100:.1f}% / {ws['散户权重']*100:.1f}% | — |")
+    L.append(f"| 90kg以下比例 | {w.get('90kg以下',{}).get('本周',0)*100:.2f}% | 去年 {w.get('90kg以下',{}).get('去年',0)*100:.2f}% |")
+    L.append(f"| 150kg以上比例 | {w.get('150kg以上',{}).get('本周',0)*100:.2f}% | 去年 {w.get('150kg以上',{}).get('去年',0)*100:.2f}% |")
+    L.append("")
+    L.append("## 三、鲜销率 / 冻品库存 / 毛白价差")
+    L.append("")
+    L.append("| 指标 | 本周 | 上周 | 去年同周 |")
+    L.append("|---|---|---|---|")
+    L.append(f"| 鲜销率 | {data['鲜销率']['本周']*100:.2f}% | {data['鲜销率']['上周']*100:.2f}% | {data['鲜销率']['去年']*100:.2f}% |")
+    L.append(f"| 冻品库存率 | {data['冻品库存']['本周']*100:.2f}% | {data['冻品库存']['上周']*100:.2f}% | {data['冻品库存']['去年']*100:.2f}% |")
+    L.append(f"| 毛白价差 | {data['毛白价差']['本周']:.2f} | {data['毛白价差']['上周']:.2f} | {data['毛白价差']['去年']:.2f} |")
+    L.append("")
+    L.append("## 四、养殖利润")
+    L.append("")
+    L.append("| 指标 | 本周 | 上周 |")
+    L.append("|---|---|---|")
+    lc, bai = data["利润对比"], data["白条利润"]
+    L.append(f"| 仔猪头均利润 | {lc['仔猪']:.0f} | {lc['仔猪上周']:.0f} |")
+    L.append(f"| 商品猪利润 | {lc['商品猪']:.1f} | {lc['商品猪上周']:.1f} |")
+    L.append(f"| 河南白条头均利润 | {bai['本周']:.2f} | {bai['上周']:.2f} |")
+    L.append("")
+    L.append("## 五、淘汰母猪 / 折扣 / 二育 / 出栏完成率")
+    L.append("")
+    L.append("| 指标 | 本周 | 上周 |")
+    L.append("|---|---|---|")
+    L.append(f"| 淘汰母猪价(河南) | {data['淘汰母猪']['本周']} | {data['淘汰母猪']['上周']} |")
+    L.append(f"| 高胎淘母折扣 | {data['高胎折扣']['本周']*100:.2f}% | {data['高胎折扣']['上周']*100:.2f}% |")
+    L.append(f"| 低胎母猪折扣 | {data['低胎折扣']['本周']*100:.2f}% | {data['低胎折扣']['上周']*100:.2f}% |")
+    L.append(f"| 二育栏舍利用率 | {data['二育']['本周']*100:.2f}% | {data['二育']['上周']*100:.2f}% |")
+    L.append(f"| 月度出栏完成率 | {data['出栏完成率']['全国']*100:.1f}% | — |")
+    if futures:
+        f = futures
+        basis = p["全国"] * 1000 - f["close"]
+        L.append("")
+        L.append("## 六、期货端")
+        L.append("")
+        L.append("| 指标 | 数值 |")
+        L.append("|---|---|")
+        L.append(f"| {f['ct']} 收盘（{f['date']}） | {f['close']:,.0f} 元/吨 |")
+        L.append(f"| 较前日 | {f['chg']:+,.0f}（{f['chg_pct']:+.2f}%） |")
+        L.append(f"| 持仓量 | {f['hold']:,.0f} 手 |" if f['hold'] else "| 持仓量 | — |")
+        L.append(f"| 成交量 | {f['volume']:,.0f} 手 |")
+        L.append(f"| 基差（现货全国×1000−期货） | {basis:+,.0f} 元/吨 |")
+    L.append("")
+    L.append("## 七、结论")
+    L.append("")
+    L.append("（请在此填写您的分析结论与期货建议）")
+    return "\n".join(L)
 
-    def tbl(data, colw, header_bg='#2E86AB'):
-        t = Table(data, colWidths=colw, repeatRows=1)
-        t.setStyle(TableStyle([
-            ('FONTNAME', (0, 0), (-1, -1), 'SimHei'), ('FONTSIZE', (0, 0), (-1, -1), 9),
-            ('BACKGROUND', (0, 0), (-1, 0), HexColor(header_bg)), ('TEXTCOLOR', (0, 0), (-1, 0), HexColor('#ffffff')),
-            ('ALIGN', (1, 0), (-1, -1), 'CENTER'), ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
-            ('GRID', (0, 0), (-1, -1), 0.5, HexColor('#cccccc')),
-            ('ROWBACKGROUNDS', (0, 1), (-1, -1), [HexColor('#ffffff'), HexColor('#f4f7fa')]),
-            ('TOPPADDING', (0, 0), (-1, -1), 4), ('BOTTOMPADDING', (0, 0), (-1, -1), 4)]))
-        return t
+
+def _md_inline(text, style):
+    """处理 **加粗** 并返回 Paragraph。"""
+    html = ""
+    for i, seg in enumerate(text.split("**")):
+        html += f"<b>{seg}</b>" if i % 2 == 1 else seg
+    return Paragraph(html, style)
+
+
+def _md_table(rows):
+    ncol = max(len(r) for r in rows)
+    rows = [r + [""] * (ncol - len(r)) for r in rows]
+    t = Table(rows, repeatRows=1)
+    t.setStyle(TableStyle([
+        ('FONTNAME', (0, 0), (-1, -1), 'SimHei'), ('FONTSIZE', (0, 0), (-1, -1), 9),
+        ('BACKGROUND', (0, 0), (-1, 0), HexColor('#2E86AB')), ('TEXTCOLOR', (0, 0), (-1, 0), HexColor('#ffffff')),
+        ('ALIGN', (1, 0), (-1, -1), 'CENTER'), ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ('GRID', (0, 0), (-1, -1), 0.5, HexColor('#cccccc')),
+        ('ROWBACKGROUNDS', (0, 1), (-1, -1), [HexColor('#ffffff'), HexColor('#f4f7fa')]),
+        ('TOPPADDING', (0, 0), (-1, -1), 4), ('BOTTOMPADDING', (0, 0), (-1, -1), 4)]))
+    return t
+
+
+def markdown_to_pdf(md_text):
+    """把 Markdown 文本转成 PDF bytes（支持 # ## 表格 - 列表 > 引用 **加粗**）。"""
+    _font()
+    h1 = ParagraphStyle('h1', fontName='SimHei', fontSize=18, leading=24, alignment=TA_CENTER,
+                        textColor=HexColor('#1a1a2e'), spaceAfter=8)
+    h2 = ParagraphStyle('h2', fontName='SimHei', fontSize=12.5, leading=17, textColor=HexColor('#2c3e50'),
+                        spaceBefore=10, spaceAfter=5)
+    body = ParagraphStyle('body', fontName='SimHei', fontSize=10, leading=16, textColor=HexColor('#333333'))
+    bullet = ParagraphStyle('bullet', fontName='SimHei', fontSize=10, leading=16, leftIndent=12, spaceAfter=2)
+    quote = ParagraphStyle('quote', fontName='SimHei', fontSize=8.5, leading=13, textColor=HexColor('#888888'), spaceAfter=4)
 
     buf = BytesIO()
     doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=16 * mm, rightMargin=16 * mm,
                             topMargin=14 * mm, bottomMargin=14 * mm)
-    S = []
-    p = data.get("price", {})
-    S.append(Paragraph("生猪市场周报", title))
-    S.append(Paragraph(f"数据来源：{data.get('file','涌益周度数据')}", sub))
-
-    S.append(Paragraph("一、现货价格", h))
-    S.append(tbl([['指标', '本周', '上周', '环比'],
-                  ['全国出栏均价', f"{p.get('全国'):.2f}", f"{p.get('上周'):.2f}", f"{p.get('环比',0):+.2f}%"],
-                  ['河南', f"{p.get('河南'):.2f}", '—', '—'], ['四川', f"{p.get('四川'):.2f}", '—', '—'],
-                  ['广东', f"{p.get('广东'):.2f}", '—', '—'], ['山东', f"{p.get('山东'):.2f}", '—', '—'],
-                  ['辽宁', f"{p.get('辽宁'):.2f}", '—', '—']], [70 * mm, 38 * mm, 38 * mm, 30 * mm]))
-
-    ws = data.get("weight_split", {})
-    w = data.get("weight", {})
-    S.append(Paragraph("二、出栏体重与结构", h))
-    S.append(tbl([['指标', '本周', '同期'],
-                  ['全国均重', f"{ws.get('均重'):.1f} 公斤", '—'],
-                  ['集团均重', f"{ws.get('集团'):.1f} 公斤", '—'],
-                  ['散户均重', f"{ws.get('散户'):.1f} 公斤", '—'],
-                  ['集团/散户权重', f"{ws.get('集团权重')*100:.1f}% / {ws.get('散户权重')*100:.1f}%", '—'],
-                  ['90kg以下比例', f"{w.get('90kg以下',{}).get('本周',0)*100:.2f}%", f"去年 {w.get('90kg以下',{}).get('去年',0)*100:.2f}%"],
-                  ['150kg以上比例', f"{w.get('150kg以上',{}).get('本周',0)*100:.2f}%", f"去年 {w.get('150kg以上',{}).get('去年',0)*100:.2f}%"]],
-                 [60 * mm, 55 * mm, 50 * mm]))
-
-    S.append(Paragraph("三、鲜销率 / 冻品库存 / 毛白价差", h))
-    S.append(tbl([['指标', '本周', '上周', '去年同周'],
-                  ['鲜销率', f"{data['鲜销率']['本周']*100:.2f}%", f"{data['鲜销率']['上周']*100:.2f}%", f"{data['鲜销率']['去年']*100:.2f}%"],
-                  ['冻品库存率', f"{data['冻品库存']['本周']*100:.2f}%", f"{data['冻品库存']['上周']*100:.2f}%", f"{data['冻品库存']['去年']*100:.2f}%"],
-                  ['毛白价差', f"{data['毛白价差']['本周']:.2f}", f"{data['毛白价差']['上周']:.2f}", f"{data['毛白价差']['去年']:.2f}"]],
-                 [60 * mm, 35 * mm, 35 * mm, 35 * mm]))
-
-    lc = data.get("利润对比", {})
-    bai = data.get("白条利润", {})
-    S.append(Paragraph("四、养殖利润", h))
-    S.append(tbl([['指标', '本周', '上周'],
-                  ['仔猪头均利润', f"{lc.get('仔猪'):.0f}", f"{lc.get('仔猪上周'):.0f}"],
-                  ['商品猪利润', f"{lc.get('商品猪'):.1f}", f"{lc.get('商品猪上周'):.1f}"],
-                  ['河南白条头均利润', f"{bai.get('本周'):.2f}", f"{bai.get('上周'):.2f}"]],
-                 [70 * mm, 48 * mm, 48 * mm]))
-
-    S.append(Paragraph("五、淘汰母猪 / 折扣 / 二育 / 出栏完成率", h))
-    S.append(tbl([['指标', '本周', '上周'],
-                  ['淘汰母猪价(河南)', data['淘汰母猪']['本周'], data['淘汰母猪']['上周']],
-                  ['高胎淘母折扣', f"{data['高胎折扣']['本周']*100:.2f}%", f"{data['高胎折扣']['上周']*100:.2f}%"],
-                  ['低胎母猪折扣', f"{data['低胎折扣']['本周']*100:.2f}%", f"{data['低胎折扣']['上周']*100:.2f}%"],
-                  ['二育栏舍利用率', f"{data['二育']['本周']*100:.2f}%", f"{data['二育']['上周']*100:.2f}%"],
-                  ['月度出栏完成率', f"{data['出栏完成率']['全国']*100:.1f}%", '—']],
-                 [70 * mm, 48 * mm, 48 * mm]))
-
-    if futures:
-        f = futures
-        basis = data["price"]["全国"] * 1000 - f["close"]
-        S.append(Paragraph("六、期货端", h))
-        S.append(tbl([['指标', '数值'],
-                      [f'{f["ct"]} 收盘（{f["date"]}）', f"{f['close']:,.0f} 元/吨"],
-                      ['较前日', f"{f['chg']:+,.0f}（{f['chg_pct']:+.2f}%）"],
-                      ['持仓量', f"{f['hold']:,.0f} 手" if f['hold'] else '—'],
-                      ['成交量', f"{f['volume']:,.0f} 手"],
-                      ['基差（现货全国×1000 − 期货）', f"{basis:+,.0f} 元/吨"]],
-                     [90 * mm, 70 * mm]))
-
-    S.append(Paragraph("七、期货操作结论", h))
-    for line in conclusion.split("\n"):
-        line = line.strip()
-        if line:
-            S.append(Paragraph(line, bullet))
-
-    doc.build(S)
+    story = []
+    lines = md_text.split("\n")
+    i = 0
+    while i < len(lines):
+        line = lines[i].rstrip()
+        if not line.strip():
+            i += 1
+            continue
+        if line.startswith("# "):
+            story.append(_md_inline(line[2:], h1))
+        elif line.startswith("## "):
+            story.append(_md_inline(line[3:], h2))
+        elif line.startswith("|"):
+            rows = []
+            while i < len(lines) and lines[i].strip().startswith("|"):
+                rows.append([c.strip() for c in lines[i].strip().strip("|").split("|")])
+                i += 1
+            if len(rows) >= 2 and all(set(c.replace("-", "").replace(":", "").strip()) == set() for c in rows[1]):
+                rows.pop(1)
+            if rows:
+                story.append(_md_table(rows))
+            continue
+        elif line.startswith("- "):
+            story.append(_md_inline(line[2:], bullet))
+        elif line.startswith("> "):
+            story.append(_md_inline(line[2:], quote))
+        else:
+            story.append(_md_inline(line, body))
+        i += 1
+    doc.build(story)
     return buf.getvalue()
 
 
@@ -353,16 +401,13 @@ if futures:
     basis = p["全国"] * 1000 - futures["close"]
     c5.metric(f"{futures['ct']} 收盘", f"{futures['close']:,.0f}", f"基差 {basis:+,.0f}")
 
-st.markdown("### 编辑结论（可自行修改）")
-default_conclusion = """1. 短期：现货端关注价格持续性，期货端关注基差与资金动向，建议震荡思路、不追高。
-2. 中期：结合旺季消费预期与冻品库存/大猪供应压力，把握基差回归或趋势机会。
-3. 产业套保：养殖端深度亏损，建议在期货升水较大时逢高分批卖出保值。
-
-⚠️ 风险提示：旺季消费不及预期、冻品库存高位、出栏体重偏高导致的供应后置。本结论仅供参考，不构成投资建议。"""
-conclusion = st.text_area("结论内容（每条一行，生成 PDF 时逐条展示）", value=default_conclusion, height=200)
+st.markdown("### 编辑周报（全文可自行修改）")
+default_md = generate_markdown(data, futures)
+md_text = st.text_area("周报内容（Markdown 格式，可改标题/数据/结论，生成 PDF 时按此内容输出）",
+                       value=default_md, height=520)
 
 if st.button("📄 生成 PDF", type="primary", use_container_width=True):
     with st.spinner("生成 PDF…"):
-        pdf_bytes = build_pdf(data, futures, conclusion)
+        pdf_bytes = markdown_to_pdf(md_text)
     st.download_button("⬇️ 下载 PDF", data=pdf_bytes, file_name="生猪周报.pdf", mime="application/pdf",
                        use_container_width=True)
