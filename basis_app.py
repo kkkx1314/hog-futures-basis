@@ -3337,14 +3337,32 @@ def _compute_momentum_anomaly(fut_df, ct: str, ltd_ts) -> dict:
         detail_rows = []
         tbl = df.iloc[max(0, cur - 19):cur + 1]
         net_map = {d["date"]: d["status"] for d in divergence_series}
+        net_pos_map = {d["date"]: d["net_position"] for d in divergence_series}
+        # 每日前20多空合计（从本地缓存读取，不触发 API）
+        long_short_map = {}
+        for _, _r in tbl.iterrows():
+            try:
+                _ds = pd.Timestamp(_r["date"]).strftime("%Y%m%d")
+                _f = HOLDINGS_DIR / f"{ct}_{_ds}.csv"
+                if _f.exists():
+                    _hdf = pd.read_csv(_f)
+                    if "long" in _hdf.columns and "short" in _hdf.columns:
+                        long_short_map[_r["date"]] = (int(_hdf["long"].sum()), int(_hdf["short"].sum()))
+            except Exception:
+                pass
         for _, r in tbl.iterrows():
             pct = None
             if not pd.isna(r["oi_prev"]) and r["oi_prev"] > 0 and not pd.isna(r["oi_chg"]):
                 pct = float(r["oi_chg"] / r["oi_prev"] * 100)
             ratio_v = r["momentum_ratio"]
+            _ls = long_short_map.get(r["date"])
+            _net = (_ls[0] - _ls[1]) if _ls else net_pos_map.get(r["date"])
             detail_rows.append({
                 "date": r["date"],
                 "close": float(r["close"]) if pd.notna(r["close"]) else None,
+                "long": _ls[0] if _ls else None,
+                "short": _ls[1] if _ls else None,
+                "net": _net,
                 "oi": float(r["oi"]) if pd.notna(r["oi"]) else None,
                 "oi_chg_pct": pct,
                 "ratio": None if pd.isna(ratio_v) else (float(ratio_v) if not np.isinf(ratio_v) else "∞"),
@@ -3466,7 +3484,7 @@ def _render_momentum_anomaly(anomaly: dict, ct: str, td):
                           annotation_text="0.3 阈值", annotation_font_color="#E74C3C")
         fig_mom.update_layout(
             title=f"{ct} 持仓动能比（近20交易日）｜当前：{anomaly['momentum_ratio_label']}",
-            xaxis_title="日期", yaxis_title="动能比",
+            xaxis=dict(title="日期", tickformat="%m月%d日"), yaxis_title="动能比",
             template="plotly_white", height=360, hovermode="x unified",
             legend=dict(orientation="h", y=1.12, x=0))
         st.plotly_chart(fig_mom, use_container_width=True)
@@ -3488,7 +3506,7 @@ def _render_momentum_anomaly(anomaly: dict, ct: str, td):
             hovertemplate="<b>%{x|%Y年%m月%d日}</b><br>净持仓：%{y:+,}<extra></extra>"))
         fig_div.update_layout(
             title=f"{ct} 前20净持仓与价格（背离分析）",
-            xaxis=dict(title="日期"),
+            xaxis=dict(title="日期", tickformat="%m月%d日"),
             yaxis=dict(title="收盘价（元/吨）", side="left", showgrid=True),
             yaxis2=dict(title="净持仓（手）", side="right", overlaying="y", showgrid=False),
             template="plotly_white", height=360, hovermode="x unified",
@@ -3508,18 +3526,23 @@ def _render_momentum_anomaly(anomaly: dict, ct: str, td):
     if rows:
         tbl = pd.DataFrame(rows)
         tbl = tbl.rename(columns={
-            "date": "日期", "close": "收盘价", "oi": "持仓量",
+            "date": "日期", "close": "收盘价", "long": "多单", "short": "空单",
+            "net": "净持仓", "oi": "持仓量",
             "oi_chg_pct": "持仓变化率%", "ratio": "持仓动能比",
             "state": "量价状态", "divergence": "背离状态"})
         tbl["日期"] = tbl["日期"].apply(lambda d: _cn(d) if d is not None else "—")
         tbl["收盘价"] = tbl["收盘价"].apply(lambda x: f"{x:,.0f}" if pd.notna(x) else "—")
+        tbl["多单"] = tbl["多单"].apply(lambda x: f"{x:,}" if pd.notna(x) else "—")
+        tbl["空单"] = tbl["空单"].apply(lambda x: f"{x:,}" if pd.notna(x) else "—")
+        tbl["净持仓"] = tbl["净持仓"].apply(lambda x: f"{x:+,}" if pd.notna(x) else "—")
         tbl["持仓量"] = tbl["持仓量"].apply(lambda x: f"{x:,.0f}" if pd.notna(x) else "—")
         tbl["持仓变化率%"] = tbl["持仓变化率%"].apply(
             lambda x: f"{x:+.2f}" if x is not None else "—")
         tbl["持仓动能比"] = tbl["持仓动能比"].apply(
             lambda x: "∞" if x == "∞" else (f"{x:.2f}" if pd.notna(x) else "—"))
-
-        st.dataframe(tbl, use_container_width=True, hide_index=True)
+        col_order = ["日期", "收盘价", "多单", "空单", "净持仓", "持仓量",
+                     "持仓变化率%", "持仓动能比", "量价状态", "背离状态"]
+        st.dataframe(tbl[col_order], use_container_width=True, hide_index=True)
     else:
         st.caption("📋 明细数据不足")
 
@@ -4335,16 +4358,12 @@ def tab6():
         # net_data_full 已由 _build_vol_oi_seasonal_cached 缓存返回，只需按日期范围筛选
         st.markdown("#### 🏢 前20净持仓季节性对比")
 
-        net_data: Dict[str, pd.DataFrame] = {}
-        if net_data_full:
-            ref_start = pd.Timestamp(year=2020, month=sd.month, day=sd.day)
-            ref_end = pd.Timestamp(year=2020, month=ed.month, day=ed.day)
-            for label, ndf in net_data_full.items():
-                if ndf.empty: continue
-                mask = (ndf["plot_date"] >= ref_start) & (ndf["plot_date"] <= ref_end)
-                fdf = ndf[mask]
-                if not fdf.empty:
-                    net_data[label] = fdf
+        # 前20净持仓季节性对比应展示完整年度季节周期（1-12月），不再按所选日期范围
+        # 的“月-日”区间裁剪——否则当数据最早日期落在年中(如7月)时，会把1-6月的数据全砍掉。
+        net_data: Dict[str, pd.DataFrame] = {
+            label: ndf for label, ndf in (net_data_full or {}).items()
+            if ndf is not None and not ndf.empty
+        }
 
         if net_data:
             fig_net = go.Figure()
@@ -4413,8 +4432,11 @@ def _cached_fetch_holdings(ct: str, date_str: str) -> Optional[pd.DataFrame]:
 
 
 def _fetch_exact_holdings(ct: str, date_str: str, use_fallback: bool = True) -> Optional[pd.DataFrame]:
-    # 走缓存
-    return _cached_fetch_holdings(ct, date_str)
+    if use_fallback:
+        return _cached_fetch_holdings(ct, date_str)
+    # use_fallback=False（如 _download_net_single 净持仓同步）要求精确日期，
+    # 不能向前回退，否则会把前一日持仓数据错标成当前日期写入 net_agg。
+    return _fetch_exact_holdings_raw(ct, date_str, use_fallback=False)
 
 
 def _fetch_exact_holdings_raw(ct: str, date_str: str, use_fallback: bool = True) -> Optional[pd.DataFrame]:
@@ -5095,189 +5117,8 @@ def tab7():
         fig_kline.update_yaxes(autorange=True)
         st.plotly_chart(fig_kline, use_container_width=True)
 
-        # ── 技术分析结论卡片（含压力支撑）──
-        latest_row = df.iloc[-1]
-        prev_row = df.iloc[-2] if len(df) > 1 else latest_row
-
-        # 趋势判断
-        ma5_v = latest_row.get("ma5", np.nan); ma10_v = latest_row.get("ma10", np.nan)
-        ma20_v = latest_row.get("ma20", np.nan); ma60_v = latest_row.get("ma60", np.nan)
-        if pd.notna(ma5_v) and pd.notna(ma10_v) and pd.notna(ma20_v) and pd.notna(ma60_v):
-            if ma5_v > ma10_v > ma20_v > ma60_v:
-                trend_text = "均线多头排列（MA5>MA10>MA20>MA60），趋势偏强"
-                trend_signal = "bullish"
-            elif ma5_v < ma10_v < ma20_v < ma60_v:
-                trend_text = "均线空头排列（MA5<MA10<MA20<MA60），趋势偏弱"
-                trend_signal = "bearish"
-            elif ma20_v > ma60_v:
-                trend_text = "中长期均线（MA20/MA60）多头排列，短期震荡"
-                trend_signal = "neutral_bullish"
-            elif ma20_v < ma60_v:
-                trend_text = "中长期均线（MA20/MA60）空头排列，短期震荡"
-                trend_signal = "neutral_bearish"
-            else:
-                trend_text = "均线交织，趋势不明朗，处于震荡格局"
-                trend_signal = "neutral"
-        else:
-            trend_text = "均线数据不足，暂无法判断趋势"
-            trend_signal = "neutral"
-
-        # MACD 信号
-        dif_v = latest_row.get("dif", np.nan); dea_v = latest_row.get("dea", np.nan)
-        hist_v = latest_row.get("macd_hist", np.nan)
-        prev_dif = prev_row.get("dif", np.nan); prev_dea = prev_row.get("dea", np.nan)
-        prev_hist = prev_row.get("macd_hist", np.nan)
-        if pd.notna(dif_v) and pd.notna(dea_v) and pd.notna(hist_v):
-            if pd.notna(prev_dif) and pd.notna(prev_dea):
-                if prev_dif <= prev_dea and dif_v > dea_v:
-                    macd_text = "金叉形成（DIF上穿DEA），看涨信号"
-                    macd_signal = "bullish"
-                elif prev_dif >= prev_dea and dif_v < dea_v:
-                    macd_text = "死叉形成（DIF下穿DEA），看跌信号"
-                    macd_signal = "bearish"
-                elif dif_v > dea_v:
-                    if pd.notna(prev_hist) and hist_v > prev_hist:
-                        macd_text = "金叉延续，红柱放大，动能增强"
-                    elif pd.notna(prev_hist) and hist_v < prev_hist:
-                        macd_text = "金叉延续，红柱缩短，动能减弱"
-                    else:
-                        macd_text = "金叉延续，DIF在DEA上方运行"
-                    macd_signal = "bullish"
-                else:
-                    if pd.notna(prev_hist) and hist_v < prev_hist:
-                        macd_text = "死叉延续，绿柱放大，动能增强"
-                    elif pd.notna(prev_hist) and hist_v > prev_hist:
-                        macd_text = "死叉延续，绿柱缩短，动能减弱"
-                    else:
-                        macd_text = "死叉延续，DIF在DEA下方运行"
-                    macd_signal = "bearish"
-            else:
-                macd_text = "DIF在DEA上方" if dif_v > dea_v else "DIF在DEA下方"
-                macd_signal = "bullish" if dif_v > dea_v else "bearish"
-        else:
-            macd_text = "MACD数据不足"
-            macd_signal = "neutral"
-
-        # RSI 状态
-        rsi_v = latest_row.get("rsi14", np.nan)
-        if pd.notna(rsi_v):
-            if rsi_v > 70:
-                rsi_text = f"RSI14={rsi_v:.1f}，处于超买区域（>70），注意回调风险"
-                rsi_signal = "bearish"
-            elif rsi_v < 30:
-                rsi_text = f"RSI14={rsi_v:.1f}，处于超卖区域（<30），反弹概率增大"
-                rsi_signal = "bullish"
-            else:
-                rsi_text = f"RSI14={rsi_v:.1f}，处于中性区间（30-70）"
-                rsi_signal = "neutral"
-        else:
-            rsi_text = "RSI数据不足"
-            rsi_signal = "neutral"
-
-        # 布林带位置
-        close_v = float(latest_row["close"]); bb_up = latest_row.get("bb_up", np.nan)
-        bb_mid = latest_row.get("bb_mid", np.nan); bb_low = latest_row.get("bb_low", np.nan)
-        if pd.notna(bb_up) and pd.notna(bb_mid) and pd.notna(bb_low):
-            bb_width_pct = (bb_up - bb_low) / bb_mid * 100 if bb_mid > 0 else 0
-            if close_v > bb_up:
-                bb_text = f"价格突破布林上轨（{bb_up:.0f}），超强格局，开口宽度{bb_width_pct:.1f}%"
-                bb_signal = "bullish"
-            elif close_v > bb_mid:
-                pct = (close_v - bb_mid) / (bb_up - bb_mid) * 100 if bb_up > bb_mid else 0
-                bb_text = f"价格运行于中轨与上轨之间（{pct:.0f}%位置），偏强格局"
-                bb_signal = "bullish"
-            elif close_v > bb_low:
-                pct = (close_v - bb_low) / (bb_mid - bb_low) * 100 if bb_mid > bb_low else 0
-                bb_text = f"价格运行于中轨与下轨之间（{pct:.0f}%位置），偏弱格局"
-                bb_signal = "bearish"
-            else:
-                bb_text = f"价格跌破布林下轨（{bb_low:.0f}），超弱格局"
-                bb_signal = "bearish"
-        else:
-            bb_text = "布林带数据不足"
-            bb_signal = "neutral"
-
-        # ── ATR 波动率 ──
-        atr_v = latest_row.get("atr14", np.nan); atr_pct = latest_row.get("atr_pct", np.nan)
-        if pd.notna(atr_v) and pd.notna(atr_pct):
-            atr_text = f"ATR14={atr_v:.0f}({atr_pct:.1f}%)，{'波动剧烈' if atr_pct > 2 else '波动正常'}"
-        else:
-            atr_text = "数据不足"
-
-        # ── OBV 量能 ──
-        obv_v = latest_row.get("obv", np.nan); obv_ma5 = latest_row.get("obv_ma5", np.nan)
-        obv_signal = "neutral"
-        if pd.notna(obv_v) and pd.notna(obv_ma5) and len(df) >= 10:
-            obv_trend = obv_v - df["obv"].iloc[-10] if not pd.isna(df["obv"].iloc[-10]) else 0
-            if obv_v > obv_ma5 and obv_trend > 0:
-                obv_text = "OBV上行，量价配合，资金流入"
-                obv_signal = "bullish"
-            elif obv_v < obv_ma5 and obv_trend < 0:
-                obv_text = "OBV下行，量价背离，资金流出"
-                obv_signal = "bearish"
-            else:
-                obv_text = "OBV平稳，量能中性"
-        else:
-            obv_text = "数据不足"
-
-        # ── WR 威廉指标 ──
-        wr_v = latest_row.get("wr14", np.nan)
-        wr_signal = "neutral"
-        if pd.notna(wr_v):
-            if wr_v > -20:
-                wr_text = f"WR={wr_v:.0f}，超买"
-                wr_signal = "bearish"
-            elif wr_v < -80:
-                wr_text = f"WR={wr_v:.0f}，超卖"
-                wr_signal = "bullish"
-            else:
-                wr_text = f"WR={wr_v:.0f}，正常"
-        else:
-            wr_text = "数据不足"
-
-        # ── CCI 商品通道 ──
-        cci_v = latest_row.get("cci20", np.nan)
-        cci_signal = "neutral"
-        if pd.notna(cci_v):
-            if cci_v > 200:
-                cci_text = f"CCI={cci_v:.0f}，极度超买"
-                cci_signal = "bullish_extreme"
-            elif cci_v > 100:
-                cci_text = f"CCI={cci_v:.0f}，偏多"
-                cci_signal = "bullish"
-            elif cci_v < -200:
-                cci_text = f"CCI={cci_v:.0f}，极度超卖"
-                cci_signal = "bearish_extreme"
-            elif cci_v < -100:
-                cci_text = f"CCI={cci_v:.0f}，偏空"
-                cci_signal = "bearish"
-            else:
-                cci_text = f"CCI={cci_v:.0f}，中性"
-        else:
-            cci_text = "数据不足"
-
-        # ── 综合判断（多指标交叉验证）──
-        signals = [trend_signal, macd_signal, rsi_signal, bb_signal, obv_signal, wr_signal, cci_signal]
-        bull_count = sum(1 for s in signals if "bullish" in str(s))
-        bear_count = sum(1 for s in signals if "bearish" in str(s))
-        # extreme 信号加权
-        bull_count += sum(2 for s in signals if "bullish_extreme" in str(s))
-        bear_count += sum(2 for s in signals if "bearish_extreme" in str(s))
-        if bull_count >= 3 and bear_count <= 1:
-            direction = "偏多"
-            direction_sentiment = "bullish"
-        elif bear_count >= 3 and bull_count <= 1:
-            direction = "偏空"
-            direction_sentiment = "bearish"
-        elif bull_count >= 2 and bear_count <= 1:
-            direction = "中性偏多"
-            direction_sentiment = "bullish"
-        elif bear_count >= 2 and bull_count <= 1:
-            direction = "中性偏空"
-            direction_sentiment = "bearish"
-        else:
-            direction = "中性"
-            direction_sentiment = "neutral"
+        # ── 技术分析结论卡片（含压力支撑）—— 复用 _technical_conclusion，与日报口径一致 ──
+        tc = _technical_conclusion(df)
 
         # 构建压力/支撑位文字
         res_parts = []
@@ -5292,19 +5133,19 @@ def tab7():
 
         # 使用统一结论组件
         tech_items = [
-            f"趋势：{trend_text}",
-            f"MACD：{macd_text}",
-            f"RSI：{rsi_text}",
-            f"布林带：{bb_text}",
-            f"波动率：{atr_text}",
-            f"量能(OBV)：{obv_text}",
-            f"威廉(WR)：{wr_text}",
-            f"商品通道(CCI)：{cci_text}",
+            f"趋势：{tc['trend_text']}",
+            f"MACD：{tc['macd_text']}",
+            f"RSI：{tc['rsi_text']}",
+            f"布林带：{tc['bb_text']}",
+            f"波动率：{tc['atr_text']}",
+            f"量能(OBV)：{tc['obv_text']}",
+            f"威廉(WR)：{tc['wr_text']}",
+            f"商品通道(CCI)：{tc['cci_text']}",
             f"压力位：{res_str}",
             f"支撑位：{sup_str}",
-            f"综合判断：{direction}（{bull_count}多 vs {bear_count}空，7指标交叉验证）",
+            f"综合判断：{tc['direction']}（{tc['bull_count']}多 vs {tc['bear_count']}空，7指标交叉验证）",
         ]
-        display_conclusion(f"📊 技术分析结论（{ct}）", tech_items, direction_sentiment)
+        display_conclusion(f"📊 技术分析结论（{ct}）", tech_items, tc['direction_sentiment'])
 
         # ── 三个副图（共享 X 轴）──
         # MACD
@@ -5789,7 +5630,7 @@ def _build_daily_report_html(main_ct: str, fut_df, spot_dict, ltd, prev_td,
         pos_card_html = f"""
         <!-- 5. 前20净持仓分析 -->
         <div class="card">
-        <h2><span class="icon">🏢</span>前20净持仓分析（{ha_date_cn if ha_date_cn else '—'}）</h2>
+        <h2><span class="icon">🏢</span>前20净持仓分析（{ha_date_cn if ha_date_cn else '—'}）{'<span style="font-size:0.78rem;color:#E67E22;">（T+1发布，数据为最近可用交易日）</span>' if ha.get('data_stale') else ''}</h2>
         {pos_section}
         </div>"""
     else:
@@ -5837,7 +5678,8 @@ def _build_daily_report_html(main_ct: str, fut_df, spot_dict, ltd, prev_td,
 
     # ── 量价状态卡片 ──
     anomaly_card_html = _momentum_anomaly_html(momentum_anomaly, cn_date,
-                                               ha.get('total_long'), ha.get('total_short'))
+                                               (momentum_anomaly or {}).get('total_long'),
+                                               (momentum_anomaly or {}).get('total_short'))
 
     # ── 构建 HTML ──
     html = f"""
@@ -5993,7 +5835,8 @@ def _build_daily_report_md(main_ct, fut_df, spot_dict, ltd, prev_td,
     res_str = "、".join(sr_lines_info.get("resistances", ["暂无"])) if sr_lines_info else "暂无"
     sup_str = "、".join(sr_lines_info.get("supports", ["暂无"])) if sr_lines_info else "暂无"
 
-    anomaly_section = _momentum_anomaly_md(momentum_anomaly, ha.get('total_long'), ha.get('total_short'))
+    anomaly_section = _momentum_anomaly_md(momentum_anomaly, (momentum_anomaly or {}).get('total_long'),
+                                           (momentum_anomaly or {}).get('total_short'))
 
     md = f"""# 🐷 生猪期货每日分析报告
 
@@ -6240,9 +6083,12 @@ def _compute_daily_report_cache(main_ct: str, spot_hash: int, _version: int = 0,
             holdings_date_match = True
     except Exception:
         pass
-    if holdings_date_match:
+    if holdings_df is not None and not holdings_df.empty:
         holdings_analysis = _analyze_holdings_for_report(
             holdings_df, main_ct, ltd_ts, holdings_actual_date)
+        if not holdings_date_match:
+            # 持仓排名 T+1 发布，数据日期落后于报告日期——仍展示真实多空合计，标注数据日期
+            holdings_analysis["data_stale"] = True
     else:
         holdings_analysis = {"available": False, "data_date": str(holdings_actual_date)[:8] if holdings_actual_date else _cn(ltd_ts),
                             "total_long": 0, "total_short": 0, "net_pos": 0,
@@ -6701,121 +6547,187 @@ def _deviation_level(deviation):
         return f"<span class=\"tag tag-neutral\">处于</span>历史同期均值附近（偏离{deviation:+.0f}%）"
 
 
+def _technical_conclusion(df_tech: pd.DataFrame) -> dict:
+    """从 calculate_technicals 输出计算技术分析文字结论（Tab8 与日报共用，保证两处口径一致）。
+    返回各指标文本/信号与综合方向。"""
+    latest_row = df_tech.iloc[-1]
+    prev_row = df_tech.iloc[-2] if len(df_tech) > 1 else latest_row
+
+    # ── 趋势（MA5/10/20/60）──
+    ma5_v = latest_row.get("ma5", np.nan); ma10_v = latest_row.get("ma10", np.nan)
+    ma20_v = latest_row.get("ma20", np.nan); ma60_v = latest_row.get("ma60", np.nan)
+    if pd.notna(ma5_v) and pd.notna(ma10_v) and pd.notna(ma20_v) and pd.notna(ma60_v):
+        if ma5_v > ma10_v > ma20_v > ma60_v:
+            trend_text = "均线多头排列（MA5>MA10>MA20>MA60），趋势偏强"; trend_signal = "bullish"
+        elif ma5_v < ma10_v < ma20_v < ma60_v:
+            trend_text = "均线空头排列（MA5<MA10<MA20<MA60），趋势偏弱"; trend_signal = "bearish"
+        elif ma20_v > ma60_v:
+            trend_text = "中长期均线（MA20/MA60）多头排列，短期震荡"; trend_signal = "neutral_bullish"
+        elif ma20_v < ma60_v:
+            trend_text = "中长期均线（MA20/MA60）空头排列，短期震荡"; trend_signal = "neutral_bearish"
+        else:
+            trend_text = "均线交织，趋势不明朗，处于震荡格局"; trend_signal = "neutral"
+    else:
+        trend_text = "均线数据不足，暂无法判断趋势"; trend_signal = "neutral"
+
+    # ── MACD ──
+    dif_v = latest_row.get("dif", np.nan); dea_v = latest_row.get("dea", np.nan)
+    hist_v = latest_row.get("macd_hist", np.nan)
+    prev_dif = prev_row.get("dif", np.nan); prev_dea = prev_row.get("dea", np.nan)
+    prev_hist = prev_row.get("macd_hist", np.nan)
+    if pd.notna(dif_v) and pd.notna(dea_v) and pd.notna(hist_v):
+        if pd.notna(prev_dif) and pd.notna(prev_dea):
+            if prev_dif <= prev_dea and dif_v > dea_v:
+                macd_text = "金叉形成（DIF上穿DEA），看涨信号"; macd_signal = "bullish"
+            elif prev_dif >= prev_dea and dif_v < dea_v:
+                macd_text = "死叉形成（DIF下穿DEA），看跌信号"; macd_signal = "bearish"
+            elif dif_v > dea_v:
+                if pd.notna(prev_hist) and hist_v > prev_hist:
+                    macd_text = "金叉延续，红柱放大，动能增强"
+                elif pd.notna(prev_hist) and hist_v < prev_hist:
+                    macd_text = "金叉延续，红柱缩短，动能减弱"
+                else:
+                    macd_text = "金叉延续，DIF在DEA上方运行"
+                macd_signal = "bullish"
+            else:
+                if pd.notna(prev_hist) and hist_v < prev_hist:
+                    macd_text = "死叉延续，绿柱放大，动能增强"
+                elif pd.notna(prev_hist) and hist_v > prev_hist:
+                    macd_text = "死叉延续，绿柱缩短，动能减弱"
+                else:
+                    macd_text = "死叉延续，DIF在DEA下方运行"
+                macd_signal = "bearish"
+        else:
+            macd_text = "DIF在DEA上方" if dif_v > dea_v else "DIF在DEA下方"
+            macd_signal = "bullish" if dif_v > dea_v else "bearish"
+    else:
+        macd_text = "MACD数据不足"; macd_signal = "neutral"
+
+    # ── RSI ──
+    rsi_v = latest_row.get("rsi14", np.nan)
+    if pd.notna(rsi_v):
+        if rsi_v > 70:
+            rsi_text = f"RSI14={rsi_v:.1f}，处于超买区域（>70），注意回调风险"; rsi_signal = "bearish"
+        elif rsi_v < 30:
+            rsi_text = f"RSI14={rsi_v:.1f}，处于超卖区域（<30），反弹概率增大"; rsi_signal = "bullish"
+        else:
+            rsi_text = f"RSI14={rsi_v:.1f}，处于中性区间（30-70）"; rsi_signal = "neutral"
+    else:
+        rsi_text = "RSI数据不足"; rsi_signal = "neutral"
+
+    # ── 布林带 ──
+    close_v = float(latest_row["close"]); bb_up = latest_row.get("bb_up", np.nan)
+    bb_mid = latest_row.get("bb_mid", np.nan); bb_low = latest_row.get("bb_low", np.nan)
+    if pd.notna(bb_up) and pd.notna(bb_mid) and pd.notna(bb_low):
+        bb_width_pct = (bb_up - bb_low) / bb_mid * 100 if bb_mid > 0 else 0
+        if close_v > bb_up:
+            bb_text = f"价格突破布林上轨（{bb_up:.0f}），超强格局，开口宽度{bb_width_pct:.1f}%"; bb_signal = "bullish"
+        elif close_v > bb_mid:
+            pct = (close_v - bb_mid) / (bb_up - bb_mid) * 100 if bb_up > bb_mid else 0
+            bb_text = f"价格运行于中轨与上轨之间（{pct:.0f}%位置），偏强格局"; bb_signal = "bullish"
+        elif close_v > bb_low:
+            pct = (close_v - bb_low) / (bb_mid - bb_low) * 100 if bb_mid > bb_low else 0
+            bb_text = f"价格运行于中轨与下轨之间（{pct:.0f}%位置），偏弱格局"; bb_signal = "bearish"
+        else:
+            bb_text = f"价格跌破布林下轨（{bb_low:.0f}），超弱格局"; bb_signal = "bearish"
+    else:
+        bb_text = "布林带数据不足"; bb_signal = "neutral"
+
+    # ── ATR ──
+    atr_v = latest_row.get("atr14", np.nan); atr_pct = latest_row.get("atr_pct", np.nan)
+    atr_text = (f"ATR14={atr_v:.0f}({atr_pct:.1f}%)，{'波动剧烈' if atr_pct > 2 else '波动正常'}"
+                if pd.notna(atr_v) and pd.notna(atr_pct) else "数据不足")
+
+    # ── OBV ──
+    obv_v = latest_row.get("obv", np.nan); obv_ma5 = latest_row.get("obv_ma5", np.nan)
+    obv_signal = "neutral"
+    if pd.notna(obv_v) and pd.notna(obv_ma5) and len(df_tech) >= 10:
+        obv_trend = obv_v - df_tech["obv"].iloc[-10] if not pd.isna(df_tech["obv"].iloc[-10]) else 0
+        if obv_v > obv_ma5 and obv_trend > 0:
+            obv_text = "OBV上行，量价配合，资金流入"; obv_signal = "bullish"
+        elif obv_v < obv_ma5 and obv_trend < 0:
+            obv_text = "OBV下行，量价背离，资金流出"; obv_signal = "bearish"
+        else:
+            obv_text = "OBV平稳，量能中性"
+    else:
+        obv_text = "数据不足"
+
+    # ── WR ──
+    wr_v = latest_row.get("wr14", np.nan); wr_signal = "neutral"
+    if pd.notna(wr_v):
+        if wr_v > -20:
+            wr_text = f"WR={wr_v:.0f}，超买"; wr_signal = "bearish"
+        elif wr_v < -80:
+            wr_text = f"WR={wr_v:.0f}，超卖"; wr_signal = "bullish"
+        else:
+            wr_text = f"WR={wr_v:.0f}，正常"
+    else:
+        wr_text = "数据不足"
+
+    # ── CCI ──
+    cci_v = latest_row.get("cci20", np.nan); cci_signal = "neutral"
+    if pd.notna(cci_v):
+        if cci_v > 200:
+            cci_text = f"CCI={cci_v:.0f}，极度超买"; cci_signal = "bullish_extreme"
+        elif cci_v > 100:
+            cci_text = f"CCI={cci_v:.0f}，偏多"; cci_signal = "bullish"
+        elif cci_v < -200:
+            cci_text = f"CCI={cci_v:.0f}，极度超卖"; cci_signal = "bearish_extreme"
+        elif cci_v < -100:
+            cci_text = f"CCI={cci_v:.0f}，偏空"; cci_signal = "bearish"
+        else:
+            cci_text = f"CCI={cci_v:.0f}，中性"
+    else:
+        cci_text = "数据不足"
+
+    # ── 综合判断（7 指标交叉验证）──
+    signals = [trend_signal, macd_signal, rsi_signal, bb_signal, obv_signal, wr_signal, cci_signal]
+    bull_count = sum(1 for s in signals if "bullish" in str(s))
+    bear_count = sum(1 for s in signals if "bearish" in str(s))
+    bull_count += sum(2 for s in signals if "bullish_extreme" in str(s))
+    bear_count += sum(2 for s in signals if "bearish_extreme" in str(s))
+    if bull_count >= 3 and bear_count <= 1:
+        direction = "偏多"; direction_sentiment = "bullish"
+    elif bear_count >= 3 and bull_count <= 1:
+        direction = "偏空"; direction_sentiment = "bearish"
+    elif bull_count >= 2 and bear_count <= 1:
+        direction = "中性偏多"; direction_sentiment = "bullish"
+    elif bear_count >= 2 and bull_count <= 1:
+        direction = "中性偏空"; direction_sentiment = "bearish"
+    else:
+        direction = "中性"; direction_sentiment = "neutral"
+
+    return {
+        "trend_text": trend_text, "macd_text": macd_text, "rsi_text": rsi_text,
+        "bb_text": bb_text, "atr_text": atr_text, "obv_text": obv_text,
+        "wr_text": wr_text, "cci_text": cci_text,
+        "direction": direction, "direction_sentiment": direction_sentiment,
+        "bull_count": bull_count, "bear_count": bear_count,
+        "trend_signal": trend_signal, "macd_signal": macd_signal,
+        "rsi_signal": rsi_signal, "bb_signal": bb_signal,
+        "obv_signal": obv_signal, "wr_signal": wr_signal, "cci_signal": cci_signal,
+    }
+
+
 def _quick_technical(fut_df, ltd) -> Tuple[str, dict]:
     """快速技术分析：趋势 + MACD/RSI/布林带 完整文字结论"""
     if fut_df is None or fut_df.empty:
         return "震荡", {"resistances": [], "supports": []}
     try:
         df = fut_df.sort_values("date").reset_index(drop=True)
-        # 计算技术指标
-        close = df["close"].astype(float)
-        high = df["high"].astype(float) if "high" in df.columns else close
-        low = df["low"].astype(float) if "low" in df.columns else close
-
-        n = len(close)
+        df, _warnings = calculate_technicals(df)
+        n = len(df)
         if n < 20:
             return "数据不足(需≥20日)", {"resistances": [], "supports": []}
 
-        cur = float(close.iloc[-1])
+        cur = float(df["close"].iloc[-1])
+        # 复用与 Tab8 技术分析完全一致的口径（MA60/ATR/OBV/WR/CCI 七指标）
+        c = _technical_conclusion(df)
+        tech_summary = f"{c['direction']} | {c['trend_text']} | {c['macd_text']} | {c['rsi_text']} | {c['bb_text']}"
 
-        # ── 均线趋势 ──
-        ma5 = close.rolling(5).mean().iloc[-1]
-        ma10 = close.rolling(10).mean().iloc[-1]
-        ma20 = close.rolling(20).mean().iloc[-1]
-        ma5_v = float(ma5) if pd.notna(ma5) else 0
-        ma10_v = float(ma10) if pd.notna(ma10) else 0
-        ma20_v = float(ma20) if pd.notna(ma20) else 0
-
-        # ── MACD ──
-        ema12 = close.ewm(span=12, adjust=False).mean()
-        ema26 = close.ewm(span=26, adjust=False).mean()
-        dif = ema12 - ema26
-        dea = dif.ewm(span=9, adjust=False).mean()
-        macd_hist = 2 * (dif - dea)
-        dif_v = float(dif.iloc[-1]); dea_v = float(dea.iloc[-1])
-        macd_v = float(macd_hist.iloc[-1])
-        dif_prev = float(dif.iloc[-2]) if n >= 2 else dif_v
-        dea_prev = float(dea.iloc[-2]) if n >= 2 else dea_v
-
-        # ── RSI14 ──
-        delta = close.diff()
-        gain = delta.clip(lower=0)
-        loss = (-delta).clip(lower=0)
-        avg_gain = gain.ewm(alpha=1/14, adjust=False).mean()
-        avg_loss = loss.ewm(alpha=1/14, adjust=False).mean()
-        rs = avg_gain / avg_loss.replace(0, np.nan)
-        rsi14_v = float((100 - (100 / (1 + rs))).iloc[-1])
-
-        # ── 布林带 ──
-        bb_mid = ma20_v
-        std20 = close.rolling(20).std().iloc[-1]
-        bb_up = bb_mid + 2 * float(std20) if pd.notna(std20) else cur * 1.05
-        bb_low = bb_mid - 2 * float(std20) if pd.notna(std20) else cur * 0.95
-        bb_width = (bb_up - bb_low) / bb_mid * 100 if bb_mid > 0 else 0
-
-        # ── 构建文字结论 ──
-        tech_lines = []
-
-        # 趋势
-        if ma5_v > ma10_v > ma20_v:
-            trend = "多头排列，趋势偏强"
-        elif ma5_v < ma10_v < ma20_v:
-            trend = "空头排列，趋势偏弱"
-        elif cur > ma20_v:
-            trend = "价格在MA20上方，短期偏多"
-        elif cur < ma20_v:
-            trend = "价格在MA20下方，短期偏空"
-        else:
-            trend = "均线交织，震荡格局"
-
-        # MACD
-        if dif_prev <= dea_prev and dif_v > dea_v:
-            macd_text = "金叉形成（DIF上穿DEA），看涨信号"
-        elif dif_prev >= dea_prev and dif_v < dea_v:
-            macd_text = "死叉形成（DIF下穿DEA），看跌信号"
-        elif dif_v > dea_v:
-            macd_text = f"DIF在DEA上方运行，{'红柱' if macd_v > 0 else '绿柱'}，{'动能增强' if abs(macd_v) > 0 else '动能减弱'}"
-        else:
-            macd_text = f"DIF在DEA下方运行，{'绿柱' if macd_v < 0 else '红柱'}，{'动能增强' if abs(macd_v) > 0 else '动能减弱'}"
-
-        # RSI
-        if rsi14_v > 70:
-            rsi_text = f"RSI={rsi14_v:.1f}，超买区域（>70），注意回调"
-        elif rsi14_v < 30:
-            rsi_text = f"RSI={rsi14_v:.1f}，超卖区域（<30），反弹概率增大"
-        else:
-            rsi_text = f"RSI={rsi14_v:.1f}，中性区间（30-70）"
-
-        # 布林带
-        if cur > bb_up:
-            bb_text = f"突破布林上轨（{bb_up:.0f}），超强格局，带宽{bb_width:.1f}%"
-        elif cur < bb_low:
-            bb_text = f"跌破布林下轨（{bb_low:.0f}），超弱格局，带宽{bb_width:.1f}%"
-        elif cur > bb_mid:
-            pct = (cur - bb_mid) / (bb_up - bb_mid) * 100 if bb_up > bb_mid else 50
-            bb_text = f"运行于中轨与上轨之间（{pct:.0f}%），偏强，带宽{bb_width:.1f}%"
-        else:
-            pct = (cur - bb_low) / (bb_mid - bb_low) * 100 if bb_mid > bb_low else 50
-            bb_text = f"运行于中轨与下轨之间（{pct:.0f}%），偏弱，带宽{bb_width:.1f}%"
-
-        # 总结方向
-        bull_score = 0; bear_score = 0
-        if "多头" in trend or "偏多" in trend: bull_score += 1
-        elif "空头" in trend or "偏空" in trend: bear_score += 1
-        if "金叉" in macd_text or "上方运行" in macd_text: bull_score += 1
-        elif "死叉" in macd_text or "下方运行" in macd_text: bear_score += 1
-        if rsi14_v < 30: bull_score += 1
-        elif rsi14_v > 70: bear_score += 1
-        if cur > bb_mid: bull_score += 1
-        elif cur < bb_mid: bear_score += 1
-
-        if bull_score >= 3: direction = "偏多"
-        elif bear_score >= 3: direction = "偏空"
-        elif bull_score > bear_score: direction = "中性偏多"
-        elif bear_score > bull_score: direction = "中性偏空"
-        else: direction = "震荡"
-
-        tech_summary = f"{direction} | {trend} | {macd_text} | {rsi_text} | {bb_text}"
+        # 布林带上下轨（供下方支撑/压力补充使用）
+        bb_up = float(df["bb_up"].iloc[-1]) if pd.notna(df["bb_up"].iloc[-1]) else cur * 1.05
+        bb_low = float(df["bb_low"].iloc[-1]) if pd.notna(df["bb_low"].iloc[-1]) else cur * 0.95
 
         # ── 支撑/压力（Fibonacci + 布林带，与 Tab8 技术分析一致，取近90日）──
         close_all = df["close"].astype(float).dropna()
