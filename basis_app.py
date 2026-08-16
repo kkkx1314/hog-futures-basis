@@ -3323,6 +3323,16 @@ def _compute_momentum_anomaly(fut_df, ct: str, ltd_ts) -> dict:
                 divergence_count = cnt
                 divergence_warning = cnt >= 3
 
+        # ── 当日 前20多空合计 ──
+        total_long = total_short = None
+        try:
+            h = _get_holdings(ct, cur_date)
+            if h is not None and not h.empty and 'long' in h.columns and 'short' in h.columns:
+                total_long = int(h['long'].sum())
+                total_short = int(h['short'].sum())
+        except Exception:
+            pass
+
         # ── 明细表（近20日） ──
         detail_rows = []
         tbl = df.iloc[max(0, cur - 19):cur + 1]
@@ -3368,6 +3378,8 @@ def _compute_momentum_anomaly(fut_df, ct: str, ltd_ts) -> dict:
             "volume_alert": volume_alert,
             "price_volume_oi": price_volume_oi,
             "price_chg_pct": price_chg_pct,
+            "total_long": total_long,
+            "total_short": total_short,
             "detail_rows": detail_rows,
         }
     except Exception:
@@ -3482,7 +3494,12 @@ def _render_momentum_anomaly(anomaly: dict, ct: str, td):
             template="plotly_white", height=360, hovermode="x unified",
             legend=dict(orientation="h", y=1.12, x=0))
         st.plotly_chart(fig_div, use_container_width=True)
-        st.caption("📐 净持仓 = 前20期货公司多单合计 − 前20空单合计；背离 = 净持仓变化方向与价格涨跌方向相反")
+        tl, ts = anomaly.get('total_long'), anomaly.get('total_short')
+        net_str = f"，净持仓 {(tl - ts):+,} 手" if (tl is not None and ts is not None) else ""
+        long_str = f"{tl:,} 手" if tl is not None else "—"
+        short_str = f"{ts:,} 手" if ts is not None else "—"
+        st.caption(f"📐 当日前20多单合计 {long_str}、空单合计 {short_str}{net_str}；"
+                   f"背离 = 净持仓变化方向与价格涨跌方向相反")
     else:
         st.caption("🏢 前20净持仓数据暂不可用，无法进行背离分析")
 
@@ -5576,8 +5593,8 @@ def _analyze_vol_oi_momentum(fut_df, ltd) -> dict:
                 "oi_decline": "计算异常", "vol_trend": "计算异常"}
 
 
-def _momentum_anomaly_html(anomaly, cn_date: str) -> str:
-    """多空动能与资金异动分析 → 日报 HTML 卡片"""
+def _momentum_anomaly_html(anomaly, cn_date: str, total_long=None, total_short=None) -> str:
+    """量价状态 → 日报 HTML 卡片"""
     if not anomaly or not anomaly.get("available"):
         return ""
     warn = ""
@@ -5607,17 +5624,27 @@ def _momentum_anomaly_html(anomaly, cn_date: str) -> str:
     oi_note = "（持仓量缺失，OI 指标暂不计算）" if anomaly.get("oi_missing") else ""
     dd = anomaly.get("data_date", "")
     dd_note = f"（数据截至 {dd}）" if dd and dd != cn_date else ""
+    # 前20净持仓情况
+    net_parts = []
+    if total_long is not None:
+        net_parts.append(f"前20多单合计 <b>{total_long:,}</b> 手")
+    if total_short is not None:
+        net_parts.append(f"前20空单合计 <b>{total_short:,}</b> 手")
+    if total_long is not None and total_short is not None:
+        net_parts.append(f"净持仓 <b>{total_long - total_short:+,}</b> 手")
+    net_parts.append(f"背离：连续 <b>{anomaly['divergence_count']}</b> 日")
+    net_info = "，".join(net_parts)
     return f"""
         <div class="card">
-        <h2><span class="icon">🚨</span>多空动能与资金异动分析（{cn_date}）<span style="font-size:0.78rem;color:#999;">{dd_note}</span></h2>
+        <h2><span class="icon">⚡</span>量价状态（{cn_date}）<span style="font-size:0.78rem;color:#999;">{dd_note}</span></h2>
         <p style="font-size:0.92rem;line-height:1.9;">
         • 量价状态：<b>{anomaly['state_label']}</b>（价格 {pchg_str}，成交量 {vchg_str}，持仓 {oi_chg_str}）{oi_note}<br>
         • 价量配合：{pvo}<br>
-        • 持仓/成交比：<b>{ovr_str}</b>（近20日均值 {ovr_20_str}，{ovr_compare}，{anomaly.get('oi_volume_ratio_desc', '—')}）<br>
-        • 成交量状态：<b>{vstate}</b>（较5日均值 {vchg_str}）{vol_alert or ''}<br>
         • 近5日状态：{seq}<br>
+        • 成交量状态：<b>{vstate}</b>（较5日均值 {vchg_str}）{vol_alert or ''}<br>
+        • 持仓/成交比：<b>{ovr_str}</b>（近20日均值 {ovr_20_str}，{ovr_compare}，{anomaly.get('oi_volume_ratio_desc', '—')}）<br>
         • 持仓动能比：<b>{ratio_str}</b>（{anomaly['momentum_ratio_label']}）<br>
-        • 前20净持仓背离：连续 <b>{anomaly['divergence_count']}</b> 日
+        • 前20净持仓情况以及背离情况：{net_info}
         </p>{warn}
         <p style="font-size:0.72rem;color:#999;line-height:1.6;border-top:1px dashed #eee;padding-top:6px;margin-top:8px;">
         计算方法：持仓变化率 = 当日持仓量变动 ÷ 前日持仓量 × 100%；<br>
@@ -5629,8 +5656,8 @@ def _momentum_anomaly_html(anomaly, cn_date: str) -> str:
         </div>"""
 
 
-def _momentum_anomaly_md(anomaly) -> str:
-    """多空动能与资金异动分析 → 日报 Markdown 板块"""
+def _momentum_anomaly_md(anomaly, total_long=None, total_short=None) -> str:
+    """量价状态 → 日报 Markdown 板块"""
     if not anomaly or not anomaly.get("available"):
         return ""
     seq = " → ".join(lbl for _d, lbl in anomaly.get("state_series", []))
@@ -5651,18 +5678,27 @@ def _momentum_anomaly_md(anomaly) -> str:
     if ovr is not None and ovr_20 is not None:
         ovr_compare = "高于均值（资金沉淀偏强）" if ovr > ovr_20 else ("低于均值（投机偏强）" if ovr < ovr_20 else "与均值持平")
     oi_note = "（持仓量缺失，OI 指标暂不计算）" if anomaly.get("oi_missing") else ""
+    net_parts = []
+    if total_long is not None:
+        net_parts.append(f"前20多单合计 **{total_long:,}** 手")
+    if total_short is not None:
+        net_parts.append(f"前20空单合计 **{total_short:,}** 手")
+    if total_long is not None and total_short is not None:
+        net_parts.append(f"净持仓 **{total_long - total_short:+,}** 手")
+    net_parts.append(f"背离连续 **{anomaly['divergence_count']}** 日")
+    net_info = "，".join(net_parts)
     warn = ("\n\n> ⚠️ 前20净持仓与价格已连续3日背离，市场分歧加剧，谨慎追涨/杀跌！"
             if anomaly.get("divergence_warning") else "")
     lines = [
-        "## 🚨 五、多空动能与资金异动分析",
+        "## ⚡ 五、量价状态",
         "",
         f"- 量价状态：**{anomaly['state_label']}**（价格 {pchg_str}，成交量 {vchg_str}，持仓 {oi_chg_str}）{oi_note}",
         f"- 价量配合：{anomaly.get('price_volume_oi') or '—'}",
-        f"- 持仓/成交比：**{ovr_str}**（近20日均值 {ovr_20_str}，{ovr_compare}）",
-        f"- 成交量状态：**{vstate}**（较5日均值 {vchg_str}）",
         f"- 近5日状态：{seq}",
+        f"- 成交量状态：**{vstate}**（较5日均值 {vchg_str}）",
+        f"- 持仓/成交比：**{ovr_str}**（近20日均值 {ovr_20_str}，{ovr_compare}）",
         f"- 持仓动能比：**{ratio_str}**（{anomaly['momentum_ratio_label']}）",
-        f"- 前20净持仓背离：连续 **{anomaly['divergence_count']}** 日",
+        f"- 前20净持仓情况以及背离情况：{net_info}",
         "",
         "> 计算方法：持仓变化率=当日持仓量变动÷前日持仓量×100%；持仓/成交比=当日持仓量÷当日成交量（>3资金沉淀、1~3均衡、<1投机主导）；持仓动能比=持仓变化率÷|价格变化率|（>2资金异动、<0.3资金跟进不足）；成交量状态=当日成交量÷前5日均量（>1.2放量、<0.8缩量）；净持仓=前20期货公司多单合计−前20空单合计，背离=净持仓变化方向与价格涨跌方向相反。",
     ]
@@ -5782,20 +5818,6 @@ def _build_daily_report_html(main_ct: str, fut_df, spot_dict, ltd, prev_td,
     else:
         overall = "⚖️ 市场多空交织，短期方向不明"
 
-    # ── 持仓量与成交量分析 HTML ──
-    vo = vol_oi_analysis or {}
-    oi_text = vo.get('oi_text', '')
-    oi_zero = ('0手' in oi_text or '暂未获取' in oi_text or '-100.0%' in oi_text)  # 持仓量为0或未获取时隐藏
-    if vo.get("available") and not oi_zero:
-        vol_oi_html = f"""
-        <p style="font-size:0.92rem;line-height:1.8;">
-        • 成交量：{vo.get('vol_text', '—')}<br>
-        • 持仓量：{oi_text}<br>
-        • 持仓峰值：{vo.get('oi_decline', '—')}
-        </p>"""
-    else:
-        vol_oi_html = "<p>⚠️ 成交量/持仓量数据不足</p>"
-
     # 图表嵌入
     chart_html = ""
     if chart_images:
@@ -5813,8 +5835,9 @@ def _build_daily_report_html(main_ct: str, fut_df, spot_dict, ltd, prev_td,
     # ── 构建基差分析HTML（含历史分位）──
     basis_analysis_html = _build_basis_analysis_html(snap, basis_enhanced, na_basis, max_region, max_basis, min_region, min_basis)
 
-    # ── 多空动能与资金异动分析卡片 ──
-    anomaly_card_html = _momentum_anomaly_html(momentum_anomaly, cn_date)
+    # ── 量价状态卡片 ──
+    anomaly_card_html = _momentum_anomaly_html(momentum_anomaly, cn_date,
+                                               ha.get('total_long'), ha.get('total_short'))
 
     # ── 构建 HTML ──
     html = f"""
@@ -5897,11 +5920,6 @@ body {{ font-family: 'Microsoft YaHei', 'SimHei', sans-serif; background: #eef0f
 <p style="font-size:0.92rem;line-height:2.0;">{spread_html}</p>
 </div>
 
-{'<!-- OI=0, hidden -->' if oi_zero else f"""<div class="card">
-<h2><span class="icon">📊</span>持仓量与成交量分析（{cn_date}）</h2>
-{vol_oi_html}
-</div>"""}
-
 {anomaly_card_html}
 {pos_card_html}
 
@@ -5975,7 +5993,7 @@ def _build_daily_report_md(main_ct, fut_df, spot_dict, ltd, prev_td,
     res_str = "、".join(sr_lines_info.get("resistances", ["暂无"])) if sr_lines_info else "暂无"
     sup_str = "、".join(sr_lines_info.get("supports", ["暂无"])) if sr_lines_info else "暂无"
 
-    anomaly_section = _momentum_anomaly_md(momentum_anomaly)
+    anomaly_section = _momentum_anomaly_md(momentum_anomaly, ha.get('total_long'), ha.get('total_short'))
 
     md = f"""# 🐷 生猪期货每日分析报告
 
