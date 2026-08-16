@@ -2608,20 +2608,20 @@ def _gen_tab6_conclusion(vol_data: Dict, oi_data: Dict, net_data: Dict, sel_mont
                 if oi_pct > 20:
                     bull_score += 1
 
-    # 净持仓：当前年份（net_data只有plot_date列，无date列）
-    non_avg_net_cur = {k: v for k, v in net_data.items() if "历史均值" not in k and not v.empty and _is_current_year(k)}
-    if non_avg_net_cur:
-        latest_net = max(non_avg_net_cur.items(), key=lambda x: x[1]["plot_date"].max())
-        if not latest_net[1].empty:
-            # net_data无date列，直接用plot_date按月/日查询（plot_date已映射到2020年）
-            nr_df = latest_net[1]
-            nr_match = nr_df[(nr_df["plot_date"].dt.month == target_m) & (nr_df["plot_date"].dt.day == target_d)]
-            if not nr_match.empty:
-                cur_n = int(nr_match["net_position"].iloc[-1])
-            else:
-                cur_n = int(nr_df["net_position"].iloc[-1])
+    # 净持仓：直接用聚合缓存(含真实日期)，避免 plot_date 跨年归一化选错合约年份
+    net_contract = None
+    for c in (active_cts or []):
+        if ct_month(c) == sel_month and c[2:4] == current_year_2d:
+            net_contract = c
+            break
+    if net_contract is not None:
+        net_df = _load_aggregated_net(net_contract)
+        if net_df is not None and not net_df.empty:
+            last_row = net_df.sort_values('date').iloc[-1]
+            cur_n = int(last_row['net_position'])
+            actual_md = _cn_md(last_row['date'])
             bias = "净多" if cur_n > 0 else "净空"
-            items.append(f"• 前20净持仓（{_cn_md(ltd)}）：{cur_n:+,}手（{bias}），前20席位{'偏多' if cur_n > 0 else '偏空'}")
+            items.append(f"• 前20净持仓（{actual_md}）：{cur_n:+,}手（{bias}），前20席位{'偏多' if cur_n > 0 else '偏空'}")
             if cur_n > 5000: bull_score += 2
             elif cur_n < -5000: bear_score += 1
 
@@ -3323,13 +3323,16 @@ def _compute_momentum_anomaly(fut_df, ct: str, ltd_ts) -> dict:
                 divergence_count = cnt
                 divergence_warning = cnt >= 3
 
-        # ── 当日 前20多空合计 ──
+        # ── 当日 前20多空合计（仅精确当日缓存，不回退前一日）──
         total_long = total_short = None
         try:
-            h = _get_holdings(ct, cur_date)
-            if h is not None and not h.empty and 'long' in h.columns and 'short' in h.columns:
-                total_long = int(h['long'].sum())
-                total_short = int(h['short'].sum())
+            _ds = pd.Timestamp(cur_date).strftime("%Y%m%d")
+            _cf = HOLDINGS_DIR / f"{ct}_{_ds}.csv"
+            if _cf.exists():
+                _h = pd.read_csv(_cf)
+                if 'long' in _h.columns and 'short' in _h.columns:
+                    total_long = int(_h['long'].sum())
+                    total_short = int(_h['short'].sum())
         except Exception:
             pass
 
@@ -3670,40 +3673,11 @@ def tab5():
             except Exception:
                 pass
 
-            # ── 日期不匹配 / 数据源提示 ──
+            # ── 日期不匹配：无当日数据，省略本节（不回退前一日）──
             if holdings_date_mismatch:
                 sel_date_str = _cn(td)
-                actual_date_str = _cn(holdings_actual_dt) if holdings_actual_dt is not None else holdings_actual_date
-                days_behind = (td.date() - holdings_actual_dt.date()).days if holdings_actual_dt else 999
-
-                if holdings_source in ("akshare", "akshare_fallback"):
-                    # ★ API 正常，但所选日期数据尚未发布（大商所 T+1，正常现象）
-                    st.info(
-                        f"📡 **{sel_date_str}** 的持仓排名数据尚未发布"
-                        f"（大商所通常 T+1 更新），"
-                        f"当前显示的是最新可用数据 **{actual_date_str}**"
-                        f"（{days_behind}天前，来自新浪财经）。"
-                    )
-                else:
-                    # ★ API 完全失败，使用的是本地缓存
-                    error_key = f"{ct}_{td.strftime('%Y%m%d')}"
-                    api_errors = st.session_state.get("_holdings_api_errors", {})
-                    error_detail = api_errors.get(error_key, "")
-                    error_hint = ""
-                    if error_detail:
-                        if "timeout" in error_detail.lower() or "timed out" in error_detail.lower():
-                            error_hint = "（接口请求超时，可能是网络波动或新浪服务器繁忙）"
-                        elif "connection" in error_detail.lower() or "refused" in error_detail.lower():
-                            error_hint = "（接口连接失败，请检查网络或稍后重试）"
-                        elif "数据尚未发布" in error_detail:
-                            error_hint = "（所选日期及近 5 个交易日数据均未发布，大商所通常 T+1 更新）"
-                        else:
-                            error_hint = f"（接口异常：{error_detail[:80]}）"
-                    st.warning(
-                        f"⚠️ **{sel_date_str}** 暂无前20期货公司多空持仓数据，"
-                        f"当前显示的是最近可用数据 **{actual_date_str}**。"
-                        f"（数据来源：{holdings_source}）{error_hint}"
-                    )
+                st.info(f"📡 **{sel_date_str}** 的前20多空持仓数据尚未发布（大商所 T+1 更新），本节已省略。")
+                return
             elif holdings_source == "unavailable":
                 st.warning("⚠️ 前20期货公司多空持仓数据暂不可用，API 和本地缓存均无数据。")
 
@@ -5465,16 +5439,18 @@ def _momentum_anomaly_html(anomaly, cn_date: str, total_long=None, total_short=N
     oi_note = "（持仓量缺失，OI 指标暂不计算）" if anomaly.get("oi_missing") else ""
     dd = anomaly.get("data_date", "")
     dd_note = f"（数据截至 {dd}）" if dd and dd != cn_date else ""
-    # 前20净持仓情况
-    net_parts = []
-    if total_long is not None:
-        net_parts.append(f"前20多单合计 <b>{total_long:,}</b> 手")
-    if total_short is not None:
-        net_parts.append(f"前20空单合计 <b>{total_short:,}</b> 手")
+    # 前20净持仓情况（仅当日持仓数据存在时展示，不回退前一日）
     if total_long is not None and total_short is not None:
-        net_parts.append(f"净持仓 <b>{total_long - total_short:+,}</b> 手")
-    net_parts.append(f"背离：连续 <b>{anomaly['divergence_count']}</b> 日")
-    net_info = "，".join(net_parts)
+        net_parts = [
+            f"前20多单合计 <b>{total_long:,}</b> 手",
+            f"前20空单合计 <b>{total_short:,}</b> 手",
+            f"净持仓 <b>{total_long - total_short:+,}</b> 手",
+            f"背离：连续 <b>{anomaly['divergence_count']}</b> 日",
+        ]
+        net_info = "，".join(net_parts)
+        net_line = f"• 前20净持仓情况以及背离情况：{net_info}<br>"
+    else:
+        net_line = ""
     return f"""
         <div class="card">
         <h2><span class="icon">⚡</span>量价状态（{cn_date}）<span style="font-size:0.78rem;color:#999;">{dd_note}</span></h2>
@@ -5485,7 +5461,7 @@ def _momentum_anomaly_html(anomaly, cn_date: str, total_long=None, total_short=N
         • 成交量状态：<b>{vstate}</b>（较5日均值 {vchg_str}）{vol_alert or ''}<br>
         • 持仓/成交比：<b>{ovr_str}</b>（近20日均值 {ovr_20_str}，{ovr_compare}，{anomaly.get('oi_volume_ratio_desc', '—')}）<br>
         • 持仓动能比：<b>{ratio_str}</b>（{anomaly['momentum_ratio_label']}）<br>
-        • 前20净持仓情况以及背离情况：{net_info}
+        {net_line}
         </p>{warn}
         <p style="font-size:0.72rem;color:#999;line-height:1.6;border-top:1px dashed #eee;padding-top:6px;margin-top:8px;">
         计算方法：持仓变化率 = 当日持仓量变动 ÷ 前日持仓量 × 100%；<br>
@@ -5519,15 +5495,17 @@ def _momentum_anomaly_md(anomaly, total_long=None, total_short=None) -> str:
     if ovr is not None and ovr_20 is not None:
         ovr_compare = "高于均值（资金沉淀偏强）" if ovr > ovr_20 else ("低于均值（投机偏强）" if ovr < ovr_20 else "与均值持平")
     oi_note = "（持仓量缺失，OI 指标暂不计算）" if anomaly.get("oi_missing") else ""
-    net_parts = []
-    if total_long is not None:
-        net_parts.append(f"前20多单合计 **{total_long:,}** 手")
-    if total_short is not None:
-        net_parts.append(f"前20空单合计 **{total_short:,}** 手")
     if total_long is not None and total_short is not None:
-        net_parts.append(f"净持仓 **{total_long - total_short:+,}** 手")
-    net_parts.append(f"背离连续 **{anomaly['divergence_count']}** 日")
-    net_info = "，".join(net_parts)
+        net_parts = [
+            f"前20多单合计 **{total_long:,}** 手",
+            f"前20空单合计 **{total_short:,}** 手",
+            f"净持仓 **{total_long - total_short:+,}** 手",
+            f"背离连续 **{anomaly['divergence_count']}** 日",
+        ]
+        net_info = "，".join(net_parts)
+        net_line = f"- 前20净持仓情况以及背离情况：{net_info}"
+    else:
+        net_line = None
     warn = ("\n\n> ⚠️ 前20净持仓与价格已连续3日背离，市场分歧加剧，谨慎追涨/杀跌！"
             if anomaly.get("divergence_warning") else "")
     lines = [
@@ -5539,11 +5517,11 @@ def _momentum_anomaly_md(anomaly, total_long=None, total_short=None) -> str:
         f"- 成交量状态：**{vstate}**（较5日均值 {vchg_str}）",
         f"- 持仓/成交比：**{ovr_str}**（近20日均值 {ovr_20_str}，{ovr_compare}）",
         f"- 持仓动能比：**{ratio_str}**（{anomaly['momentum_ratio_label']}）",
-        f"- 前20净持仓情况以及背离情况：{net_info}",
+        net_line,
         "",
         "> 计算方法：持仓变化率=当日持仓量变动÷前日持仓量×100%；持仓/成交比=当日持仓量÷当日成交量（>3资金沉淀、1~3均衡、<1投机主导）；持仓动能比=持仓变化率÷|价格变化率|（>2资金异动、<0.3资金跟进不足）；成交量状态=当日成交量÷前5日均量（>1.2放量、<0.8缩量）；净持仓=前20期货公司多单合计−前20空单合计，背离=净持仓变化方向与价格涨跌方向相反。",
     ]
-    return "\n".join(lines) + warn
+    return "\n".join([l for l in lines if l is not None]) + warn
 
 
 def _build_daily_report_html(main_ct: str, fut_df, spot_dict, ltd, prev_td,
@@ -5630,7 +5608,7 @@ def _build_daily_report_html(main_ct: str, fut_df, spot_dict, ltd, prev_td,
         pos_card_html = f"""
         <!-- 5. 前20净持仓分析 -->
         <div class="card">
-        <h2><span class="icon">🏢</span>前20净持仓分析（{ha_date_cn if ha_date_cn else '—'}）{'<span style="font-size:0.78rem;color:#E67E22;">（T+1发布，数据为最近可用交易日）</span>' if ha.get('data_stale') else ''}</h2>
+        <h2><span class="icon">🏢</span>前20净持仓分析（{ha_date_cn if ha_date_cn else '—'}）</h2>
         {pos_section}
         </div>"""
     else:
@@ -6083,12 +6061,9 @@ def _compute_daily_report_cache(main_ct: str, spot_hash: int, _version: int = 0,
             holdings_date_match = True
     except Exception:
         pass
-    if holdings_df is not None and not holdings_df.empty:
+    if holdings_date_match:
         holdings_analysis = _analyze_holdings_for_report(
             holdings_df, main_ct, ltd_ts, holdings_actual_date)
-        if not holdings_date_match:
-            # 持仓排名 T+1 发布，数据日期落后于报告日期——仍展示真实多空合计，标注数据日期
-            holdings_analysis["data_stale"] = True
     else:
         holdings_analysis = {"available": False, "data_date": str(holdings_actual_date)[:8] if holdings_actual_date else _cn(ltd_ts),
                             "total_long": 0, "total_short": 0, "net_pos": 0,
@@ -6715,6 +6690,10 @@ def _quick_technical(fut_df, ltd) -> Tuple[str, dict]:
         return "震荡", {"resistances": [], "supports": []}
     try:
         df = fut_df.sort_values("date").reset_index(drop=True)
+        # 与 Tab8 技术分析默认范围一致：近90个自然日，避免 EMA/MACD 初值差异导致结论不一致
+        if ltd is not None:
+            cutoff = pd.Timestamp(ltd) - timedelta(days=90)
+            df = df[df["date"] >= cutoff].reset_index(drop=True)
         df, _warnings = calculate_technicals(df)
         n = len(df)
         if n < 20:
