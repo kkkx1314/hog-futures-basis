@@ -57,7 +57,10 @@ YEAR_COLOR = {
 @st.cache_data(show_spinner=False)
 def _solar2lunar_ts(ts):
     ld = LunarDate.fromSolarDate(ts.year, ts.month, ts.day)
-    return (ld.year, ld.month, ld.day, ld.month * 100 + ld.day)
+    md = ld.month * 100 + ld.day
+    if ld.isLeapMonth:
+        md += 10000  # 闰月加偏移，避免与正常月混淆（数据源闰月农历日期为空，对齐时自然剔除）
+    return (ld.year, ld.month, ld.day, md)
 
 
 def _solar2lunar(ts):
@@ -424,33 +427,39 @@ if run:
         ["📊 A时段详情", "📊 B时段详情", "📊 均值逐年对齐", "📊 综合汇总", "🔮 预测结果"])
 
     with tab1:
-        st.markdown(f"#### A 时段各年份每日值（{sel_name}，农历对齐）")
+        st.markdown(f"#### A 时段各年份每日值（{sel_name}）")
         fig = go.Figure()
         for i, (y, grp) in enumerate(sorted(a_years.items())):
-            x_lbl = [_md_label(k) for k in grp["lunar_md"]]
-            fig.add_trace(go.Scatter(x=x_lbl, y=grp["value"],
-                                     mode="lines+markers", name=str(y),
+            if cal_a == "公历":
+                x = grp["date"]
+                hover = f"<b>{y}年</b><br>公历%{{x|%Y-%m-%d}}<br>值：%{{y:,.2f}}<extra></extra>"
+            else:
+                x = [_md_label(k) for k in grp["lunar_md"]]
+                hover = f"<b>{y}年</b><br>农历%{{x}}<br>值：%{{y:,.2f}}<extra></extra>"
+            fig.add_trace(go.Scatter(x=x, y=grp["value"], mode="lines+markers", name=str(y),
                                      line=dict(color=YEAR_COLOR.get(y, "#95A5A6"), width=2),
-                                     customdata=grp["date"].dt.strftime("%Y-%m-%d").tolist(),
-                                     hovertemplate=f"<b>{y}年</b><br>农历%{{x}}（公历%{{customdata}}）<br>值：%{{y:,.2f}}<extra></extra>"))
-        fig.update_layout(xaxis_title="农历日期（各年份农历月日一致）", yaxis_title="屠宰量（头）",
-                          template="plotly_white", height=420, hovermode="x unified")
+                                     hovertemplate=hover))
+        fig.update_layout(xaxis_title="公历日期" if cal_a == "公历" else "农历日期（各年份一致）",
+                          yaxis_title="屠宰量（头）", template="plotly_white", height=420, hovermode="x unified")
         st.plotly_chart(fig, use_container_width=True)
         rows = [{"年份": y, **compute_stats(g["value"].tolist())} for y, g in sorted(a_years.items())]
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
     with tab2:
-        st.markdown(f"#### B 时段各年份每日值（{sel_name}，农历对齐）")
+        st.markdown(f"#### B 时段各年份每日值（{sel_name}）")
         fig = go.Figure()
         for i, (y, grp) in enumerate(sorted(b_years.items())):
-            x_lbl = [_md_label(k) for k in grp["lunar_md"]]
-            fig.add_trace(go.Scatter(x=x_lbl, y=grp["value"],
-                                     mode="lines+markers", name=str(y),
+            if cal_b == "公历":
+                x = grp["date"]
+                hover = f"<b>{y}年</b><br>公历%{{x|%Y-%m-%d}}<br>值：%{{y:,.2f}}<extra></extra>"
+            else:
+                x = [_md_label(k) for k in grp["lunar_md"]]
+                hover = f"<b>{y}年</b><br>农历%{{x}}<br>值：%{{y:,.2f}}<extra></extra>"
+            fig.add_trace(go.Scatter(x=x, y=grp["value"], mode="lines+markers", name=str(y),
                                      line=dict(color=YEAR_COLOR.get(y, "#95A5A6"), width=2),
-                                     customdata=grp["date"].dt.strftime("%Y-%m-%d").tolist(),
-                                     hovertemplate=f"<b>{y}年</b><br>农历%{{x}}（公历%{{customdata}}）<br>值：%{{y:,.2f}}<extra></extra>"))
-        fig.update_layout(xaxis_title="农历日期（各年份农历月日一致）", yaxis_title="屠宰量（头）",
-                          template="plotly_white", height=420, hovermode="x unified")
+                                     hovertemplate=hover))
+        fig.update_layout(xaxis_title="公历日期" if cal_b == "公历" else "农历日期（各年份一致）",
+                          yaxis_title="屠宰量（头）", template="plotly_white", height=420, hovermode="x unified")
         st.plotly_chart(fig, use_container_width=True)
         rows = [{"年份": y, **compute_stats(g["value"].tolist())} for y, g in sorted(b_years.items())]
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
