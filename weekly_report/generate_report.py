@@ -330,8 +330,8 @@ class DataReader:
         idx = self._sheet_index(self.file_ridu, '散户标肥价差')
         if idx is not None:
             df = self._read_sheet(self.file_ridu, idx)
-            result['150kg肥标价差'] = self._wide_timeseries(df, '河南', val_shift=1)
-            result['175kg肥标价差'] = self._wide_timeseries(df, '河南', val_shift=2)
+            result['150kg肥标价差'] = self._wide_timeseries(df, '全国均价', val_shift=1)
+            result['175kg肥标价差'] = self._wide_timeseries(df, '全国均价', val_shift=2)
             return result
         for key, kw in [('150kg肥标价差', '150公斤'), ('175kg肥标价差', '175公斤')]:
             i = self._sheet_index(self.file_ridu, kw)
@@ -529,7 +529,7 @@ class DataReader:
         return self._extract_timeseries(df, val_col=col, date_col=0, date_row_start=hdr + 1)
 
     def get_breeding_profit(self):
-        """养殖利润 - 返回{label: df}"""
+        """养殖利润 - 返回{label: df}（表头行含「开始日期/结束日期」，「外购」列名在表头上一行合并单元格）"""
         if not self.file_zhoudou:
             return {}
         idx = self._sheet_index(self.file_zhoudou, '养殖利润最新')
@@ -538,10 +538,15 @@ class DataReader:
         if idx is None:
             return {}
         df = self._read_sheet(self.file_zhoudou, idx)
-        hdr = self._header_row(df, ['母猪', '利润', '外购'])
+        # 表头行以「开始日期/结束日期/母猪50头以下」定位（旧关键词「利润」会误命中标题行）
+        hdr = self._header_row(df, ['开始日期', '结束日期', '母猪50头以下', '项目'])
+        if hdr <= 0:
+            return {}
         result = {}
         for kw, label in [('母猪50头以下', '母猪50头以下'), ('5000-10000', '5000-10000头'), ('外购', '外购仔猪育肥')]:
             col = self._col_by_name(df, hdr, kw)
+            if col is None:
+                col = self._col_by_name(df, hdr - 1, kw)  # 合并表头在上一行
             if col is not None:
                 result[label] = self._extract_timeseries(df, val_col=col, date_col=1, date_row_start=hdr + 1)
         return result
@@ -792,14 +797,21 @@ class Analyzer:
                 yoy_str = Analyzer._fmt(cmp[4], is_pct=True) if cmp and cmp[4] is not None else 'N/A'
                 lines.append(f"- 全国均价自然周({cur_s}): {m:.2f}元/kg，环比{wow_str}，同比{yoy_str}")
 
-        # 肥标价差
+        # 肥标价差（全国均价）
         fss = data.get('fat_std_spread', {})
         if isinstance(fss, dict):
             for key in ['150kg肥标价差', '175kg肥标价差']:
                 df = fss.get(key)
                 if df is not None and not df.empty:
                     latest = df.sort_values('date')['value'].iloc[-1]
-                    lines.append(f"- 散户{key}: {latest:.2f}元/kg")
+                    lines.append(f"- 全国{key}: {latest:.2f}元/kg")
+
+        # 价格判断
+        if national is not None and not national.empty:
+            cmp = Analyzer._week_avg_compare(national, 'value')
+            if cmp and cmp[3] is not None:
+                dirn = '上涨' if cmp[3] > 0 else '下跌'
+                lines.append(f"- 分析：全国均价环比{dirn}{abs(cmp[3])*100:.1f}%，短期猪价{'偏强' if cmp[3] > 0 else '偏弱'}")
 
         return '\n'.join(lines)
 
@@ -815,7 +827,7 @@ class Analyzer:
             if df is not None and not df.empty:
                 wow_chg, wow_pct, yoy_chg, yoy_pct = Analyzer._wow_yoy(df)
                 latest = df.sort_values('date')['value'].iloc[-1]
-                lines.append(f"- {key}出栏体重: {latest:.1f}kg, "
+                lines.append(f"- {key}出栏体重: {latest:.2f}kg, "
                            f"环比{Analyzer._fmt(wow_chg, 'kg')}, 同比{Analyzer._fmt(yoy_chg, 'kg')}")
 
         eryu = data.get('eryu_rate')
@@ -824,6 +836,12 @@ class Analyzer:
             wow_chg, wow_pct, yoy_chg, yoy_pct = Analyzer._wow_yoy(eryu)
             lines.append(f"- 二育栏舍利用率(全国均值): {latest:.1%}, "
                        f"环比{Analyzer._fmt(wow_pct, is_pct=True)}")
+
+        # 供给判断
+        group_wt = ws.get('集团')
+        if group_wt is not None and not group_wt.empty:
+            gw_chg, _, _, _ = Analyzer._wow_yoy(group_wt)
+            lines.append(f"- 分析：集团出栏体重{'增加' if gw_chg > 0 else '下降'}，短期供给压力{'上升' if gw_chg > 0 else '缓解'}")
 
         return '\n'.join(lines)
 
@@ -847,15 +865,22 @@ class Analyzer:
                              f"上周日均{prev:.0f}头/日(环比{wow_str}), "
                              f"去年同周日均{ly:.0f}头/日(同比{yoy_str})")
 
-        # 其余省份（自然周日均）
+        # 其余省份（自然周日均 + 环比 + 同比，与河南格式一致）
         for p in TARGET_PROVINCES:
             if p == '河南':
                 continue
             df = prov_sl.get(p)
             if df is not None and not df.empty:
-                m = Analyzer._natural_week_mean(df, 'value')
-                if m is not None:
-                    lines.append(f"- {p}屠宰量日均: {m:.0f}头/日")
+                cmp = Analyzer._week_avg_compare(df, 'value')
+                if cmp:
+                    cur, prev, ly, wow, yoy = cmp
+                    wow_str = Analyzer._fmt(wow, is_pct=True) if wow is not None else 'N/A'
+                    yoy_str = Analyzer._fmt(yoy, is_pct=True) if yoy is not None else 'N/A'
+                    prev_str = f"{prev:.0f}" if prev is not None else '—'
+                    ly_str = f"{ly:.0f}" if ly is not None else '—'
+                    lines.append(f"- {p}周度屠宰量日均: {cur:.0f}头/日, "
+                                 f"上周日均{prev_str}头/日(环比{wow_str}), "
+                                 f"去年同周日均{ly_str}头/日(同比{yoy_str})")
 
         # 鲜销率
         fresh = data.get('fresh_sale_rate')
@@ -878,6 +903,13 @@ class Analyzer:
         if profit is not None and not profit.empty:
             latest = profit.sort_values('date')['value'].iloc[-1]
             lines.append(f"- 河南白条头均利润: {latest:.1f}元/头")
+
+        # 屠宰判断
+        if hn is not None and not hn.empty:
+            cmp = Analyzer._week_avg_compare(hn, 'value')
+            if cmp and cmp[3] is not None:
+                dirn = '增加' if cmp[3] > 0 else '减少'
+                lines.append(f"- 分析：河南屠宰量环比{dirn}{abs(cmp[3])*100:.1f}%，终端需求{'改善' if cmp[3] > 0 else '偏弱'}")
 
         return '\n'.join(lines)
 
@@ -906,6 +938,11 @@ class Analyzer:
             lines.append(f"- 河南二元母猪(50kg)价格: {latest:.0f}元/头, "
                        f"环比{Analyzer._fmt(wow_pct, is_pct=True)}")
 
+        # 母猪判断
+        if cull is not None and not cull.empty:
+            wow_chg, _, _, _ = Analyzer._wow_yoy(cull)
+            lines.append(f"- 分析：淘汰母猪价格{'上涨' if wow_chg > 0 else '下跌'}，母猪产能{'去化放缓' if wow_chg > 0 else '加速去化'}")
+
         return '\n'.join(lines)
 
     @staticmethod
@@ -922,6 +959,12 @@ class Analyzer:
                 wow_chg, wow_pct, yoy_chg, yoy_pct = Analyzer._wow_yoy(df)
                 lines.append(f"- {label}: {latest:.0f}元/头, "
                            f"环比{Analyzer._fmt(wow_pct, is_pct=True)}, 同比{Analyzer._fmt(yoy_pct, is_pct=True)}")
+
+        # 仔猪判断
+        p15 = data.get('piglet_15kg')
+        if p15 is not None and not p15.empty:
+            wow_chg, _, _, _ = Analyzer._wow_yoy(p15)
+            lines.append(f"- 分析：15公斤仔猪价格{'上涨' if wow_chg > 0 else '下跌'}，补栏意愿{'提升' if wow_chg > 0 else '谨慎'}")
 
         return '\n'.join(lines)
 
@@ -944,6 +987,15 @@ class Analyzer:
                 else:
                     lines.append(f"  → 已实现盈利")
 
+        # 利润判断
+        wg = bp.get('外购仔猪育肥')
+        if wg is not None and not wg.empty:
+            latest_wg = wg.sort_values('date')['value'].iloc[-1]
+            if latest_wg < 0:
+                lines.append(f"- 分析：外购仔猪育肥仍亏损({latest_wg:.0f}元/头)，补栏意愿低迷，产能去化延续")
+            else:
+                lines.append(f"- 分析：外购仔猪育肥已盈利({latest_wg:.0f}元/头)，补栏积极性提升")
+
         return '\n'.join(lines)
 
     @staticmethod
@@ -955,17 +1007,22 @@ class Analyzer:
         lines.append("=" * 50)
         lines.append("")
 
-        # 价格走势判断
+        # 价格走势判断（按自然周日均口径）
         np_df = data.get('national_price')
         if np_df is not None and not np_df.empty:
-            latest = np_df.sort_values('date')['value'].iloc[-1]
-            wow_chg, wow_pct, yoy_chg, yoy_pct = Analyzer._wow_yoy(np_df)
-            direction = '上涨' if wow_chg > 0 else '下跌'
-            lines.append(f"本周全国生猪均价{latest:.2f}元/kg, 环比{direction}{abs(wow_chg):.2f}元/kg。")
-
-            if yoy_chg and not np.isnan(yoy_chg):
-                yoy_dir = '高于' if yoy_chg > 0 else '低于'
-                lines.append(f"同比{yoy_dir}去年同期{abs(yoy_chg):.2f}元/kg。")
+            cmp = Analyzer._week_avg_compare(np_df, 'value')
+            if cmp:
+                cur, prev, ly, wow, yoy = cmp
+                if prev is not None:
+                    wow_chg = cur - prev
+                    direction = '上涨' if wow_chg > 0 else '下跌'
+                    lines.append(f"本周全国生猪均价{cur:.2f}元/kg, 环比{direction}{abs(wow_chg):.2f}元/kg。")
+                else:
+                    lines.append(f"本周全国生猪均价{cur:.2f}元/kg。")
+                if ly is not None:
+                    yoy_chg = cur - ly
+                    yoy_dir = '高于' if yoy_chg > 0 else '低于'
+                    lines.append(f"同比{yoy_dir}去年同期{abs(yoy_chg):.2f}元/kg。")
 
         # 供给端判断
         ws = data.get('weight_split', {})
@@ -1127,14 +1184,14 @@ def build_report_layout(analysis_text):
                                  dbc.Col([dcc.Graph(id='chart-price-yoy-guangdong')], width=6),
                                  dbc.Col([dcc.Graph(id='chart-price-yoy-liaoning')], width=6),
                              ]),
-                             html.H5("价差历史同期（河南 vs 广东/四川/辽宁/全国均价）", className='mt-3'),
+                             html.H5("价差历史同期（各省 vs 全国均价）", className='mt-3'),
                              dbc.Row([
-                                 dbc.Col([dcc.Graph(id='chart-spread-hn-gd')], width=6),
-                                 dbc.Col([dcc.Graph(id='chart-spread-hn-sc')], width=6),
+                                 dbc.Col([dcc.Graph(id='chart-spread-hn-nat')], width=6),
+                                 dbc.Col([dcc.Graph(id='chart-spread-sc-nat')], width=6),
                              ]),
                              dbc.Row([
-                                 dbc.Col([dcc.Graph(id='chart-spread-hn-ln')], width=6),
-                                 dbc.Col([dcc.Graph(id='chart-spread-hn-nat')], width=6),
+                                 dbc.Col([dcc.Graph(id='chart-spread-ln-nat')], width=6),
+                                 dbc.Col([dcc.Graph(id='chart-spread-gd-nat')], width=6),
                              ]),
                              html.H5("散户肥标价差季节性同比 & 全国均价", className='mt-3'),
                              dbc.Row([
@@ -1298,29 +1355,32 @@ app.layout = build_report_layout(analysis_text)
 # ============================================================
 
 def make_seasonal_fig(df, title, ylabel, is_pct=False):
-    """生成季节性同比图"""
+    """生成季节性同比图（按日历月-日对齐，各年从实际起始日期开始，如24年从9月）"""
     if df is None or df.empty:
         return go.Figure()
     df = df.copy()
     df['year'] = df['date'].dt.year
+    # 归一化到同一日历位置（月-日），使各年数据按实际月份对齐
+    df['plot_date'] = [pd.Timestamp(year=2020, month=d.month, day=d.day) for d in df['date']]
     fig = go.Figure()
     for yr in range(2021, 2027):
         yr_df = df[df['year'] == yr].sort_values('date')
         if yr_df.empty:
             continue
-        yr_df['week'] = range(1, len(yr_df) + 1)
         color = YR_COLORS.get(yr, '#888')
         fig.add_trace(go.Scatter(
-            x=yr_df['week'], y=yr_df['value'], mode='lines',
+            x=yr_df['plot_date'], y=yr_df['value'], mode='lines',
             name=f'{yr}年', line=dict(color=color, width=2),
+            hovertemplate=f"<b>{yr}年</b><br>%{{x|%m月%d日}}<br>值：%{{y}}<extra></extra>",
         ))
     fig.update_layout(
         template='plotly_white', title=title,
-        xaxis_title='周次', yaxis_title=ylabel, height=400,
+        xaxis=dict(title='日期（月-日）', tickformat='%m月', dtick='M1',
+                   range=['2020-01-01', '2020-12-31']),
+        yaxis_title=ylabel, height=400,
         legend=dict(orientation='h', y=1.05),
         margin=dict(l=60, r=40, t=60, b=50),
     )
-    fig.update_xaxes(range=[0, None])
     if is_pct:
         fig.update_yaxes(tickformat='.1%')
     return fig
@@ -1367,9 +1427,9 @@ for prov in PROV_EN:
     chart_outputs.append(Output(f'chart-price-sl-{en}', 'figure'))
     chart_outputs.append(Output(f'chart-price-yoy-{en}', 'figure'))
 
-# 价差历史同期（河南 vs 广东/四川/辽宁/全国均价）
-for _sp_id in ['gd', 'sc', 'ln', 'nat']:
-    chart_outputs.append(Output(f'chart-spread-hn-{_sp_id}', 'figure'))
+# 价差历史同期（各省 vs 全国均价）
+for _sp_id in ['hn', 'sc', 'ln', 'gd']:
+    chart_outputs.append(Output(f'chart-spread-{_sp_id}-nat', 'figure'))
 
 chart_outputs.extend([
     Output('chart-fat-std-150', 'figure'),
@@ -1416,7 +1476,7 @@ def update_all_charts(n):
         else:
             results.append(go.Figure())
 
-    # 价差历史同期（河南 vs 广东/四川/辽宁/全国均价）
+    # 价差历史同期（各省 vs 全国均价）
     _series = {}
     for _p in TARGET_PROVINCES:
         _pp = data['province_price'].get(_p)
@@ -1424,13 +1484,13 @@ def update_all_charts(n):
             _series[_p] = _pp.set_index('date')['price']
     if data.get('national_price') is not None and not data['national_price'].empty:
         _series['全国均价'] = data['national_price'].set_index('date')['value']
-    for _o in ['广东', '四川', '辽宁', '全国均价']:
-        if '河南' in _series and _o in _series:
-            _c = _series['河南'].index.intersection(_series[_o].index)
+    for _o in ['河南', '四川', '辽宁', '广东']:
+        if _o in _series and '全国均价' in _series:
+            _c = _series[_o].index.intersection(_series['全国均价'].index)
             if len(_c) > 0:
-                _sp = (_series['河南'][_c] - _series[_o][_c]).reset_index()
+                _sp = (_series[_o][_c] - _series['全国均价'][_c]).reset_index()
                 _sp.columns = ['date', 'value']
-                results.append(make_seasonal_fig(_sp, f'河南-{_o}价差历史同期 (元/kg)', '元/kg'))
+                results.append(make_seasonal_fig(_sp, f'{_o}-全国均价价差历史同期 (元/kg)', '元/kg'))
             else:
                 results.append(go.Figure())
         else:
@@ -1482,17 +1542,19 @@ def update_all_charts(n):
         fig = go.Figure()
         if df is not None and not df.empty:
             df2 = df.copy(); df2['year'] = df2['date'].dt.year
+            df2['plot_date'] = [pd.Timestamp(year=2020, month=d.month, day=d.day) for d in df2['date']]
             for yr in range(2021, 2027):
                 yr_df = df2[df2['year'] == yr].sort_values('date')
                 if yr_df.empty: continue
-                yr_df['week'] = range(1, len(yr_df)+1)
                 c = YR_COLORS.get(yr, '#888')
-                fig.add_trace(go.Scatter(x=yr_df['week'], y=yr_df['value'], mode='lines',
+                fig.add_trace(go.Scatter(x=yr_df['plot_date'], y=yr_df['value'], mode='lines',
                     name=f'{yr}年', line=dict(color=c, width=2 if yr==2026 else 1.2),
                     opacity=0.9 if yr==2026 else 0.5))
         fig.add_hline(y=0, line_dash="dash", line_color="gray", opacity=0.5)
         fig.update_layout(template='plotly_white', title=f'{key}养殖利润季节性同比 (元/头)',
-            xaxis_title='周次', yaxis_title='元/头', height=400, margin=dict(l=60, r=40, t=60, b=50))
+            xaxis=dict(title='日期（月-日）', tickformat='%m月', dtick='M1',
+                       range=['2020-01-01', '2020-12-31']),
+            yaxis_title='元/头', height=400, margin=dict(l=60, r=40, t=60, b=50))
         results.append(fig)
 
     return results
