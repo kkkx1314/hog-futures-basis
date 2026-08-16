@@ -19,11 +19,22 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.colors import HexColor
 from reportlab.lib.units import mm
 from reportlab.lib.enums import TA_CENTER
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
 st.set_page_config(page_title="涌益周度数据 · 周报生成", page_icon="🐷", layout="wide")
+
+matplotlib.rcParams["font.sans-serif"] = ["Microsoft YaHei", "SimHei"]
+matplotlib.rcParams["axes.unicode_minus"] = False
+
+# 年份固定配色（2021-2026）
+YEAR_COLOR = {2026: "#E74C3C", 2025: "#27AE60", 2024: "#000000", 2023: "#3498DB",
+              2022: "#F1C40F", 2021: "#9B59B6"}
 
 _DESKTOP_DIRS = [r"D:\CC\Desktop", os.path.expanduser("~/Desktop")]
 
@@ -199,6 +210,73 @@ def get_futures(ct):
     }
 
 
+# ── 区域价差 & 图表 ──
+def extract_regional(path):
+    """读取周度商品猪出栏价，返回 DataFrame(date, 河南, 四川, 辽宁, 广东, 广西, 全国)。"""
+    df = pd.read_excel(path, sheet_name="周度-商品猪出栏价", header=None)
+    d = df.iloc[2:].dropna(subset=[1]).copy()
+    d[1] = pd.to_datetime(d[1], errors="coerce")
+    d = d.dropna(subset=[1]).sort_values(1).reset_index(drop=True)
+    regions = {2: "河南", 13: "四川", 10: "辽宁", 15: "广东", 16: "广西", 19: "全国"}
+    out = pd.DataFrame({"date": d[1]})
+    for col, name in regions.items():
+        out[name] = pd.to_numeric(d[col], errors="coerce")
+    return out
+
+
+def build_charts(regional):
+    """生成图表 PNG bytes 列表：[区域价差图, 历年同期全国均价图]。"""
+    charts = []
+    last = regional.iloc[-1]
+    # 图1：区域价差（最新周 相对河南）
+    fig, ax = plt.subplots(figsize=(7.5, 3.4))
+    h = last["河南"]
+    names, vals = [], []
+    for r in ["四川", "辽宁", "广东", "广西", "全国"]:
+        if pd.notna(h) and pd.notna(last[r]):
+            names.append(r)
+            vals.append(last[r] - h)
+    colors = ["#E74C3C" if v >= 0 else "#27AE60" for v in vals]
+    ax.bar(names, vals, color=colors, alpha=0.85)
+    ax.axhline(0, color="#555555", linewidth=0.8)
+    ax.set_title(f"区域价差（相对河南，{last['date'].date()}）")
+    ax.set_ylabel("价差（元/公斤）")
+    ax.grid(axis="y", alpha=0.3)
+    for i, v in enumerate(vals):
+        ax.text(i, v, f"{v:+.2f}", ha="center", va="bottom" if v >= 0 else "top", fontsize=9)
+    fig.tight_layout()
+    buf = BytesIO()
+    fig.savefig(buf, format="png", dpi=130)
+    charts.append(buf.getvalue())
+    plt.close(fig)
+
+    # 图2：历年同期全国均价（2021-2026，用年份配色）
+    target = last["date"]
+    fig, ax = plt.subplots(figsize=(7.5, 3.4))
+    years = [2021, 2022, 2023, 2024, 2025, 2026]
+    vals, labels = [], []
+    for y in years:
+        sub = regional[regional["date"].dt.year == y].copy()
+        if sub.empty:
+            continue
+        sub["_d"] = abs((sub["date"].dt.month - target.month) * 30 + (sub["date"].dt.day - target.day))
+        row = sub.loc[sub["_d"].idxmin()]
+        vals.append(float(row["全国"]))
+        labels.append(str(y))
+    ax.bar(labels, vals, color=[YEAR_COLOR.get(y, "#999") for y in years], alpha=0.9)
+    ax.set_title("历年同期全国均价（元/公斤）")
+    ax.set_ylabel("元/公斤")
+    ax.grid(axis="y", alpha=0.3)
+    for i, v in enumerate(vals):
+        ax.text(i, v, f"{v:.2f}", ha="center", va="bottom", fontsize=9)
+    fig.tight_layout()
+    buf = BytesIO()
+    fig.savefig(buf, format="png", dpi=130)
+    charts.append(buf.getvalue())
+    plt.close(fig)
+    return charts
+
+
 # ── PDF ──
 def _font():
     try:
@@ -307,8 +385,8 @@ def _md_table(rows):
     return t
 
 
-def markdown_to_pdf(md_text):
-    """把 Markdown 文本转成 PDF bytes（支持 # ## 表格 - 列表 > 引用 **加粗**）。"""
+def markdown_to_pdf(md_text, charts=None):
+    """把 Markdown 文本转成 PDF bytes（支持 # ## 表格 - 列表 > 引用 **加粗**）。charts 为 PNG bytes 列表，追加在末尾。"""
     _font()
     h1 = ParagraphStyle('h1', fontName='SimHei', fontSize=18, leading=24, alignment=TA_CENTER,
                         textColor=HexColor('#1a1a2e'), spaceAfter=8)
@@ -350,6 +428,14 @@ def markdown_to_pdf(md_text):
         else:
             story.append(_md_inline(line, body))
         i += 1
+    if charts:
+        for c in charts:
+            try:
+                img = Image(BytesIO(c), width=170 * mm, height=170 * mm * 0.45)
+                story.append(Spacer(1, 8))
+                story.append(img)
+            except Exception:
+                pass
     doc.build(story)
     return buf.getvalue()
 
@@ -401,13 +487,35 @@ if futures:
     basis = p["全国"] * 1000 - futures["close"]
     c5.metric(f"{futures['ct']} 收盘", f"{futures['close']:,.0f}", f"基差 {basis:+,.0f}")
 
+st.markdown("### 图表")
+try:
+    regional = extract_regional(path)
+    charts = build_charts(regional)
+    c1, c2 = st.columns(2)
+    with c1:
+        st.image(charts[0], use_container_width=True)
+    with c2:
+        st.image(charts[1], use_container_width=True)
+    # 区域价差 markdown 表
+    last = regional.iloc[-1]
+    h = last["河南"]
+    spread_lines = ["", "## 区域价差（相对河南）", "", "| 区域 | 价差（元/公斤） |", "|---|---|"]
+    for r in ["四川", "辽宁", "广东", "广西", "全国"]:
+        if pd.notna(h) and pd.notna(last[r]):
+            spread_lines.append(f"| {r} | {last[r] - h:+.2f} |")
+    regional_md = "\n".join(spread_lines)
+except Exception as e:
+    charts = []
+    regional_md = ""
+    st.warning(f"图表生成失败：{e}")
+
 st.markdown("### 编辑周报（全文可自行修改）")
-default_md = generate_markdown(data, futures)
+default_md = generate_markdown(data, futures) + regional_md
 md_text = st.text_area("周报内容（Markdown 格式，可改标题/数据/结论，生成 PDF 时按此内容输出）",
-                       value=default_md, height=520)
+                       value=default_md, height=560)
 
 if st.button("📄 生成 PDF", type="primary", use_container_width=True):
     with st.spinner("生成 PDF…"):
-        pdf_bytes = markdown_to_pdf(md_text)
+        pdf_bytes = markdown_to_pdf(md_text, charts)
     st.download_button("⬇️ 下载 PDF", data=pdf_bytes, file_name="生猪周报.pdf", mime="application/pdf",
                        use_container_width=True)

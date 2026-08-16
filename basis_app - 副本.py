@@ -144,7 +144,7 @@ def _build_contracts() -> List[str]:
     for y in range(21, 28):
         for m in ALL_MONTHS:
             c = f"LH{y}{m}"
-            if c >= "LH2109":
+            if "LH2109" <= c <= "LH2705":
                 cts.append(c)
     return cts
 
@@ -531,45 +531,6 @@ def load_futures(ct: str) -> Tuple[Optional[pd.DataFrame], str]:
 
 # ── 同步：全量 / 增量下载，写入本地 CSV ──
 
-def _backfill_hold(ct: str) -> bool:
-    """用 akshare 新浪接口补齐本地 CSV 中缺失的持仓量（hold）。
-
-    增量同步走东财兜底时不含持仓量，导致近期 hold 为 NaN；新浪接口有完整持仓量。
-    这里针对性回补缺失日期的 hold。返回是否补到了数据。
-    """
-    cp = _csv_path(ct)
-    if not cp.exists():
-        return False
-    try:
-        df = pd.read_csv(cp)
-        if "hold" not in df.columns or "date" not in df.columns:
-            return False
-        df["date"] = pd.to_datetime(df["date"])
-        missing = df["hold"].isna() | (df["hold"] == 0)
-        if not missing.any():
-            return False
-        import akshare as ak
-        full = ak.futures_zh_daily_sina(symbol=ct)
-        if full is None or full.empty or "hold" not in full.columns:
-            return False
-        full["date"] = pd.to_datetime(full["date"])
-        hold_map = dict(zip(full["date"], pd.to_numeric(full["hold"], errors="coerce")))
-        fixed = 0
-        for i in df.index[missing]:
-            d = df.at[i, "date"]
-            v = hold_map.get(d)
-            if v is not None and pd.notna(v) and v > 0:
-                df.at[i, "hold"] = v
-                fixed += 1
-        if fixed > 0:
-            df.to_csv(cp, index=False)
-            load_futures.clear(ct)
-            return True
-        return False
-    except Exception:
-        return False
-
-
 def sync_futures(ct: str, force_full: bool = False) -> Tuple[bool, str]:
     """同步合约期货数据到本地 CSV。
     - 已到期合约（停更 7 天+）跳过
@@ -581,9 +542,6 @@ def sync_futures(ct: str, force_full: bool = False) -> Tuple[bool, str]:
     # 已到期合约永远跳过（除非 force_full）
     if status == "expired" and not force_full:
         return True, "⏭️ 已到期，跳过"
-
-    # ★ 先回补缺失的持仓量（hold）
-    _backfill_hold(ct)
 
     cp = _csv_path(ct)
     today = _cst_now()
@@ -1082,7 +1040,7 @@ def fig_calendar_comparison(series: Dict[str, pd.DataFrame], tmon: str, data_dat
     fig.update_layout(title=title, xaxis_title="日期（月-日）", yaxis_title="基差（元/吨）",
         template="plotly_white", height=550, hovermode="x unified",
         legend=dict(orientation="h", y=1.02, x=0), margin=dict(t=80,b=40,l=60,r=40))
-    fig.update_xaxes(tickformat="%m月", dtick="M1", range=["2020-01-01","2020-12-31"])
+    fig.update_xaxes(tickformat="%m-%d", dtick="M1", range=["2020-01-01","2020-12-31"])
     fig.update_yaxes(autorange=True)
     return fig
 
@@ -1866,7 +1824,7 @@ def fig_spread_season(data: Dict[str, pd.DataFrame], ma: str, mb: str, data_date
     fig.update_layout(title=title, xaxis_title="日期（月-日）", yaxis_title="价差（元/吨）",
         template="plotly_white", height=550, hovermode="x unified",
         legend=dict(orientation="h", y=1.02, x=0), margin=dict(t=80,b=40,l=60,r=40))
-    fig.update_xaxes(tickformat="%m月", dtick="M1", range=["2020-01-01","2020-12-31"])
+    fig.update_xaxes(tickformat="%m-%d", dtick="M1", range=["2020-01-01","2020-12-31"])
     fig.update_yaxes(autorange=True)
     return fig
 
@@ -3063,449 +3021,6 @@ def tab4():
                 st.dataframe(pd.DataFrame(stats), use_container_width=True, hide_index=True)
 
 # ══════════════════════════════════════════════════════════════
-# ══════════════════════════════════════════════════════════════
-# 多空动能与资金异动分析（Tab 6 持仓与成交分析 ｜ 日报持仓板块共用）
-# ══════════════════════════════════════════════════════════════
-
-# 量价关系状态 → (状态标签, 市场含义, 多空定性, sentiment, 方向倾向)
-_PRICE_OI_STATES = {
-    "多头主动增仓": ("量价齐升", "强势看多，资金主动入场做多", "bull", "看多"),
-    "空头主动离场": ("减仓上行", "谨慎看多，由空头平仓推动，持续性存疑", "bull_weak", "谨慎看多"),
-    "空头主动增仓": ("量价齐跌", "强势看空，资金主动入场做空", "bear", "看空"),
-    "多头被动离场": ("减仓下行", "谨慎看空，由多头平仓推动，持续性存疑", "bear_weak", "谨慎看空"),
-    "价涨仓平": ("量价背离", "价格上涨但持仓未增，持续性存疑", "bull_weak", "谨慎看多"),
-    "价跌仓平": ("量价背离", "价格下跌但持仓未减，持续性存疑", "bear_weak", "谨慎看空"),
-    "价平": ("量价平稳", "价格持平，方向不明", "neutral", "中性"),
-}
-
-
-def _classify_price_oi(p_chg: float, o_chg: float) -> str:
-    """根据价格涨跌与持仓量变化组合，判定市场状态标签。"""
-    if p_chg > 0 and o_chg > 0:
-        return "多头主动增仓"
-    if p_chg > 0 and o_chg < 0:
-        return "空头主动离场"
-    if p_chg < 0 and o_chg > 0:
-        return "空头主动增仓"
-    if p_chg < 0 and o_chg < 0:
-        return "多头被动离场"
-    if p_chg > 0 and o_chg == 0:
-        return "价涨仓平"
-    if p_chg < 0 and o_chg == 0:
-        return "价跌仓平"
-    return "价平"
-
-
-def _divergence_status(net_chg: float, p_chg: float) -> str:
-    """前20净持仓变化方向与价格涨跌方向是否一致。"""
-    if pd.isna(net_chg) or pd.isna(p_chg):
-        return "—"
-    if net_chg > 0 and p_chg > 0:
-        return "共振偏多"
-    if net_chg < 0 and p_chg < 0:
-        return "共振偏空"
-    if net_chg > 0 and p_chg < 0:
-        return "背离（警惕反转）"
-    if net_chg < 0 and p_chg > 0:
-        return "背离（警惕反转）"
-    return "中性"
-
-
-def _classify_price_volume_oi(price_up: bool, vol_state: str, oi_up: bool) -> str:
-    """价格×成交量×持仓 三维配合度（增强版量价关系）。vol_state ∈ 放量/缩量/正常。"""
-    if vol_state == "正常":
-        return "量能平稳，多空均衡，趋势延续性待观察"
-    if price_up and vol_state == "放量" and oi_up:
-        return "🔥 强势上涨，资金主动做多，趋势健康"
-    if price_up and vol_state == "放量" and not oi_up:
-        return "⚠️ 空头止损离场，上涨可能加速但持续性存疑"
-    if price_up and vol_state == "缩量" and oi_up:
-        return "⚠️ 无量增仓，多空分歧但资金未形成合力"
-    if price_up and vol_state == "缩量" and not oi_up:
-        return "💤 无量上涨，缺乏资金支撑，警惕回落"
-    if not price_up and vol_state == "放量" and oi_up:
-        return "🔥 强势下跌，资金主动做空，趋势健康"
-    if not price_up and vol_state == "放量" and not oi_up:
-        return "⚠️ 多头止损离场，下跌可能加速但持续性存疑"
-    if not price_up and vol_state == "缩量" and oi_up:
-        return "⚠️ 无量增仓，多空僵持"
-    if not price_up and vol_state == "缩量" and not oi_up:
-        return "💤 无量下跌，缺乏资金支撑，警惕反弹"
-    return "量价配合平稳"
-
-
-def _compute_momentum_anomaly(fut_df, ct: str, ltd_ts) -> dict:
-    """多空动能与资金异动分析（Tab 6 与日报共用）。
-
-    基于：收盘价 close + 持仓量 hold/open_interest + 前20净持仓 net_position。
-    返回 dict：
-      available / state_* / momentum_* / divergence_* / score* / oi_chg_pct / detail_rows
-    """
-    empty = {
-        "available": False, "state_label": "—", "state_market": "—",
-        "state_bias": "—", "state_sentiment": "neutral", "state_series": [],
-        "momentum_ratio_current": None, "momentum_ratio_label": "—",
-        "momentum_series": pd.DataFrame(),
-        "divergence_series": [], "divergence_count": 0,
-        "divergence_warning": False,
-        "oi_chg_pct": None, "detail_rows": [],
-    }
-    if fut_df is None or fut_df.empty:
-        return empty
-    try:
-        df = fut_df.sort_values("date").reset_index(drop=True).copy()
-        if "close" not in df.columns or "date" not in df.columns:
-            return empty
-        oi_col = "open_interest" if "open_interest" in df.columns else ("hold" if "hold" in df.columns else None)
-        if oi_col is None:
-            return empty
-
-        df["close"] = pd.to_numeric(df["close"], errors="coerce")
-        df["oi"] = pd.to_numeric(df[oi_col], errors="coerce").replace(0, np.nan)
-
-        df["p_chg"] = df["close"].diff()
-        df["oi_chg"] = df["oi"].diff()
-        df["close_prev"] = df["close"].shift(1)
-        df["oi_prev"] = df["oi"].shift(1)
-
-        # ── 持仓动能比：(ΔOI/OI_prev) / (|ΔPrice|/Price_prev) ──
-        oi_rate = df["oi_chg"] / df["oi_prev"]
-        p_rate = df["p_chg"].abs() / df["close_prev"]
-        with np.errstate(divide="ignore", invalid="ignore"):
-            ratio = oi_rate / p_rate
-        ratio = np.where(
-            (df["oi_prev"] > 0) & (df["close_prev"] > 0) & (p_rate > 0),
-            ratio, np.nan)
-        # 价格零变动但持仓变化 → 比值趋近无穷大（资金异动）
-        ratio = np.where(
-            (df["oi_prev"] > 0) & (p_rate == 0) & (df["oi_chg"] != 0),
-            np.inf, ratio)
-        df["momentum_ratio"] = ratio
-        # 供图表使用：inf 替换为大值，避免破坏绘图
-        df["momentum_ratio_plot"] = np.where(np.isinf(ratio), 5.0, ratio)
-
-        # ── 量价关系状态 ──
-        p = df["p_chg"]
-        o = df["oi_chg"]
-        state = np.select(
-            [(p > 0) & (o > 0), (p > 0) & (o < 0), (p < 0) & (o > 0), (p < 0) & (o < 0),
-             (p > 0) & (o == 0), (p < 0) & (o == 0)],
-            ["多头主动增仓", "空头主动离场", "空头主动增仓", "多头被动离场",
-             "价涨仓平", "价跌仓平"],
-            default="价平")
-        df["state_label"] = np.where(p.isna() | o.isna(), "—", state)
-
-        # ── 定位当前交易日 ──
-        if ltd_ts is not None:
-            pos = df.index[df["date"] <= pd.Timestamp(ltd_ts)]
-            cur = int(pos[-1]) if len(pos) > 0 else len(df) - 1
-        else:
-            cur = len(df) - 1
-        cur_date = df["date"].iloc[cur]
-        # 当日持仓量是否缺失（缺失则不退回、不做 OI 相关计算）
-        oi_missing = bool(pd.isna(df["oi"].iloc[cur]))
-
-        # ── 量价关系：当前 + 近5日序列 ──
-        cur_label = df["state_label"].iloc[cur]
-        st_meta = _PRICE_OI_STATES.get(cur_label, ("—", "—", "neutral", "中性"))
-        recent5 = df.iloc[max(0, cur - 4):cur + 1]
-        state_series = [(r["date"], r["state_label"]) for _, r in recent5.iterrows()]
-
-        # ── 持仓动能比：当前 + 近20日走势 ──
-        ratio_cur = df["momentum_ratio"].iloc[cur]
-        ratio_cur = None if pd.isna(ratio_cur) else float(ratio_cur)
-        if ratio_cur is None:
-            ratio_label = "数据不足"
-        elif ratio_cur > 2.0:
-            ratio_label = "资金异动（偏高）"
-        elif ratio_cur < 0.3:
-            ratio_label = "资金跟进不足（偏低）"
-        else:
-            ratio_label = "正常"
-        momentum_series = df.iloc[max(0, cur - 19):cur + 1][["date", "momentum_ratio_plot", "momentum_ratio"]].copy()
-
-        # ── 持仓量变化率（当日） ──
-        oi_chg_pct = None
-        if not pd.isna(df["oi_prev"].iloc[cur]) and df["oi_prev"].iloc[cur] > 0 \
-                and not pd.isna(df["oi_chg"].iloc[cur]):
-            oi_chg_pct = float(df["oi_chg"].iloc[cur] / df["oi_prev"].iloc[cur] * 100)
-
-        # ── 持仓/成交比值 + 成交量深度分析 ──
-        vol = pd.to_numeric(df["volume"], errors="coerce") if "volume" in df.columns else None
-        oi_volume_ratio = oi_volume_ratio_20d = None
-        oi_volume_ratio_level = oi_volume_ratio_desc = "—"
-        volume_state = volume_vs_5d = volume_alert = None
-        price_volume_oi = price_chg_pct = volume_chg_pct = None
-
-        if vol is not None:
-            cur_vol = float(vol.iloc[cur]) if pd.notna(vol.iloc[cur]) and vol.iloc[cur] > 0 else None
-            # 持仓/成交比值（当日 + 近20日均值）
-            if not oi_missing and cur_vol is not None:
-                oi_volume_ratio = float(df["oi"].iloc[cur] / cur_vol)
-            win = df.iloc[max(0, cur - 19):cur + 1].copy()
-            win["vol"] = vol.iloc[max(0, cur - 19):cur + 1].values
-            valid_win = win[(win["oi"].notna()) & (win["vol"] > 0)]
-            if not valid_win.empty:
-                oi_volume_ratio_20d = float((valid_win["oi"] / valid_win["vol"]).mean())
-            if oi_volume_ratio is not None:
-                if oi_volume_ratio > 3.0:
-                    oi_volume_ratio_level, oi_volume_ratio_desc = "高", "资金沉淀，长线资金主导"
-                elif oi_volume_ratio >= 1.0:
-                    oi_volume_ratio_level, oi_volume_ratio_desc = "中等", "多空博弈均衡，短线与长线资金共存"
-                else:
-                    oi_volume_ratio_level, oi_volume_ratio_desc = "低", "投机性强，短线资金主导"
-            # 成交量状态（vs 前5日均值）
-            vol5 = float(vol.iloc[max(0, cur - 4):cur + 1].mean())
-            if cur_vol is not None and vol5 and vol5 > 0:
-                volume_vs_5d = cur_vol / vol5
-                if volume_vs_5d > 1.2:
-                    volume_state = "放量"
-                elif volume_vs_5d < 0.8:
-                    volume_state = "缩量"
-                else:
-                    volume_state = "正常"
-                volume_chg_pct = (volume_vs_5d - 1) * 100
-            # 成交量异动（vs 前20日均值）
-            vol20 = float(vol.iloc[max(0, cur - 19):cur + 1].mean())
-            if cur_vol is not None and vol20 and vol20 > 0:
-                if cur_vol > vol20 * 1.5:
-                    volume_alert = "🔥 成交量异常放大，关注方向选择"
-                elif cur_vol < vol20 * 0.5:
-                    volume_alert = "💤 成交量极度萎缩，市场观望情绪浓厚"
-                last3 = vol.iloc[max(0, cur - 2):cur + 1]
-                if len(last3) == 3 and all(last3 > vol20 * 1.2):
-                    volume_alert = "📈 连续放量，资金持续活跃"
-            # 价量配合（增强版）
-            if pd.notna(df["close_prev"].iloc[cur]) and df["close_prev"].iloc[cur] > 0:
-                price_chg_pct = float(df["p_chg"].iloc[cur] / df["close_prev"].iloc[cur] * 100)
-            if not oi_missing and pd.notna(df["oi_chg"].iloc[cur]):
-                price_up = df["p_chg"].iloc[cur] > 0
-                oi_up = df["oi_chg"].iloc[cur] > 0
-                price_volume_oi = _classify_price_volume_oi(price_up, volume_state or "正常", oi_up)
-
-        # ── 前20净持仓与价格背离 ──
-        net_df = None
-        try:
-            net_df = _load_aggregated_net(ct)
-        except Exception:
-            net_df = None
-        if net_df is None or net_df.empty:
-            try:
-                net_df = _ensure_net_cache(ct)
-            except Exception:
-                net_df = None
-
-        divergence_series = []
-        divergence_count = 0
-        divergence_warning = False
-        if net_df is not None and not net_df.empty and "net_position" in net_df.columns:
-            n = net_df.copy()
-            n["date"] = pd.to_datetime(n["date"])
-            merged = df.merge(n[["date", "net_position"]], on="date", how="inner").sort_values("date")
-            merged["net_chg"] = merged["net_position"].diff()
-            if not merged.empty:
-                m_cur = merged.index[merged["date"] <= cur_date]
-                m_last = int(m_cur[-1]) if len(m_cur) > 0 else len(merged) - 1
-                win = merged.iloc[max(0, m_last - 19):m_last + 1]
-                for _, r in win.iterrows():
-                    stt = _divergence_status(r["net_chg"], r["p_chg"])
-                    divergence_series.append({
-                        "date": r["date"], "close": r["close"],
-                        "net_position": r["net_position"], "status": stt,
-                    })
-                # 连续背离天数（截至最新交易日）
-                cnt = 0
-                for d in reversed(divergence_series):
-                    if "背离" in d["status"]:
-                        cnt += 1
-                    else:
-                        break
-                divergence_count = cnt
-                divergence_warning = cnt >= 3
-
-        # ── 明细表（近20日） ──
-        detail_rows = []
-        tbl = df.iloc[max(0, cur - 19):cur + 1]
-        net_map = {d["date"]: d["status"] for d in divergence_series}
-        for _, r in tbl.iterrows():
-            pct = None
-            if not pd.isna(r["oi_prev"]) and r["oi_prev"] > 0 and not pd.isna(r["oi_chg"]):
-                pct = float(r["oi_chg"] / r["oi_prev"] * 100)
-            ratio_v = r["momentum_ratio"]
-            detail_rows.append({
-                "date": r["date"],
-                "close": float(r["close"]) if pd.notna(r["close"]) else None,
-                "oi": float(r["oi"]) if pd.notna(r["oi"]) else None,
-                "oi_chg_pct": pct,
-                "ratio": None if pd.isna(ratio_v) else (float(ratio_v) if not np.isinf(ratio_v) else "∞"),
-                "state": r["state_label"],
-                "divergence": net_map.get(r["date"], "—"),
-            })
-
-        return {
-            "available": True,
-            "data_date": _cn(cur_date),
-            "oi_missing": oi_missing,
-            "state_label": cur_label,
-            "state_market": st_meta[0],
-            "state_bias": st_meta[1],
-            "state_sentiment": st_meta[2],
-            "state_series": state_series,
-            "momentum_ratio_current": ratio_cur,
-            "momentum_ratio_label": ratio_label,
-            "momentum_series": momentum_series,
-            "divergence_series": divergence_series,
-            "divergence_count": divergence_count,
-            "divergence_warning": divergence_warning,
-            "oi_chg_pct": oi_chg_pct,
-            "oi_volume_ratio": oi_volume_ratio,
-            "oi_volume_ratio_20d": oi_volume_ratio_20d,
-            "oi_volume_ratio_level": oi_volume_ratio_level,
-            "oi_volume_ratio_desc": oi_volume_ratio_desc,
-            "volume_state": volume_state,
-            "volume_vs_5d": volume_vs_5d,
-            "volume_chg_pct": volume_chg_pct,
-            "volume_alert": volume_alert,
-            "price_volume_oi": price_volume_oi,
-            "price_chg_pct": price_chg_pct,
-            "detail_rows": detail_rows,
-        }
-    except Exception:
-        return empty
-
-
-def _render_momentum_anomaly(anomaly: dict, ct: str, td):
-    """Tab 6 中渲染多空动能与资金异动分析模块（5段布局）。"""
-    st.markdown("## 🚨 多空动能与资金异动分析")
-
-    if not anomaly.get("available"):
-        st.info("📡 持仓量或价格数据不足，无法生成多空动能分析。")
-        return
-
-    st.caption(f"📅 分析数据截至：{anomaly.get('data_date', '—')}（持仓量缺失日自动回退至最近可比交易日）")
-
-    # 顶部警告：连续3日背离
-    if anomaly.get("divergence_warning"):
-        st.markdown(
-            '<div style="background:#fdecea;border:2px solid #E74C3C;border-radius:8px;'
-            'padding:12px 16px;margin:8px 0;font-weight:600;color:#c0392b;">'
-            '⚠️ 注意：前20净持仓与价格已连续3日背离，市场分歧加剧，谨慎追涨/杀跌！</div>',
-            unsafe_allow_html=True)
-
-    # ── 1. 量价关系状态卡片 ──
-    _sent_colors = {"bull": "#E74C3C", "bear": "#27AE60", "bull_weak": "#E67E22",
-                    "bear_weak": "#16A085", "neutral": "#95A5A6"}
-    s_color = _sent_colors.get(anomaly["state_sentiment"], "#95A5A6")
-    seq_html = " → ".join(
-        f'<span style="color:{_sent_colors.get(_PRICE_OI_STATES.get(lbl, ("—", "—", "neutral", "中性"))[2], "#555")};">{lbl}</span>'
-        for _d, lbl in anomaly["state_series"])
-    st.markdown(
-        f'<div style="background:#fff;border:1px solid #e3e6ea;border-radius:8px;padding:12px 16px;margin:8px 0;">'
-        f'<div style="font-size:0.9rem;color:#666;">当前交易日量价关系</div>'
-        f'<div style="font-size:1.2rem;font-weight:700;color:{s_color};">{anomaly["state_label"]}'
-        f'<span style="font-size:0.85rem;color:#888;font-weight:400;">（{anomaly["state_market"]}）</span></div>'
-        f'<div style="color:#555;font-size:0.92rem;margin-top:4px;">{anomaly["state_bias"]}</div>'
-        f'<div style="margin-top:8px;font-size:0.88rem;color:#333;">近5日状态：{seq_html}</div></div>',
-        unsafe_allow_html=True)
-
-    # ── 2.5 持仓/成交比值 + 成交量深度分析卡片 ──
-    if anomaly.get("oi_missing"):
-        st.warning("⚠️ 当日持仓量数据缺失，OI 相关指标（持仓/成交比、持仓变化率）暂不计算")
-    ovr = anomaly.get("oi_volume_ratio")
-    ovr_str = "—" if ovr is None else f"{ovr:.2f}"
-    ovr_20 = anomaly.get("oi_volume_ratio_20d")
-    ovr_20_str = "—" if ovr_20 is None else f"{ovr_20:.2f}"
-    ovr_compare = ""
-    if ovr is not None and ovr_20 is not None:
-        ovr_compare = "高于均值（资金沉淀偏强）" if ovr > ovr_20 else ("低于均值（投机偏强）" if ovr < ovr_20 else "与均值持平")
-    vstate = anomaly.get("volume_state") or "—"
-    vchg = anomaly.get("volume_chg_pct")
-    vchg_str = "—" if vchg is None else f"{vchg:+.0f}%"
-    vol_alert = anomaly.get("volume_alert")
-    pvo = anomaly.get("price_volume_oi") or "—"
-    pchg = anomaly.get("price_chg_pct")
-    pchg_str = "—" if pchg is None else f"{pchg:+.2f}%"
-    oichg = anomaly.get("oi_chg_pct")
-    oichg_str = "—" if oichg is None else f"{oichg:+.1f}%"
-    card_lines = [
-        f"📊 持仓/成交比值：<b>{ovr_str}</b>（近20日均值 {ovr_20_str}，{ovr_compare}，{anomaly.get('oi_volume_ratio_desc', '—')}）",
-        f"📊 成交量状态：<b>{vstate}</b>（较5日均值 {vchg_str}）",
-    ]
-    if vol_alert:
-        card_lines.append(f"📊 成交量异动：{vol_alert}")
-    card_lines.append(f"📈 价量配合：<b>{pvo}</b>（价格 {pchg_str}，成交量 {vchg_str}，持仓 {oichg_str}）")
-    st.markdown(
-        f'<div style="background:#fff;border:1px solid #e3e6ea;border-radius:8px;padding:12px 16px;margin:8px 0;">'
-        f'<div style="font-size:0.9rem;color:#666;margin-bottom:4px;">量价动能 · 持仓/成交比 &amp; 成交量深度分析</div>'
-        f'<div style="font-size:0.92rem;line-height:1.9;color:#333;">{"<br>".join(card_lines)}</div></div>',
-        unsafe_allow_html=True)
-
-    # ── 3. 中部：持仓动能比走势图 ──
-    mom = anomaly["momentum_series"]
-    if mom is not None and not mom.empty:
-        fig_mom = go.Figure()
-        fig_mom.add_trace(go.Scatter(
-            x=mom["date"], y=mom["momentum_ratio_plot"], mode="lines+markers",
-            name="持仓动能比", line=dict(color="#8E44AD", width=2),
-            hovertemplate="<b>%{x|%Y年%m月%d日}</b><br>动能比：%{y:.2f}<extra></extra>"))
-        fig_mom.add_hline(y=2.0, line_dash="dash", line_color="#E74C3C",
-                          annotation_text="2.0 阈值", annotation_font_color="#E74C3C")
-        fig_mom.add_hline(y=0.3, line_dash="dash", line_color="#E74C3C",
-                          annotation_text="0.3 阈值", annotation_font_color="#E74C3C")
-        fig_mom.update_layout(
-            title=f"{ct} 持仓动能比（近20交易日）｜当前：{anomaly['momentum_ratio_label']}",
-            xaxis_title="日期", yaxis_title="动能比",
-            template="plotly_white", height=360, hovermode="x unified",
-            legend=dict(orientation="h", y=1.12, x=0))
-        st.plotly_chart(fig_mom, use_container_width=True)
-    else:
-        st.caption("📊 持仓动能比：数据不足（持仓量缺失）")
-
-    # ── 4. 下部：前20净持仓与价格对比图（双轴） ──
-    div = anomaly["divergence_series"]
-    if div:
-        div_df = pd.DataFrame(div)
-        fig_div = go.Figure()
-        fig_div.add_trace(go.Scatter(
-            x=div_df["date"], y=div_df["close"], mode="lines", name="收盘价",
-            line=dict(color="#2C3E50", width=2), yaxis="y",
-            hovertemplate="<b>%{x|%Y年%m月%d日}</b><br>收盘价：%{y:,.0f}<extra></extra>"))
-        fig_div.add_trace(go.Scatter(
-            x=div_df["date"], y=div_df["net_position"], mode="lines", name="前20净持仓",
-            line=dict(color="#E67E22", width=2), yaxis="y2",
-            hovertemplate="<b>%{x|%Y年%m月%d日}</b><br>净持仓：%{y:+,}<extra></extra>"))
-        fig_div.update_layout(
-            title=f"{ct} 前20净持仓与价格（背离分析）",
-            xaxis=dict(title="日期"),
-            yaxis=dict(title="收盘价（元/吨）", side="left", showgrid=True),
-            yaxis2=dict(title="净持仓（手）", side="right", overlaying="y", showgrid=False),
-            template="plotly_white", height=360, hovermode="x unified",
-            legend=dict(orientation="h", y=1.12, x=0))
-        st.plotly_chart(fig_div, use_container_width=True)
-    else:
-        st.caption("🏢 前20净持仓数据暂不可用，无法进行背离分析")
-
-    # ── 5. 底部：详细数据表格（含背离状态标注） ──
-    rows = anomaly["detail_rows"]
-    if rows:
-        tbl = pd.DataFrame(rows)
-        tbl = tbl.rename(columns={
-            "date": "日期", "close": "收盘价", "oi": "持仓量",
-            "oi_chg_pct": "持仓变化率%", "ratio": "持仓动能比",
-            "state": "量价状态", "divergence": "背离状态"})
-        tbl["日期"] = tbl["日期"].apply(lambda d: _cn(d) if d is not None else "—")
-        tbl["收盘价"] = tbl["收盘价"].apply(lambda x: f"{x:,.0f}" if pd.notna(x) else "—")
-        tbl["持仓量"] = tbl["持仓量"].apply(lambda x: f"{x:,.0f}" if pd.notna(x) else "—")
-        tbl["持仓变化率%"] = tbl["持仓变化率%"].apply(
-            lambda x: f"{x:+.2f}" if x is not None else "—")
-        tbl["持仓动能比"] = tbl["持仓动能比"].apply(
-            lambda x: "∞" if x == "∞" else (f"{x:.2f}" if pd.notna(x) else "—"))
-
-        st.dataframe(tbl, use_container_width=True, hide_index=True)
-    else:
-        st.caption("📋 明细数据不足")
-
-
 # Tab 5：持仓与成交分析
 # ══════════════════════════════════════════════════════════════
 def tab5():
@@ -3548,11 +3063,6 @@ def tab5():
                 f"📅 **{_cn(pd.to_datetime(sel_date))}** 暂无交易数据，"
                 f"已自动切换至最近交易日 **{_cn(td)}**"
             )
-
-        # ── 多空动能与资金异动分析 ──
-        with st.spinner("计算多空动能与资金异动…"):
-            _anomaly = _compute_momentum_anomaly(fut_df, ct, td)
-        _render_momentum_anomaly(_anomaly, ct, td)
 
         # ── 上方：成交量/持仓量 双轴图 ──
         st.markdown("#### 📈 成交量与持仓量走势")
@@ -4186,9 +3696,6 @@ def tab6():
         available_cts = []
         skipped_cts = []
         for c in same_month_cts:
-            if not _csv_path(c).exists():  # 未上市/无数据合约直接跳过，避免触发联网下载卡顿
-                skipped_cts.append(c)
-                continue
             df, _ = load_futures(c)
             if df is not None and not df.empty:
                 available_cts.append(c)
@@ -4255,7 +3762,7 @@ def tab6():
                 ))
             fig_vol_s.update_layout(
                 title=f"{sel_month}月合约 成交量季节性对比",
-                xaxis=dict(title="日期（月-日）", tickformat="%m月", dtick="M1",
+                xaxis=dict(title="日期（月-日）", tickformat="%m-%d", dtick="M1",
                            range=["2020-01-01", "2020-12-31"]),
                 yaxis=dict(title="成交量（手）"),
                 template="plotly_white", height=420, hovermode="x unified",
@@ -4293,7 +3800,7 @@ def tab6():
                 ))
             fig_oi_s.update_layout(
                 title=f"{sel_month}月合约 持仓量季节性对比",
-                xaxis=dict(title="日期（月-日）", tickformat="%m月", dtick="M1",
+                xaxis=dict(title="日期（月-日）", tickformat="%m-%d", dtick="M1",
                            range=["2020-01-01", "2020-12-31"]),
                 yaxis=dict(title="持仓量（手）"),
                 template="plotly_white", height=420, hovermode="x unified",
@@ -4344,7 +3851,7 @@ def tab6():
                 ))
             fig_net.update_layout(
                 title=f"{sel_month}月合约 前20净持仓季节性对比",
-                xaxis=dict(title="日期（月-日）", tickformat="%m月", dtick="M1",
+                xaxis=dict(title="日期（月-日）", tickformat="%m-%d", dtick="M1",
                            range=["2020-01-01", "2020-12-31"]),
                 yaxis=dict(title="净持仓（多-空，手）"),
                 template="plotly_white", height=420, hovermode="x unified",
@@ -5395,7 +4902,7 @@ def _analyze_basis_historical(main_ct, spot_dict, fut_df, ltd, regions, snap) ->
     target_m, target_d = ltd.month, ltd.day
     tmon = ct_month(main_ct)
     same_month = [c for c in ALL_CONTRACTS if ct_month(c) == tmon]
-    avail = [c for c in same_month if _csv_path(c).exists() and load_futures(c)[0] is not None]
+    avail = [c for c in same_month if load_futures(c)[0] is not None]
     if not avail:
         return result
 
@@ -5575,103 +5082,11 @@ def _analyze_vol_oi_momentum(fut_df, ltd) -> dict:
                 "oi_decline": "计算异常", "vol_trend": "计算异常"}
 
 
-def _momentum_anomaly_html(anomaly, cn_date: str) -> str:
-    """多空动能与资金异动分析 → 日报 HTML 卡片"""
-    if not anomaly or not anomaly.get("available"):
-        return ""
-    warn = ""
-    if anomaly.get("divergence_warning"):
-        warn = ('<p style="margin-top:6px;color:#c0392b;font-weight:600;background:#fdecea;'
-                'padding:6px 10px;border-radius:4px;">⚠️ 前20净持仓与价格已连续3日背离，'
-                '市场分歧加剧，谨慎追涨/杀跌！</p>')
-    seq = " → ".join(lbl for _d, lbl in anomaly.get("state_series", []))
-    ratio = anomaly.get("momentum_ratio_current")
-    ratio_str = "—" if ratio is None else f"{ratio:.2f}"
-    oi_chg = anomaly.get("oi_chg_pct")
-    oi_chg_str = "—" if oi_chg is None else f"{oi_chg:+.2f}%"
-    pchg = anomaly.get("price_chg_pct")
-    pchg_str = "—" if pchg is None else f"{pchg:+.2f}%"
-    vchg = anomaly.get("volume_chg_pct")
-    vchg_str = "—" if vchg is None else f"{vchg:+.0f}%"
-    vstate = anomaly.get("volume_state") or "—"
-    vol_alert = anomaly.get("volume_alert")
-    ovr = anomaly.get("oi_volume_ratio")
-    ovr_str = "—" if ovr is None else f"{ovr:.2f}"
-    ovr_20 = anomaly.get("oi_volume_ratio_20d")
-    ovr_20_str = "—" if ovr_20 is None else f"{ovr_20:.2f}"
-    ovr_compare = ""
-    if ovr is not None and ovr_20 is not None:
-        ovr_compare = "高于均值（资金沉淀偏强）" if ovr > ovr_20 else ("低于均值（投机偏强）" if ovr < ovr_20 else "与均值持平")
-    pvo = anomaly.get("price_volume_oi") or "—"
-    oi_note = "（持仓量缺失，OI 指标暂不计算）" if anomaly.get("oi_missing") else ""
-    dd = anomaly.get("data_date", "")
-    dd_note = f"（数据截至 {dd}）" if dd and dd != cn_date else ""
-    return f"""
-        <div class="card">
-        <h2><span class="icon">🚨</span>多空动能与资金异动分析（{cn_date}）<span style="font-size:0.78rem;color:#999;">{dd_note}</span></h2>
-        <p style="font-size:0.92rem;line-height:1.9;">
-        • 量价状态：<b>{anomaly['state_label']}</b>（价格 {pchg_str}，成交量 {vchg_str}，持仓 {oi_chg_str}）{oi_note}<br>
-        • 价量配合：{pvo}<br>
-        • 持仓/成交比：<b>{ovr_str}</b>（近20日均值 {ovr_20_str}，{ovr_compare}，{anomaly.get('oi_volume_ratio_desc', '—')}）<br>
-        • 成交量状态：<b>{vstate}</b>（较5日均值 {vchg_str}）{vol_alert or ''}<br>
-        • 近5日状态：{seq}<br>
-        • 持仓动能比：<b>{ratio_str}</b>（{anomaly['momentum_ratio_label']}）<br>
-        • 前20净持仓背离：连续 <b>{anomaly['divergence_count']}</b> 日
-        </p>{warn}
-        <p style="font-size:0.72rem;color:#999;line-height:1.6;border-top:1px dashed #eee;padding-top:6px;margin-top:8px;">
-        计算方法：持仓变化率 = 当日持仓量变动 ÷ 前日持仓量 × 100%；<br>
-        持仓/成交比 = 当日持仓量 ÷ 当日成交量（&gt;3 资金沉淀、1~3 均衡、&lt;1 投机主导）；<br>
-        持仓动能比 = 持仓变化率 ÷ |价格变化率|。比值 &gt;2 资金异动，&lt;0.3 资金跟进不足；<br>
-        成交量状态 = 当日成交量 ÷ 前5日均量（&gt;1.2 放量、&lt;0.8 缩量）。
-        </p>
-        </div>"""
-
-
-def _momentum_anomaly_md(anomaly) -> str:
-    """多空动能与资金异动分析 → 日报 Markdown 板块"""
-    if not anomaly or not anomaly.get("available"):
-        return ""
-    seq = " → ".join(lbl for _d, lbl in anomaly.get("state_series", []))
-    ratio = anomaly.get("momentum_ratio_current")
-    ratio_str = "—" if ratio is None else f"{ratio:.2f}"
-    oi_chg = anomaly.get("oi_chg_pct")
-    oi_chg_str = "—" if oi_chg is None else f"{oi_chg:+.1f}%"
-    pchg = anomaly.get("price_chg_pct")
-    pchg_str = "—" if pchg is None else f"{pchg:+.2f}%"
-    vchg = anomaly.get("volume_chg_pct")
-    vchg_str = "—" if vchg is None else f"{vchg:+.0f}%"
-    vstate = anomaly.get("volume_state") or "—"
-    ovr = anomaly.get("oi_volume_ratio")
-    ovr_str = "—" if ovr is None else f"{ovr:.2f}"
-    ovr_20 = anomaly.get("oi_volume_ratio_20d")
-    ovr_20_str = "—" if ovr_20 is None else f"{ovr_20:.2f}"
-    ovr_compare = ""
-    if ovr is not None and ovr_20 is not None:
-        ovr_compare = "高于均值（资金沉淀偏强）" if ovr > ovr_20 else ("低于均值（投机偏强）" if ovr < ovr_20 else "与均值持平")
-    oi_note = "（持仓量缺失，OI 指标暂不计算）" if anomaly.get("oi_missing") else ""
-    warn = ("\n\n> ⚠️ 前20净持仓与价格已连续3日背离，市场分歧加剧，谨慎追涨/杀跌！"
-            if anomaly.get("divergence_warning") else "")
-    lines = [
-        "## 🚨 五、多空动能与资金异动分析",
-        "",
-        f"- 量价状态：**{anomaly['state_label']}**（价格 {pchg_str}，成交量 {vchg_str}，持仓 {oi_chg_str}）{oi_note}",
-        f"- 价量配合：{anomaly.get('price_volume_oi') or '—'}",
-        f"- 持仓/成交比：**{ovr_str}**（近20日均值 {ovr_20_str}，{ovr_compare}）",
-        f"- 成交量状态：**{vstate}**（较5日均值 {vchg_str}）",
-        f"- 近5日状态：{seq}",
-        f"- 持仓动能比：**{ratio_str}**（{anomaly['momentum_ratio_label']}）",
-        f"- 前20净持仓背离：连续 **{anomaly['divergence_count']}** 日",
-        "",
-        "> 计算方法：持仓变化率=当日持仓量变动÷前日持仓量×100%；持仓/成交比=当日持仓量÷当日成交量（>3资金沉淀、1~3均衡、<1投机主导）；持仓动能比=持仓变化率÷|价格变化率|（>2资金异动、<0.3资金跟进不足）；成交量状态=当日成交量÷前5日均量（>1.2放量、<0.8缩量）。",
-    ]
-    return "\n".join(lines) + warn
-
-
 def _build_daily_report_html(main_ct: str, fut_df, spot_dict, ltd, prev_td,
                               snap, holdings_analysis, spread_dict,
                               trend_direction, sr_lines_info, chart_images=None,
                               basis_enhanced=None, vol_oi_analysis=None,
-                              spread_date_str=None, momentum_anomaly=None) -> str:
+                              spread_date_str=None) -> str:
     """构建日报 HTML 内容。spread_dict 包含 delivery/window 两个板块"""
     cn_date = _cn(ltd)
     cn_prev = _cn(prev_td) if prev_td else "前一交易日"
@@ -5811,9 +5226,6 @@ def _build_daily_report_html(main_ct: str, fut_df, spot_dict, ltd, prev_td,
     # ── 构建基差分析HTML（含历史分位）──
     basis_analysis_html = _build_basis_analysis_html(snap, basis_enhanced, na_basis, max_region, max_basis, min_region, min_basis)
 
-    # ── 多空动能与资金异动分析卡片 ──
-    anomaly_card_html = _momentum_anomaly_html(momentum_anomaly, cn_date)
-
     # ── 构建 HTML ──
     html = f"""
 <!DOCTYPE html>
@@ -5900,7 +5312,6 @@ body {{ font-family: 'Microsoft YaHei', 'SimHei', sans-serif; background: #eef0f
 {vol_oi_html}
 </div>"""}
 
-{anomaly_card_html}
 {pos_card_html}
 
 <!-- 6. 技术分析 -->
@@ -5929,7 +5340,7 @@ body {{ font-family: 'Microsoft YaHei', 'SimHei', sans-serif; background: #eef0f
 def _build_daily_report_md(main_ct, fut_df, spot_dict, ltd, prev_td,
                             snap, holdings_analysis, key_spread_info,
                             trend_direction, sr_lines_info, basis_enhanced=None,
-                            vol_oi_analysis=None, momentum_anomaly=None) -> str:
+                            vol_oi_analysis=None) -> str:
     """构建日报 Markdown 内容"""
     cn_date = _cn(ltd)
     cn_prev = _cn(prev_td) if prev_td else "前一交易日"
@@ -5973,8 +5384,6 @@ def _build_daily_report_md(main_ct, fut_df, spot_dict, ltd, prev_td,
     res_str = "、".join(sr_lines_info.get("resistances", ["暂无"])) if sr_lines_info else "暂无"
     sup_str = "、".join(sr_lines_info.get("supports", ["暂无"])) if sr_lines_info else "暂无"
 
-    anomaly_section = _momentum_anomaly_md(momentum_anomaly)
-
     md = f"""# 🐷 生猪期货每日分析报告
 
 **报告日期：{cn_date}** ｜ 主力合约：{main_ct}
@@ -6007,14 +5416,13 @@ def _build_daily_report_md(main_ct, fut_df, spot_dict, ltd, prev_td,
 {key_spread_info if key_spread_info else "暂无价差数据"}
 
 {pos_section}
-{anomaly_section}
-## 📉 六、技术分析
+## 📉 五、技术分析
 
 - 趋势判断：**{trend_direction or '震荡'}**
 - 压力位：{res_str}
 - 支撑位：{sup_str}
 
-## 🎯 七、综合结论
+## 🎯 六、综合结论
 
 > 以上各维度综合判断，当前市场建议关注后续走势。
 
@@ -6177,7 +5585,7 @@ def _build_reportlab_pdf(html_content: str, cn_date: str, chart_images: dict = N
 
 
 # ★ 修改日报逻辑后递增此版本号，使旧缓存自动失效
-_DAILY_REPORT_VERSION = 20
+_DAILY_REPORT_VERSION = 19
 
 @st.cache_data(ttl=3600, show_spinner="正在生成日报…")
 def _compute_daily_report_cache(main_ct: str, spot_hash: int, _version: int = 0,
@@ -6243,9 +5651,6 @@ def _compute_daily_report_cache(main_ct: str, spot_hash: int, _version: int = 0,
     # ── 成交量/持仓量动能分析 ──
     vol_oi_analysis = _analyze_vol_oi_momentum(fut_df, ltd_ts)
 
-    # ── 多空动能与资金异动分析 ──
-    momentum_anomaly = _compute_momentum_anomaly(fut_df, main_ct, ltd_ts)
-
     # ── 技术分析（使用期货数据）──
     trend_dir, sr_info = _quick_technical(fut_df, ltd_ts)
 
@@ -6256,11 +5661,10 @@ def _compute_daily_report_cache(main_ct: str, spot_hash: int, _version: int = 0,
     html = _build_daily_report_html(main_ct, fut_df, spot_dict, ltd_ts, prev_td,
                                      snap, holdings_analysis, spread_dict,
                                      trend_dir, sr_info, chart_images, basis_enhanced,
-                                     vol_oi_analysis, spread_date, momentum_anomaly)
+                                     vol_oi_analysis, spread_date)
     md = _build_daily_report_md(main_ct, fut_df, spot_dict, ltd_ts, prev_td,
                                  snap, holdings_analysis, spread_info,
-                                 trend_dir, sr_info, basis_enhanced, vol_oi_analysis,
-                                 momentum_anomaly)
+                                 trend_dir, sr_info, basis_enhanced, vol_oi_analysis)
 
     return {"html": html, "md": md, "error": None,
             "ltd": ltd_ts, "cn_date": _cn(ltd_ts),
@@ -6574,7 +5978,7 @@ def _analyze_basis_delivery(main_ct, spot_dict, fut_df, ltd, regions, snap):
         return result
     tmon = ct_month(main_ct)
     same_month = [c for c in ALL_CONTRACTS if ct_month(c) == tmon]
-    avail = [c for c in same_month if _csv_path(c).exists() and load_futures(c)[0] is not None]
+    avail = [c for c in same_month if load_futures(c)[0] is not None]
     if not avail:
         return result
 
@@ -6624,7 +6028,7 @@ def _analyze_basis_window(main_ct, spot_dict, fut_df, ltd, regions, snap, window
         return result
     tmon = ct_month(main_ct)
     same_month = [c for c in ALL_CONTRACTS if ct_month(c) == tmon]
-    avail = [c for c in same_month if _csv_path(c).exists() and load_futures(c)[0] is not None]
+    avail = [c for c in same_month if load_futures(c)[0] is not None]
     if not avail:
         return result
 

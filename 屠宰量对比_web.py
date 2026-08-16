@@ -40,6 +40,16 @@ _SELF_CONFIG = [
 _PLOT_COLORS = ["#E74C3C", "#3498DB", "#27AE60", "#F39C12", "#9B59B6",
                 "#1ABC9C", "#E67E22", "#34495E", "#95A5A6", "#D35400"]
 
+# 年份固定配色（2021-2026）
+YEAR_COLOR = {
+    2026: "#E74C3C",  # 红
+    2025: "#27AE60",  # 绿
+    2024: "#000000",  # 黑
+    2023: "#3498DB",  # 蓝
+    2022: "#F1C40F",  # 黄
+    2021: "#9B59B6",  # 紫
+}
+
 
 # ══════════════════════════════════════════════════════════════
 # 农历工具
@@ -212,8 +222,9 @@ def extract_by_lunar(df, md_keys):
 
 def compute_stats(values):
     v = np.asarray(values, dtype=float)
-    return {"均值": float(np.mean(v)), "最大值": float(np.max(v)), "最小值": float(np.min(v)),
-            "标准差": float(np.std(v, ddof=1)) if len(v) > 1 else 0.0, "数据点": int(len(v))}
+    return {"均值": round(float(np.mean(v)), 2), "最大值": round(float(np.max(v)), 2),
+            "最小值": round(float(np.min(v)), 2),
+            "标准差": round(float(np.std(v, ddof=1)) if len(v) > 1 else 0.0, 2), "数据点": int(len(v))}
 
 
 # ══════════════════════════════════════════════════════════════
@@ -413,29 +424,32 @@ if run:
         ["📊 A时段详情", "📊 B时段详情", "📊 均值逐年对齐", "📊 综合汇总", "🔮 预测结果"])
 
     with tab1:
-        st.markdown(f"#### A 时段各年份每日值（{sel_name}）")
+        st.markdown(f"#### A 时段各年份每日值（{sel_name}，农历对齐）")
         fig = go.Figure()
         for i, (y, grp) in enumerate(sorted(a_years.items())):
-            fig.add_trace(go.Scatter(x=list(range(1, len(grp) + 1)), y=grp["value"],
+            x_lbl = [_md_label(k) for k in grp["lunar_md"]]
+            fig.add_trace(go.Scatter(x=x_lbl, y=grp["value"],
                                      mode="lines+markers", name=str(y),
-                                     line=dict(color=_PLOT_COLORS[i % len(_PLOT_COLORS)]),
-                                     customdata=grp["date"].tolist(),
-                                     hovertemplate=f"<b>{y}年</b><br>第%{{x}}天<br>值：%{{y:,.0f}}<extra></extra>"))
-        fig.update_layout(xaxis_title="第N天", yaxis_title="屠宰量（头）",
+                                     line=dict(color=YEAR_COLOR.get(y, "#95A5A6"), width=2),
+                                     customdata=grp["date"].dt.strftime("%Y-%m-%d").tolist(),
+                                     hovertemplate=f"<b>{y}年</b><br>农历%{{x}}（公历%{{customdata}}）<br>值：%{{y:,.2f}}<extra></extra>"))
+        fig.update_layout(xaxis_title="农历日期（各年份农历月日一致）", yaxis_title="屠宰量（头）",
                           template="plotly_white", height=420, hovermode="x unified")
         st.plotly_chart(fig, use_container_width=True)
         rows = [{"年份": y, **compute_stats(g["value"].tolist())} for y, g in sorted(a_years.items())]
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
     with tab2:
-        st.markdown(f"#### B 时段各年份每日值（{sel_name}）")
+        st.markdown(f"#### B 时段各年份每日值（{sel_name}，农历对齐）")
         fig = go.Figure()
         for i, (y, grp) in enumerate(sorted(b_years.items())):
-            fig.add_trace(go.Scatter(x=list(range(1, len(grp) + 1)), y=grp["value"],
+            x_lbl = [_md_label(k) for k in grp["lunar_md"]]
+            fig.add_trace(go.Scatter(x=x_lbl, y=grp["value"],
                                      mode="lines+markers", name=str(y),
-                                     line=dict(color=_PLOT_COLORS[i % len(_PLOT_COLORS)]),
-                                     hovertemplate=f"<b>{y}年</b><br>第%{{x}}天<br>值：%{{y:,.0f}}<extra></extra>"))
-        fig.update_layout(xaxis_title="第N天", yaxis_title="屠宰量（头）",
+                                     line=dict(color=YEAR_COLOR.get(y, "#95A5A6"), width=2),
+                                     customdata=grp["date"].dt.strftime("%Y-%m-%d").tolist(),
+                                     hovertemplate=f"<b>{y}年</b><br>农历%{{x}}（公历%{{customdata}}）<br>值：%{{y:,.2f}}<extra></extra>"))
+        fig.update_layout(xaxis_title="农历日期（各年份农历月日一致）", yaxis_title="屠宰量（头）",
                           template="plotly_white", height=420, hovermode="x unified")
         st.plotly_chart(fig, use_container_width=True)
         rows = [{"年份": y, **compute_stats(g["value"].tolist())} for y, g in sorted(b_years.items())]
@@ -454,9 +468,9 @@ if run:
         fig.update_layout(barmode="group", xaxis_title="年份", yaxis_title="均值（头）",
                           template="plotly_white", height=400)
         st.plotly_chart(fig, use_container_width=True)
-        rows = [{"年份": y, "A均值": a_mean[y], "B均值": b_mean[y],
-                 "差值(B-A)": b_mean[y] - a_mean[y],
-                 "变化率%": (b_mean[y] - a_mean[y]) / a_mean[y] * 100 if a_mean[y] else 0} for y in years]
+        rows = [{"年份": y, "A均值": round(a_mean[y], 2), "B均值": round(b_mean[y], 2),
+                 "差值(B-A)": round(b_mean[y] - a_mean[y], 2),
+                 "变化率%": round((b_mean[y] - a_mean[y]) / a_mean[y] * 100, 2) if a_mean[y] else 0} for y in years]
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
     with tab4:
@@ -466,9 +480,9 @@ if run:
             diff = bm - am
             rate = diff / am * 100 if am else 0
             c1, c2, c3 = st.columns(3)
-            c1.metric("A时段总体均值", f"{am:,.0f}")
-            c2.metric("B时段总体均值", f"{bm:,.0f}")
-            c3.metric("变化率", f"{rate:+.2f}%", f"差值 {diff:+,.0f}")
+            c1.metric("A时段总体均值", f"{am:,.2f}")
+            c2.metric("B时段总体均值", f"{bm:,.2f}")
+            c3.metric("变化率", f"{rate:+.2f}%", f"差值 {diff:+,.2f}")
         else:
             st.info("数据不足")
 
@@ -481,7 +495,7 @@ if run:
         if pr is None:
             st.warning("数据不足，无法预测")
         else:
-            st.markdown(f"**今年基准值：{pr['base_mean']:,.0f} 头**（基准期：预测区间前 {n} 天）")
+            st.markdown(f"**今年基准值：{pr['base_mean']:,.2f} 头**（基准期：预测区间前 {n} 天）")
 
             # 取值明细
             st.markdown("##### 历史年份取值明细")
@@ -508,7 +522,7 @@ if run:
                                       "预测均值": float(np.mean(daily)),
                                       "变化率%": s["rate"] * 100})
             pred_df = pd.DataFrame(pred_rows)
-            st.dataframe(pred_df.style.format({"预测均值": "{:,.0f}", "变化率%": "{:+.2f}"}),
+            st.dataframe(pred_df.style.format({"预测均值": "{:,.2f}", "变化率%": "{:+.2f}"}),
                          use_container_width=True, hide_index=True)
 
             # 各方案预测时间段均值（柱状图）
@@ -527,9 +541,9 @@ if run:
                     names.append(s["name"])
                     means.append(float(np.mean(s["daily"])))
             fig.add_trace(go.Bar(x=names, y=means, marker_color="#2E86AB",
-                                 hovertemplate="%{x}<br>预测均值：%{y:,.0f}<extra></extra>"))
+                                 hovertemplate="%{x}<br>预测均值：%{y:,.2f}<extra></extra>"))
             fig.add_hline(y=pr["base_mean"], line_dash="dash", line_color="#E74C3C",
-                          annotation_text=f"今年基准均值 {pr['base_mean']:,.0f}")
+                          annotation_text=f"今年基准均值 {pr['base_mean']:,.2f}")
             fig.update_layout(xaxis_title="方案", yaxis_title="预测时间段均值（头）",
                               template="plotly_white", height=380)
             st.plotly_chart(fig, use_container_width=True)
