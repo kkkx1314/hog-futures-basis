@@ -6800,16 +6800,10 @@ def tab_daily_report():
     with col_title:
         st.caption(f"📅 报告日期：{cn_date} ｜ 主力合约：{main_ct}")
     with col_btn1:
-        pdf_data = _build_reportlab_pdf(html, cn_date, chart_images)
-        if pdf_data:
-            st.download_button("📄 下载 PDF", data=pdf_data,
-                file_name=f"生猪期货日报_{cn_date.replace('年','').replace('月','').replace('日','')}.pdf",
-                mime="application/pdf", use_container_width=True, key="dl_pdf")
-        else:
-            st.download_button("📄 下载 HTML", data=html.encode("utf-8"),
-                file_name=f"生猪期货日报_{cn_date.replace('年','').replace('月','').replace('日','')}.html",
-                mime="text/html", use_container_width=True, key="dl_html",
-                help="PDF库不可用，浏览器打开HTML后可打印为PDF")
+        st.download_button("📄 下载 HTML", data=html.encode("utf-8"),
+            file_name=f"生猪期货日报_{cn_date.replace('年','').replace('月','').replace('日','')}.html",
+            mime="text/html", use_container_width=True, key="dl_html",
+            help="下载为HTML文件，浏览器打开后可打印为PDF")
 
     with col_btn2:
         png_data = _compose_report_image(chart_images, cn_date, main_ct)
