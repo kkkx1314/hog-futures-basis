@@ -595,6 +595,21 @@ def _backfill_futures_fields(ct: str) -> bool:
                     changed = True
             if changed:
                 fixed += 1
+
+        # ★ 东财兜底交叉校验「最新交易日」持仓量（东财持仓量对齐 DCE 官方口径，新浪最新日常滞后）
+        if "hold" in df.columns and not df.empty:
+            em_hold = _fetch_eastmoney_hold_map(ct)
+            if em_hold:
+                latest_d = df["date"].max()
+                em_v = em_hold.get(latest_d)
+                if em_v is not None and pd.notna(em_v) and em_v > 0:
+                    cur_v = df.loc[df["date"] == latest_d, "hold"]
+                    if not cur_v.empty:
+                        cv = cur_v.iloc[0]
+                        if pd.isna(cv) or abs(float(cv) - float(em_v)) > 1:
+                            df.loc[df["date"] == latest_d, "hold"] = em_v
+                            fixed += 1
+
         if fixed > 0:
             df.to_csv(cp, index=False)
             load_futures.clear(ct)
@@ -602,6 +617,32 @@ def _backfill_futures_fields(ct: str) -> bool:
         return False
     except Exception:
         return False
+
+
+def _fetch_eastmoney_hold_map(ct: str) -> dict:
+    """从东财 kline 接口拉取持仓量(f63)，返回 {date: hold}。
+    东财持仓量与 DCE 官方口径一致，用于交叉校验新浪最新日可能滞后的持仓量。
+    失败返回空 dict。"""
+    try:
+        r = requests.get("https://push2his.eastmoney.com/api/qt/stock/kline/get",
+            params={"secid": f"114.{ct}", "fields1": "f1,f2,f3,f4,f5,f6",
+                    "fields2": "f51,f52,f53,f54,f55,f56,f57,f63", "klt": "101",
+                    "fqt": "1", "end": "20500101", "lmt": "3000"},
+            timeout=8, headers={"User-Agent": "Mozilla/5.0", "Referer": "https://quote.eastmoney.com/"})
+        if r.status_code == 200:
+            d = r.json()
+            if d and d.get("data") and d["data"].get("klines"):
+                out = {}
+                for k in d["data"]["klines"]:
+                    p = k.split(",")
+                    if len(p) >= 8:
+                        h = pd.to_numeric(p[7], errors="coerce")
+                        if pd.notna(h) and h > 0:
+                            out[pd.to_datetime(p[0])] = h
+                return out
+    except Exception:
+        pass
+    return {}
 
 
 def sync_futures(ct: str, force_full: bool = False) -> Tuple[bool, str]:
