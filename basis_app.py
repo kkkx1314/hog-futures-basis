@@ -696,10 +696,10 @@ def _download_futures(ct: str, sd: str, ed: str) -> Optional[pd.DataFrame]:
             #    场景：Sina API 未及时更新当天数据时，eastmoney 可能已有数据。
     except Exception:
         pass
-    # eastmoney 兜底：只试 1 次
+    # eastmoney 兜底：只试 1 次（f63 = 持仓量，补齐 hold，避免依赖新浪时序）
     try:
         r = requests.get("https://push2his.eastmoney.com/api/qt/stock/kline/get",
-            params={"secid":f"114.{ct}","fields1":"f1,f2,f3,f4,f5,f6","fields2":"f51,f52,f53,f54,f55,f56,f57","klt":"101","fqt":"1","end":"20500101","lmt":"3000"},
+            params={"secid":f"114.{ct}","fields1":"f1,f2,f3,f4,f5,f6","fields2":"f51,f52,f53,f54,f55,f56,f57,f63","klt":"101","fqt":"1","end":"20500101","lmt":"3000"},
             timeout=8, headers={"User-Agent":"Mozilla/5.0","Referer":"https://quote.eastmoney.com/"})
         if r.status_code == 200:
             d = r.json()
@@ -707,9 +707,11 @@ def _download_futures(ct: str, sd: str, ed: str) -> Optional[pd.DataFrame]:
                 recs = []
                 for k in d["data"]["klines"]:
                     p = k.split(",")
-                    if len(p) >= 7:
+                    # fields2 顺序：f51日期 f52开 f53收 f54高 f55低 f56量 f57额 f63持仓量
+                    if len(p) >= 8:
+                        hold = pd.to_numeric(p[7], errors="coerce")
                         recs.append({"date":pd.to_datetime(p[0]),"open":float(p[1]),"close":float(p[2]),
-                                     "high":float(p[3]),"low":float(p[4]),"volume":int(float(p[5])),"settle":float(p[2]),"hold":np.nan})
+                                     "high":float(p[3]),"low":float(p[4]),"volume":int(float(p[5])),"settle":float(p[2]),"hold":hold})
                 if recs:
                     em_df = pd.DataFrame(recs).sort_values("date")
                     return em_df[(em_df["date"]>=sd)&(em_df["date"]<=ed)].reset_index(drop=True)
