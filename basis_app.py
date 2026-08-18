@@ -537,35 +537,63 @@ def load_futures(ct: str) -> Tuple[Optional[pd.DataFrame], str]:
 
 # ── 同步：全量 / 增量下载，写入本地 CSV ──
 
-def _backfill_hold(ct: str) -> bool:
-    """用 akshare 新浪接口补齐本地 CSV 中缺失的持仓量（hold）。
+def _backfill_futures_fields(ct: str) -> bool:
+    """用 akshare 新浪接口补齐/纠正本地 CSV 中的持仓量(hold)、结算价(settle)、成交量(volume)。
 
-    增量同步走东财兜底时不含持仓量，导致近期 hold 为 NaN；新浪接口有完整持仓量。
-    这里针对性回补缺失日期的 hold。返回是否补到了数据。
+    增量同步走东财兜底时：hold 为 NaN、settle 被写成 close（东财 kline 无结算价）、
+    volume 与新浪不一致。这里按新浪（主数据源）逐日纠正。返回是否修改了数据。
     """
     cp = _csv_path(ct)
     if not cp.exists():
         return False
     try:
         df = pd.read_csv(cp)
-        if "hold" not in df.columns or "date" not in df.columns:
+        if "date" not in df.columns:
             return False
         df["date"] = pd.to_datetime(df["date"])
-        missing = df["hold"].isna() | (df["hold"] == 0)
-        if not missing.any():
-            return False
         import akshare as ak
         full = ak.futures_zh_daily_sina(symbol=ct)
-        if full is None or full.empty or "hold" not in full.columns:
+        if full is None or full.empty:
             return False
         full["date"] = pd.to_datetime(full["date"])
-        hold_map = dict(zip(full["date"], pd.to_numeric(full["hold"], errors="coerce")))
+        col_map = {}
+        for col in ["hold", "settle", "volume"]:
+            if col in full.columns:
+                col_map[col] = dict(zip(full["date"], pd.to_numeric(full[col], errors="coerce")))
+        if not col_map:
+            return False
+
+        def _differs(cur, v, tol: float = 1e-6) -> bool:
+            if v is None or pd.isna(v):
+                return False
+            if cur is None or pd.isna(cur):
+                return True
+            return abs(float(cur) - float(v)) > tol
+
         fixed = 0
-        for i in df.index[missing]:
-            d = df.at[i, "date"]
-            v = hold_map.get(d)
-            if v is not None and pd.notna(v) and v > 0:
-                df.at[i, "hold"] = v
+        for i, row in df.iterrows():
+            d = row["date"]
+            changed = False
+            # 持仓量：NaN/0 → 新浪正值回补
+            if "hold" in df.columns and "hold" in col_map:
+                v = col_map["hold"].get(d)
+                cur = row.get("hold")
+                if v is not None and pd.notna(v) and v > 0 and (cur is None or pd.isna(cur) or cur == 0):
+                    df.at[i, "hold"] = v
+                    changed = True
+            # 结算价：与新浪不一致 → 纠正（东财兜底写成 close）
+            if "settle" in df.columns and "settle" in col_map:
+                v = col_map["settle"].get(d)
+                if _differs(row.get("settle"), v):
+                    df.at[i, "settle"] = v
+                    changed = True
+            # 成交量：与新浪不一致 → 纠正
+            if "volume" in df.columns and "volume" in col_map:
+                v = col_map["volume"].get(d)
+                if _differs(row.get("volume"), v):
+                    df.at[i, "volume"] = v
+                    changed = True
+            if changed:
                 fixed += 1
         if fixed > 0:
             df.to_csv(cp, index=False)
@@ -588,8 +616,8 @@ def sync_futures(ct: str, force_full: bool = False) -> Tuple[bool, str]:
     if status == "expired" and not force_full:
         return True, "⏭️ 已到期，跳过"
 
-    # ★ 先回补缺失的持仓量（hold）
-    _backfill_hold(ct)
+    # ★ 先回补/纠正持仓量(hold)、结算价(settle)、成交量(volume)
+    _backfill_futures_fields(ct)
 
     cp = _csv_path(ct)
     today = _cst_now()
