@@ -150,6 +150,12 @@ def _build_contracts() -> List[str]:
 
 ALL_CONTRACTS = _build_contracts()
 
+# 日报可选价差对（远月-近月，同一合约年度内相邻月份）
+SPREAD_PAIRS = [("11", "09"), ("09", "07"), ("07", "05"), ("05", "03"), ("03", "01")]
+
+def spread_pair_label(ma: str, mb: str) -> str:
+    return f"{ma}月-{mb}月"
+
 def ct_display(c: str) -> str:
     return f"生猪20{c[2:4]}年{c[4:6]}月（{c}）"
 
@@ -2564,7 +2570,7 @@ def _gen_tab6_conclusion(vol_data: Dict, oi_data: Dict, net_data: Dict, sel_mont
         latest_vol = max(non_avg_vol_cur.items(), key=lambda x: x[1]["date"].max())
         if not latest_vol[1].empty:
             vr = _get_row_at_md(latest_vol[1], target_m, target_d)
-            if vr is not None:
+            if vr is not None and pd.notna(vr["volume"]):
                 cur_v = int(vr["volume"])
                 cname = latest_vol[0].split()[0] if ' ' in latest_vol[0] else latest_vol[0]
                 items.append(f"分析合约：{cname}")
@@ -2572,7 +2578,7 @@ def _gen_tab6_conclusion(vol_data: Dict, oi_data: Dict, net_data: Dict, sel_mont
                 # ★ 使用图表中的历史均值线
                 if avg_vol_df is not None and not avg_vol_df.empty:
                     arow = avg_vol_df[(avg_vol_df["plot_date"].dt.month == target_m) & (avg_vol_df["plot_date"].dt.day == target_d)]
-                    if not arow.empty:
+                    if not arow.empty and pd.notna(arow["volume"].iloc[-1]):
                         hist_avg_v = int(arow["volume"].iloc[-1])
                         pct_v = (cur_v - hist_avg_v) / hist_avg_v * 100 if hist_avg_v > 0 else 0
                         direction = "偏高" if pct_v > 15 else ("偏低" if pct_v < -15 else "持平")
@@ -2586,17 +2592,17 @@ def _gen_tab6_conclusion(vol_data: Dict, oi_data: Dict, net_data: Dict, sel_mont
         latest_oi = max(non_avg_oi_cur.items(), key=lambda x: x[1]["date"].max())
         if not latest_oi[1].empty:
             oir = _get_row_at_md(latest_oi[1], target_m, target_d)
-            if oir is not None:
+            if oir is not None and pd.notna(oir["open_interest"]):
                 cur_o = int(oir["open_interest"])
                 if avg_oi_df is not None and not avg_oi_df.empty:
                     arow = avg_oi_df[(avg_oi_df["plot_date"].dt.month == target_m) & (avg_oi_df["plot_date"].dt.day == target_d)]
-                    if not arow.empty:
+                    if not arow.empty and pd.notna(arow["open_interest"].iloc[-1]):
                         hist_avg_o = int(arow["open_interest"].iloc[-1])
                         oi_pct = (cur_o - hist_avg_o) / hist_avg_o * 100 if hist_avg_o > 0 else 0
                         direction_o = "偏高" if oi_pct > 15 else ("偏低" if oi_pct < -15 else "持平")
                         items.append(f"• 当前持仓量（{_cn_md(ltd)}）：{cur_o:,}手，较历史同期{direction_o}{abs(oi_pct):.0f}%")
                 # 近期变化
-                if len(latest_oi[1]) >= 20:
+                if len(latest_oi[1]) >= 20 and pd.notna(latest_oi[1]["open_interest"].iloc[-20]):
                     recent_o = int(latest_oi[1]["open_interest"].iloc[-20])
                     if cur_o > recent_o * 1.05:
                         trend = "增仓趋势"
@@ -4890,21 +4896,25 @@ def _build_vol_oi_seasonal_cached(
             ty_str = str(trade_yr)
             label = f"{c[2:]} ({ty_str})"
             if "volume" in grp.columns:
+                # ★ 剔除 NaN 行，避免下游 int(NaN) 崩溃
+                vgrp = grp[grp["volume"].notna()]
                 vol_data[label] = pd.DataFrame({
-                    "plot_date": grp["plot_date"].values,
-                    "volume": grp["volume"].values,
-                    "date": grp["date"].values,
+                    "plot_date": vgrp["plot_date"].values,
+                    "volume": vgrp["volume"].values,
+                    "date": vgrp["date"].values,
                 }).sort_values("plot_date")
             oi_col = "open_interest" if "open_interest" in grp.columns else ("hold" if "hold" in grp.columns else None)
             if oi_col:
+                # ★ 剔除 NaN 行，避免下游 int(NaN) 崩溃
+                ogrp = grp[grp[oi_col].notna()]
                 oi_data[label] = pd.DataFrame({
-                    "plot_date": grp["plot_date"].values,
-                    "open_interest": grp[oi_col].values,
-                    "date": grp["date"].values,
+                    "plot_date": ogrp["plot_date"].values,
+                    "open_interest": ogrp[oi_col].values,
+                    "date": ogrp["date"].values,
                 }).sort_values("plot_date")
             for _, row in grp.iterrows():
                 md = (row["date"].month, row["date"].day)
-                if "volume" in grp.columns:
+                if "volume" in grp.columns and pd.notna(row["volume"]):
                     vol_collector[md].append(int(row["volume"]))
                 if oi_col and pd.notna(row[oi_col]):
                     oi_collector[md].append(int(row[oi_col]))
@@ -5642,7 +5652,7 @@ def _build_daily_report_html(main_ct: str, fut_df, spot_dict, ltd, prev_td,
     if chart_images:
         if "basis_comparison" in chart_images:
             chart_html += f'''<div class="card chart-card">
-<h2><span class="icon">📊</span>主力合约基差季节对比</h2>
+<h2><span class="icon">📊</span>合约基差季节对比</h2>
 <img src="data:image/png;base64,{chart_images['basis_comparison']}" alt="基差对比">
 </div>'''
         if "spread_trend" in chart_images:
@@ -5702,7 +5712,7 @@ body {{ font-family: 'Microsoft YaHei', 'SimHei', sans-serif; background: #eef0f
 
 <div class="header">
 <h1>🐷 生猪期货每日分析报告</h1>
-<div class="sub">报告日期：{cn_date} ｜ 主力合约：{main_ct}</div>
+<div class="sub">报告日期：{cn_date} ｜ 分析合约：{main_ct}</div>
 <div class="sub" style="font-size:0.75rem;margin-top:4px;">
 期货数据截止：{_cn(fut_df['date'].max()) if fut_df is not None else '—'} ｜
 持仓数据截止：{ha.get('data_date', '—') if ha else '—'} ｜
@@ -5818,7 +5828,7 @@ def _build_daily_report_md(main_ct, fut_df, spot_dict, ltd, prev_td,
 
     md = f"""# 🐷 生猪期货每日分析报告
 
-**报告日期：{cn_date}** ｜ 主力合约：{main_ct}
+**报告日期：{cn_date}** ｜ 分析合约：{main_ct}
 
 > 数据来源：涌益咨询现货数据 ｜ 大连商品交易所期货数据
 
@@ -6018,13 +6028,13 @@ def _build_reportlab_pdf(html_content: str, cn_date: str, chart_images: dict = N
 
 
 # ★ 修改日报逻辑后递增此版本号，使旧缓存自动失效
-_DAILY_REPORT_VERSION = 20
+_DAILY_REPORT_VERSION = 21
 
 @st.cache_data(ttl=3600, show_spinner="正在生成日报…")
 def _compute_daily_report_cache(main_ct: str, spot_hash: int, _version: int = 0,
-                                 target_date=None) -> dict:
+                                 target_date=None, spread_ma: str = "11", spread_mb: str = "09") -> dict:
     """缓存日报计算。target_date 为可选的目标日期（pd.Timestamp 或 date），
-    不传则自动使用期货数据最新交易日。"""
+    不传则自动使用期货数据最新交易日。spread_ma/spread_mb 指定价差对。"""
     spot_dict, _ = load_spot(str(SPOT_PATH))
     fut_df, _ = load_futures(main_ct)
     if fut_df is None or fut_df.empty:
@@ -6076,9 +6086,9 @@ def _compute_daily_report_cache(main_ct: str, spot_hash: int, _version: int = 0,
     basis_enhanced = _compute_basis_enhanced(main_ct, spot_dict, fut_df, ltd_ts, regions, snap)
 
     # ── 价差：三种对齐方式 ──
-    spread_dict = _compute_key_spread(main_ct, ltd_ts)
-    # 兼容旧代码：提取日历对齐作为默认
-    spread_info = spread_dict.get("calendar", ("暂无价差数据", ""))[0] if spread_dict else "暂无价差数据"
+    spread_dict = _compute_key_spread(main_ct, ltd_ts, spread_ma, spread_mb)
+    # 兼容旧代码：提取交易日对齐作为默认
+    spread_info = spread_dict.get("delivery", ("暂无价差数据", ""))[0] if spread_dict else "暂无价差数据"
     spread_date = spread_dict.get("delivery", ("", ""))[1] if spread_dict else ""
 
     # ── 成交量/持仓量动能分析 ──
@@ -6091,7 +6101,7 @@ def _compute_daily_report_cache(main_ct: str, spot_hash: int, _version: int = 0,
     trend_dir, sr_info = _quick_technical(fut_df, ltd_ts)
 
     # ── 生成图表 ──
-    chart_images = _generate_report_charts(main_ct, spot_dict, ltd_ts)
+    chart_images = _generate_report_charts(main_ct, spot_dict, ltd_ts, spread_ma, spread_mb)
 
     # ── 构建HTML和MD ──
     html = _build_daily_report_html(main_ct, fut_df, spot_dict, ltd_ts, prev_td,
@@ -6236,7 +6246,7 @@ def _analyze_holdings_for_report(holdings_df, main_ct, ltd, holdings_actual_date
     }
 
 
-def _generate_report_charts(main_ct, spot_dict, ltd) -> dict:
+def _generate_report_charts(main_ct, spot_dict, ltd, ma: str = "11", mb: str = "09") -> dict:
     """生成日报所需图表，返回 {name: base64_png}"""
     import base64
     charts = {}
@@ -6262,9 +6272,8 @@ def _generate_report_charts(main_ct, spot_dict, ltd) -> dict:
     except Exception:
         pass
 
-    # 2. 价差同期对比图（11-09，交易日对齐）
+    # 2. 价差同期对比图（默认 11-09，交易日对齐，日报可指定价差对）
     try:
-        ma, mb = "11", "09"
         valid_years = []
         for y in range(21, 28):
             ca, cb = f"LH{y:02d}{ma}", f"LH{y:02d}{mb}"
@@ -6296,21 +6305,20 @@ def _generate_report_charts(main_ct, spot_dict, ltd) -> dict:
     return charts
 
 
-def _compute_key_spread(main_ct: str, ltd=None):
-    """返回 dict，含两种交易日对齐方式的价差分析（11月-09月）：
+def _compute_key_spread(main_ct: str, ltd=None, ma: str = "11", mb: str = "09"):
+    """返回 dict，含两种交易日对齐方式的价差分析（默认 11月-09月，可用 ma/mb 指定）：
     { 'delivery': (html_text, date_str),
       'window': (html_text, date_str) }
     """
     result = {"delivery": ("暂无足够合约计算价差", ""),
               "window": ("暂无足够合约计算价差", "")}
     try:
-        # ★ 固定用 11-09 价差对
-        ma, mb = "11", "09"
+        # ★ 价差对（默认 11-09，日报可由用户选择）
         yr = int(f"20{main_ct[2:4]}")
-        ct_a = f"LH{yr:02d}11"
-        ct_b = f"LH{yr:02d}09"
+        ct_a = f"LH{yr:02d}{ma}"
+        ct_b = f"LH{yr:02d}{mb}"
         if ct_a not in ALL_CONTRACTS or ct_b not in ALL_CONTRACTS:
-            ct_a = "LH2611"; ct_b = "LH2609"
+            ct_a = f"LH26{ma}"; ct_b = f"LH26{mb}"
 
         dfa, _ = load_futures(ct_a)
         dfb, _ = load_futures(ct_b)
@@ -6749,21 +6757,14 @@ def tab_daily_report():
     """Tab 1: 每日期货分析日报"""
     st.subheader("📋 每日期货分析日报")
 
-    main_ct = get_main_contract()
+    default_ct = get_main_contract()
+    # 合约选项：全部历史合约（默认主力合约），用户可自由选择
+    ct_opts = ALL_CONTRACTS
     spot_dict, _ = load_spot(str(SPOT_PATH))
     spot_hash = _spot_hash(spot_dict)
 
-    # ── 获取期货可用日期列表 ──
-    fut_df_raw, _ = load_futures(main_ct)
-    if fut_df_raw is not None and not fut_df_raw.empty:
-        avail_dates = sorted(fut_df_raw["date"].dt.date.unique())
-        latest_date = avail_dates[-1]
-    else:
-        avail_dates = [datetime.now().date()]
-        latest_date = datetime.now().date()
-
-    # ── 控件行：刷新 + 合约 + 日期选择 ──
-    col_refresh, col_ct, col_date = st.columns([0.8, 1.2, 1.5])
+    # ── 控件行：刷新 + 合约 + 价差对 + 日期 ──
+    col_refresh, col_ct, col_spread, col_date = st.columns([0.7, 1.4, 1.2, 1.4])
     with col_refresh:
         if st.button("🔄 刷新日报", key="refresh_daily",
                      help="强制重新生成日报（有新数据时点击）"):
@@ -6772,7 +6773,25 @@ def tab_daily_report():
             _compute_daily_report_cache.clear()
             st.rerun()
     with col_ct:
-        st.caption(f"📌 主力合约：**{main_ct}**")
+        sel_ct = st.selectbox(
+            "📋 合约选择", options=ct_opts,
+            index=ct_opts.index(default_ct) if default_ct in ct_opts else 0,
+            format_func=ct_display, key="daily_report_ct")
+    with col_spread:
+        spread_opts = [spread_pair_label(ma, mb) for ma, mb in SPREAD_PAIRS]
+        sel_spread = st.selectbox("📉 价差对", options=spread_opts,
+                                  index=0, key="daily_report_spread")
+        spread_ma, spread_mb = SPREAD_PAIRS[spread_opts.index(sel_spread)]
+
+    # ── 获取所选合约的期货可用日期列表 ──
+    fut_df_raw, _ = load_futures(sel_ct)
+    if fut_df_raw is not None and not fut_df_raw.empty:
+        avail_dates = sorted(fut_df_raw["date"].dt.date.unique())
+        latest_date = avail_dates[-1]
+    else:
+        avail_dates = [datetime.now().date()]
+        latest_date = datetime.now().date()
+
     with col_date:
         sel_date = st.date_input(
             "📅 选择报告日期",
@@ -6783,8 +6802,9 @@ def tab_daily_report():
         )
 
     with st.spinner("🔄 正在生成日报…"):
-        cache = _compute_daily_report_cache(main_ct, spot_hash, _DAILY_REPORT_VERSION,
-                                             target_date=sel_date)
+        cache = _compute_daily_report_cache(sel_ct, spot_hash, _DAILY_REPORT_VERSION,
+                                             target_date=sel_date,
+                                             spread_ma=spread_ma, spread_mb=spread_mb)
 
     if cache.get("error"):
         st.error(f"❌ {cache['error']}")
@@ -6798,7 +6818,7 @@ def tab_daily_report():
     # ── 下载按钮 ──
     col_title, col_btn1, col_btn2 = st.columns([4, 1, 1])
     with col_title:
-        st.caption(f"📅 报告日期：{cn_date} ｜ 主力合约：{main_ct}")
+        st.caption(f"📅 报告日期：{cn_date} ｜ 合约：{sel_ct} ｜ 价差：{spread_pair_label(spread_ma, spread_mb)}")
     with col_btn1:
         st.download_button("📄 下载 HTML", data=html.encode("utf-8"),
             file_name=f"生猪期货日报_{cn_date.replace('年','').replace('月','').replace('日','')}.html",
@@ -6806,7 +6826,7 @@ def tab_daily_report():
             help="下载为HTML文件，浏览器打开后可打印为PDF")
 
     with col_btn2:
-        png_data = _compose_report_image(chart_images, cn_date, main_ct)
+        png_data = _compose_report_image(chart_images, cn_date, sel_ct)
         if png_data is None and chart_images:
             # PIL失败时用kaleido直接导出图表
             png_data = _export_first_chart_png(chart_images)
@@ -6888,7 +6908,7 @@ def _compose_report_image(chart_images: dict, cn_date: str, main_ct: str) -> Opt
                 continue
         if font_title is None:
             font_title = ImageFont.load_default()
-        draw.text((15, 12), f"生猪期货每日分析报告  {cn_date}  主力:{main_ct}",
+        draw.text((15, 12), f"生猪期货每日分析报告  {cn_date}  合约:{main_ct}",
                   fill=(255, 255, 255), font=font_title)
         images_to_stack.append(title_img)
 
