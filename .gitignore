@@ -8,9 +8,10 @@ venv/
 # Futures cache (tracked to speed up Streamlit Cloud cold start)
 # data/futures/*.csv
 
-# Holdings cache (individual date files are large, only commit aggregated net position data)
+# Holdings cache (commit aggregated net + per-date position files, so data deletion/correction syncs)
 data/holdings/*
 !data/holdings/*_net_agg.csv
+!data/holdings/*_????????.csv
 
 # Streamlit
 .streamlit/secrets.toml
