@@ -6,13 +6,12 @@
 无侧边栏设计——顶部胶囊导航，仅运行当前页（懒加载）。
 页面 1 — 当日基差分布（柱状图 + 四指标卡片）
 页面 2 — 每日期货分析日报（HTML 日报 + 图片/Markdown 下载）
-页面 3 — 价格相关性分析（现货/期货 × 周/月频，Top10 变量 + 最优滞后 + 结论）
-页面 4 — 单合约基差走势（区域色板 + 汇总指标固定色）
-页面 5 — 合约基差比较（同比 / 交易日对齐，颜色按合约新旧排名，含现货+期货走势图）
-页面 6 — 合约价差比较（月份选择，颜色按合约新旧排名）
-页面 7 — 持仓与成交分析（双轴图 + 前20期货公司多空持仓）
-页面 8 — 季节性持仓对比（同月份合约跨年成交量/持仓量/净持仓）
-页面 9 — 技术分析（K线图 + MA/布林带 + MACD/RSI/KDJ + 文字结论）
+页面 3 — 单合约基差走势（区域色板 + 汇总指标固定色）
+页面 4 — 合约基差比较（同比 / 交易日对齐，颜色按合约新旧排名，含现货+期货走势图）
+页面 5 — 合约价差比较（月份选择，颜色按合约新旧排名）
+页面 6 — 持仓与成交分析（双轴图 + 前20期货公司多空持仓）
+页面 7 — 季节性持仓对比（同月份合约跨年成交量/持仓量/净持仓）
+页面 8 — 技术分析（K线图 + MA/布林带 + MACD/RSI/KDJ + 文字结论）
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 核心设计原则：
   • 颜色按 **合约新旧排名**：最新合约红、前一年绿、再前一年黑，其余高对比度
@@ -3064,8 +3063,9 @@ def tab1():
 
     with col_ctrl:
         st.caption(f"🔍 目前已识别 **{len(active_cts)}** 个上市合约，共 **{len(ALL_CONTRACTS)}** 个历史合约可选")
+        _main_ct = get_main_contract()
         ct = st.selectbox("📋 合约选择", options=ALL_CONTRACTS,
-                          index=ALL_CONTRACTS.index("LH2609") if "LH2609" in ALL_CONTRACTS else 0,
+                          index=ALL_CONTRACTS.index(_main_ct) if _main_ct in ALL_CONTRACTS else 0,
                           format_func=ct_display, key="t1_ct")
         ver, _ = get_version(ct)
         vregions = get_regions(ct)
@@ -3073,11 +3073,11 @@ def tab1():
 
         with st.spinner("加载期货…"):
             fut_df, fut_src = load_futures(ct)
-        today = datetime.now().date()
+        today = _cst_now().date()
         latest = fut_df["date"].max().date() if (fut_df is not None and not fut_df.empty) else today
         st.caption(f"{fut_src}，{len(fut_df) if fut_df is not None else 0}个交易日")
 
-        sel_date = st.date_input("📅 选择日期", value=latest, max_value=today, key="t1_date")
+        sel_date = st.date_input("📅 选择日期", value=today, max_value=today, key="t1_date")
 
         # 区域 + 四个汇总指标 — 默认全选
         available_regions = [r for r in vregions if r in spot_dict] or vregions
@@ -3188,8 +3188,9 @@ def tab2():
 
     with col_ctrl:
         st.caption(f"🔍 目前已识别 **{len(active_cts)}** 个上市合约，共 **{len(ALL_CONTRACTS)}** 个历史合约可选")
+        _main_ct = get_main_contract()
         ct = st.selectbox("📋 合约选择", options=ALL_CONTRACTS,
-                          index=ALL_CONTRACTS.index("LH2609") if "LH2609" in ALL_CONTRACTS else 0,
+                          index=ALL_CONTRACTS.index(_main_ct) if _main_ct in ALL_CONTRACTS else 0,
                           format_func=ct_display, key="t2_ct")
         ver, _ = get_version(ct); vregions = get_regions(ct)
         st.caption(f"升贴水：**{ver}**（{len(vregions)}个区域）")
@@ -3369,9 +3370,11 @@ def tab4():
 
     with col_ctrl:
         st.caption(f"🔍 当前上市合约：{'、'.join(active_cts)}")
-        # 默认价差：7-3（当前主力价差，成交最活跃）；11-09 等近交割价差已基本无流动性
-        _def_ma = "07" if "07" in active_months else ("11" if "11" in active_months else active_months[-1])
-        _def_mb = "03" if "03" in active_months else ("09" if "09" in active_months else active_months[0])
+        # 默认价差：主力合约月份为近腿，下一活跃月份为远腿
+        _main_month = ct_month(get_main_contract())
+        _def_mb = _main_month if _main_month in active_months else active_months[0]
+        _mi = active_months.index(_def_mb)
+        _def_ma = active_months[(_mi + 1) % len(active_months)] if len(active_months) > 1 else _def_mb
         ma = st.selectbox("合约 A 月份", active_months,
                           index=active_months.index(_def_ma),
                           format_func=lambda m: f"{m}月", key="t4_ma_v2")
@@ -3979,16 +3982,17 @@ def tab5():
 
     with col_ctrl:
         st.caption(f"🔍 目前已识别 **{len(active_cts)}** 个上市合约")
+        _main_ct = get_main_contract()
         ct = st.selectbox("📋 合约选择", options=active_cts,
-                          index=active_cts.index("LH2609") if "LH2609" in active_cts else 0,
+                          index=active_cts.index(_main_ct) if _main_ct in active_cts else 0,
                           format_func=ct_display, key="t5_ct")
         with st.spinner("加载期货数据…"):
             fut_df, fut_src = load_futures(ct)
-        today = datetime.now().date()
+        today = _cst_now().date()
         latest = fut_df["date"].max().date() if (fut_df is not None and not fut_df.empty) else today
         st.caption(f"{fut_src}，{len(fut_df) if fut_df is not None else 0}个交易日")
 
-        sel_date = st.date_input("📅 选择日期", value=latest, max_value=today, key="t5_date")
+        sel_date = st.date_input("📅 选择日期", value=today, max_value=today, key="t5_date")
 
     with col_chart:
         if fut_df is None or fut_df.empty:
@@ -4629,8 +4633,9 @@ def tab6():
 
     with col_ctrl:
         st.caption(f"🔍 当前上市合约：{'、'.join(active_cts)}")
+        _main_month = ct_month(get_main_contract())
         sel_month = st.selectbox("📋 合约月份", active_months,
-                                 index=active_months.index("09") if "09" in active_months else 0,
+                                 index=active_months.index(_main_month) if _main_month in active_months else 0,
                                  format_func=lambda m: f"{m}月合约", key="t6_month")
 
         # ★ 找出该月份所有合约 —— 不跳过任何往年同期合约
@@ -5446,23 +5451,24 @@ def tab7():
 
     with col_ctrl:
         st.caption(f"📂 可分析 **{len(all_cache_cts)}** 个历史合约")
+        _main_ct = get_main_contract()
         ct = st.selectbox("📋 合约选择", options=all_cache_cts,
-                          index=all_cache_cts.index("LH2609") if "LH2609" in all_cache_cts else 0,
+                          index=all_cache_cts.index(_main_ct) if _main_ct in all_cache_cts else 0,
                           format_func=ct_display, key="t7_ct")
         with st.spinner("加载期货数据…"):
             fut_df, fut_src = load_futures(ct)
         st.caption(f"{fut_src}，{len(fut_df) if fut_df is not None else 0}个交易日")
 
-        today = datetime.now().date()
+        today = _cst_now().date()
         latest = fut_df["date"].max().date() if (fut_df is not None and not fut_df.empty) else today
-        default_start = latest - timedelta(days=90)
+        default_start = today - timedelta(days=90)
 
-        date_range = st.date_input("📅 日期范围", value=(default_start, latest),
+        date_range = st.date_input("📅 日期范围", value=(default_start, today),
                                    max_value=today, key="t7_date_range")
         if isinstance(date_range, tuple) and len(date_range) == 2:
             sd, ed = date_range
         else:
-            sd, ed = default_start, latest
+            sd, ed = default_start, today
 
     with col_chart:
         if fut_df is None or fut_df.empty:
@@ -8731,12 +8737,11 @@ def main():
         <div>
           <div class="hero-kicker">HOG FUTURES INTELLIGENCE</div>
           <h1>🐷 生猪期货分析平台</h1>
-          <div class="sub">现货 · 基差 · 价差 · 持仓 · <b>价格相关性</b>，一屏看清生猪市场结构</div>
+          <div class="sub">现货 · 基差 · 价差 · 持仓，一屏看清生猪市场结构</div>
           <div class="hero-chips">
             <span class="hero-chip live">● 数据每日自动同步</span>
             <span class="hero-chip">涌益咨询现货</span>
             <span class="hero-chip">大商所期货 / 持仓</span>
-            <span class="hero-chip">相关性每日更新</span>
           </div>
         </div>
         <div class="hero-mark">🐷</div>
@@ -8912,7 +8917,6 @@ def main():
     NAV_ITEMS = [
         ("📊 基差分布", tab1),
         ("📋 每日期货日报", tab_daily_report),
-        ("🔗 相关性分析", tab_correlation),
         ("📈 单合约走势", tab2),
         ("🔄 基差比较", tab3),
         ("📉 价差比较", tab4),
@@ -8920,8 +8924,12 @@ def main():
         ("📅 季节性持仓", tab6),
         ("📉 技术分析", tab7),
     ]
+    _nav_labels = [x[0] for x in NAV_ITEMS]
+    # 兼容代码热更新：若会话里还留着已下线页面的名字，回退到第一页
+    if st.session_state.get("main_nav") not in _nav_labels:
+        st.session_state["main_nav"] = _nav_labels[0]
     with st.container(key="topnav"):
-        _nav = st.radio("页面导航", [x[0] for x in NAV_ITEMS], horizontal=True,
+        _nav = st.radio("页面导航", _nav_labels, horizontal=True,
                         label_visibility="collapsed", key="main_nav")
     dict(NAV_ITEMS)[_nav]()
 
