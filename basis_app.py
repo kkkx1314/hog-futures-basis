@@ -7987,8 +7987,10 @@ def tab_daily_report():
             format_func=ct_display, key="daily_report_ct")
     with col_spread:
         spread_opts = [spread_pair_label(ma, mb) for ma, mb in SPREAD_PAIRS]
+        _default_spread = ("03", "01") if ("03", "01") in SPREAD_PAIRS else SPREAD_PAIRS[0]
         sel_spread = st.selectbox("📉 价差对", options=spread_opts,
-                                  index=0, key="daily_report_spread")
+                                  index=spread_opts.index(spread_pair_label(*_default_spread)),
+                                  key="daily_report_spread")
         spread_ma, spread_mb = SPREAD_PAIRS[spread_opts.index(sel_spread)]
 
     # ── 获取所选合约的期货可用日期列表 ──
